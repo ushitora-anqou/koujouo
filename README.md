@@ -7,9 +7,9 @@
 ## Getting Started
 
 ### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
+- [Nix](https://nixos.org/) with flake support — provides Go, kubectl, and all
+  the other development tools via `nix develop`
+- docker version 17.03+ (to load and push images)
 - Access to a Kubernetes v1.11.3+ cluster.
 
 ### To Deploy on the cluster
