@@ -12,6 +12,9 @@ internal/webhook/*             Validation/defaulting (if present)
 config/crd/bases/*             Generated CRDs (DO NOT EDIT)
 config/rbac/role.yaml          Generated RBAC (DO NOT EDIT)
 config/samples/*               Example CRs (edit these)
+flake.nix                      Nix flake: dev shell, manager and docker image packages
+flake.lock                     Pinned Nix inputs (update with `nix flake update`, DO NOT hand-edit)
+.golangci.yml                  golangci-lint config (all linters enabled)
 Makefile                       Build/test/deploy commands
 PROJECT                        Kubebuilder metadata Auto-generated (DO NOT EDIT)
 ```
@@ -34,6 +37,31 @@ Multi-group layout organizes APIs by group name (e.g., `batch`, `apps`). Check t
 6. Fix `path` in `PROJECT` file for each resource
 7. Update test suite CRD paths (add one more `..` to relative paths)
 
+## Nix Development Environment
+
+All development tools come from the Nix flake dev shell. Do NOT install
+them with `go install` or download them manually:
+
+```bash
+nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, kustomize,
+              # setup-envtest, controller-gen
+```
+
+- `controller-gen` is provided by the nixpkgs `kubernetes-controller-tools` package
+- `nix fmt` formats Nix files with alejandra
+- `nix build .#manager` builds the manager binary, `nix build .#dockerImage` builds the OCI image
+- The image is built with `dockerTools.buildImage` (static binary, nonroot user, CA certs and tzdata); there is no Dockerfile
+
+**When go.mod or go.sum changes**, update the `vendorHash` of the `manager`
+package in flake.nix:
+1. Run `nix build .#manager`
+2. Copy the `got: sha256-...` hash from the error message into `vendorHash`
+3. Re-run `nix build .#manager` and confirm it succeeds
+
+**The flake source only contains git-tracked files.** Commit (or at least
+`git add`) your changes before building the manager or the docker image,
+otherwise your edits are silently excluded from the build.
+
 ## Critical Rules
 
 ### Never Edit These (Auto-Generated)
@@ -42,6 +70,7 @@ Multi-group layout organizes APIs by group name (e.g., `batch`, `apps`). Check t
 - `config/webhook/manifests.yaml` - from `make manifests`
 - `**/zz_generated.*.go` - from `make generate`
 - `PROJECT` - from `kubebuilder [OPTIONS]`
+- `flake.lock` - from `nix flake update`
 
 ### Never Remove Scaffold Markers
 Do NOT delete `// +kubebuilder:scaffold:*` comments. CLI injects code at these markers.
@@ -51,10 +80,12 @@ Do not move files around. The CLI expects files in specific locations.
 
 ### Always Use CLI Commands
 Always use `kubebuilder create api` and `kubebuilder create webhook` to scaffold. Do NOT create files manually.
+Run `kubebuilder` from inside the dev shell (`nix develop`).
 
 ### E2E Tests Require an Isolated Kind Cluster
 The e2e tests are designed to validate the solution in an isolated environment (similar to GitHub Actions CI).
 Ensure you run them against a dedicated [Kind](https://kind.sigs.k8s.io/) cluster (not your “real” dev/prod cluster).
+Kind is available in the dev shell; run `make test-e2e` there.
 
 ## After Making Changes
 
@@ -69,6 +100,24 @@ make generate   # Regenerate DeepCopy methods
 make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
+
+**After editing `go.mod`/`go.sum`:**
+Update the `manager` `vendorHash` in flake.nix (see "Nix Development Environment").
+
+**After editing `flake.nix`:**
+```
+nix fmt .       # Format the flake
+nix build .#dockerImage   # Verify it still builds
+```
+
+## CI
+
+GitHub Actions workflows install Nix via `DeterminateSystems/nix-installer-action`
+and run `make` targets inside the dev shell using
+[`nicknovitski/nix-develop`](https://github.com/nicknovitski/nix-develop), which
+exports the dev shell environment to subsequent steps. All actions are pinned by
+commit SHA. Dependabot (`.github/dependabot.yml`) updates Go modules and the
+pinned actions weekly.
 
 ## CLI Commands Cheat Sheet
 
@@ -144,21 +193,28 @@ kubebuilder create webhook \
 ## Testing & Development
 
 ```bash
-make test              # Run unit tests (uses envtest: real K8s API + etcd)
-make run               # Run locally (uses current kubeconfig context)
+nix develop   # Enter the dev shell first
+make test     # Run unit tests (uses envtest: real K8s API + etcd)
+make run      # Run locally (uses current kubeconfig context)
 ```
 
 Tests use **Ginkgo + Gomega** (BDD style). Check `suite_test.go` for setup.
+`make test` resolves envtest binaries via `setup-envtest` (downloaded on demand);
+the `ENVTEST_K8S_VERSION` is derived from `k8s.io/api` in go.mod.
 
 ## Deployment Workflow
 
 ```bash
+# 0. Enter the dev shell and make sure your changes are git-tracked
+nix develop
+git add -A  # the flake only sees git-tracked files when building the image
+
 # 1. Regenerate manifests
 make manifests generate
 
 # 2. Build & deploy
 export IMG=<registry>/<project>:tag
-make docker-build docker-push IMG=$IMG  # Or: kind load docker-image $IMG --name <cluster>
+make docker-build docker-push IMG=$IMG  # Image built by Nix, loaded into the local runtime, re-tagged to ${IMG}
 make deploy IMG=$IMG
 
 # 3. Test
@@ -209,6 +265,7 @@ kubectl logs -n <project>-system deployment/<project>-controller-manager -c mana
 - **Owner references**: Enable automatic garbage collection (`SetControllerReference`)
 - **Watch secondary resources**: Use `.Owns()` or `.Watches()`, not just `RequeueAfter`
 - **Finalizers**: Clean up external resources (buckets, VMs, DNS entries)
+- **Linting**: All golangci-lint linters are enabled (`.golangci.yml`). Idiomatic scheme/test globals that cannot be removed carry `//nolint` directives with a reason — keep that style when adding new exceptions
 
 ### Logging
 
@@ -267,39 +324,16 @@ make build-installer IMG=<registry>/<project>:tag
 kubectl apply -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/dist/install.yaml
 ```
 
-### Option 2: Helm Chart
-
-```bash
-kubebuilder edit --plugins=helm/v2-alpha                      # Generates dist/chart/ (default)
-kubebuilder edit --plugins=helm/v2-alpha --output-dir=charts  # Generates charts/chart/
-```
-
-**For development:**
-```bash
-make helm-deploy IMG=<registry>/<project>:<tag>          # Deploy manager via Helm
-make helm-deploy IMG=$IMG HELM_EXTRA_ARGS="--set ..."    # Deploy with custom values
-make helm-status                                         # Show release status
-make helm-uninstall                                      # Remove release
-make helm-history                                        # View release history
-make helm-rollback                                       # Rollback to previous version
-```
-
-**For end users/production:**
-```bash
-helm install my-release ./<output-dir>/chart/ --namespace <ns> --create-namespace
-```
-
-**Important:** If you add webhooks or modify manifests after initial chart generation:
-1. Backup any customizations in `<output-dir>/chart/values.yaml` and `<output-dir>/chart/manager/manager.yaml`
-2. Re-run: `kubebuilder edit --plugins=helm/v2-alpha --force` (use same `--output-dir` if customized)
-3. Manually restore your custom values from the backup
-
 ### Publish Container Image
 
 ```bash
 export IMG=<registry>/<project>:<version>
 make docker-build docker-push IMG=$IMG
 ```
+
+`make docker-build` runs `nix build .#dockerImage`, loads the archive into
+the local container runtime, and re-tags it to `${IMG}`. Remember that the
+flake only builds from git-tracked files.
 
 ## References
 
@@ -308,6 +342,7 @@ make docker-build docker-push IMG=$IMG
 - **controller-runtime FAQ**: https://github.com/kubernetes-sigs/controller-runtime/blob/main/FAQ.md (common patterns and questions)
 - **Good Practices**: https://book.kubebuilder.io/reference/good-practices.html (why reconciliation is idempotent, status conditions, etc.)
 - **Logging Conventions**: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md#message-style-guidelines (message style, verbosity levels)
+- **Nix Flakes**: https://nix.dev/concepts/flakes
 
 ### API Design & Implementation
 - **API Conventions**: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md
