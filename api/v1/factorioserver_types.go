@@ -24,7 +24,7 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// FactorioServerSpec defines the desired state of FactorioServer
+// FactorioServerSpec defines the desired state of FactorioServer.
 type FactorioServerSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
@@ -42,7 +42,8 @@ type FactorioServerStatus struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md
+	// #typical-status-properties
 
 	// conditions represent the current state of the FactorioServer resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
@@ -62,7 +63,7 @@ type FactorioServerStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
-// FactorioServer is the Schema for the factorioservers API
+// FactorioServer is the Schema for the factorioservers API.
 type FactorioServer struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -81,16 +82,23 @@ type FactorioServer struct {
 
 // +kubebuilder:object:root=true
 
-// FactorioServerList contains a list of FactorioServer
+// FactorioServerList contains a list of FactorioServer.
 type FactorioServerList struct {
 	metav1.TypeMeta `json:",inline"`
+
 	metav1.ListMeta `json:"metadata,omitzero"`
-	Items           []FactorioServer `json:"items"`
+
+	Items []FactorioServer `json:"items"`
 }
 
-func init() {
+func init() { //nolint:gochecknoinits // Registers the API types with the scheme builder.
 	SchemeBuilder.Register(func(s *runtime.Scheme) error {
-		s.AddKnownTypes(SchemeGroupVersion, &FactorioServer{}, &FactorioServerList{})
+		s.AddKnownTypes(
+			SchemeGroupVersion,
+			&FactorioServer{},     //nolint:exhaustruct_v5 // Registration only needs the type.
+			&FactorioServerList{}, //nolint:exhaustruct_v5 // Registration only needs the type.
+		)
+
 		return nil
 	})
 }

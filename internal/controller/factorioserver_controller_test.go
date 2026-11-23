@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+package controller_test
 
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/ginkgo/v2" //nolint:revive // Ginkgo DSL imports are the framework convention.
+	. "github.com/onsi/gomega"    //nolint:revive // Gomega DSL imports are the framework convention.
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
+	"koujouo.anqou.net/project/internal/controller"
 )
 
 var _ = Describe("FactorioServer Controller", func() {
@@ -43,26 +44,25 @@ var _ = Describe("FactorioServer Controller", func() {
 			Name:      resourceName,
 			Namespace: resourceNamespace,
 		}
-		factorioserver := &koujouoanqounetv1.FactorioServer{}
+		factorioserver := &koujouoanqounetv1.FactorioServer{} //nolint:exhaustruct_v5 // Serves as the target of client Get.
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind FactorioServer")
+
 			err := k8sClient.Get(ctx, typeNamespacedName, factorioserver)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &koujouoanqounetv1.FactorioServer{
+				resource := &koujouoanqounetv1.FactorioServer{ //nolint:exhaustruct_v5 // Only the metadata matters for creation.
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &koujouoanqounetv1.FactorioServer{}
+			resource := &koujouoanqounetv1.FactorioServer{} //nolint:exhaustruct_v5 // Serves as the target of client Get.
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -71,7 +71,8 @@ var _ = Describe("FactorioServer Controller", func() {
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &FactorioServerReconciler{
+
+			controllerReconciler := &controller.FactorioServerReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
@@ -80,8 +81,6 @@ var _ = Describe("FactorioServer Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
 		})
 	})
 })

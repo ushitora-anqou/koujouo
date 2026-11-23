@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package controller implements the reconciliation logic for the koujouo API.
 package controller
 
 import (
 	"context"
+	"fmt"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -27,37 +29,41 @@ import (
 	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
 )
 
-// FactorioServerReconciler reconciles a FactorioServer object
+// FactorioServerReconciler reconciles a FactorioServer object.
 type FactorioServerReconciler struct {
 	client.Client
+
 	Scheme *runtime.Scheme
 }
 
+//nolint:lll // Kubebuilder markers must stay on one line.
 // +kubebuilder:rbac:groups=koujouo.anqou.net.koujouo.anqou.net,resources=factorioservers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=koujouo.anqou.net.koujouo.anqou.net,resources=factorioservers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=koujouo.anqou.net.koujouo.anqou.net,resources=factorioservers/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the FactorioServer object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
+// Compare the state specified by the FactorioServer object against the actual
+// cluster state, and then perform operations to make the cluster state reflect
+// the state specified by the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
-func (r *FactorioServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *FactorioServerReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	_ = logf.FromContext(ctx)
 
-	// TODO(user): your logic here
-
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, nil //nolint:exhaustruct_v5 // An empty result requires no requeue.
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *FactorioServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&koujouoanqounetv1.FactorioServer{}).
+	err := ctrl.NewControllerManagedBy(mgr).
+		For(&koujouoanqounetv1.FactorioServer{}). //nolint:exhaustruct_v5 // The builder only needs the type.
 		Named("factorioserver").
 		Complete(r)
+	if err != nil {
+		return fmt.Errorf("failed to build controller for FactorioServer: %w", err)
+	}
+
+	return nil
 }

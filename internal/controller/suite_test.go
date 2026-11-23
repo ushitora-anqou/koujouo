@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+// Package controller_test runs the controller test suite against an envtest
+// control plane.
+package controller_test
 
 import (
 	"context"
@@ -23,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/ginkgo/v2" //nolint:revive // Ginkgo DSL imports are the framework convention.
+	. "github.com/onsi/gomega"    //nolint:revive // Gomega DSL imports are the framework convention.
 
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -41,14 +43,16 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var (
-	ctx       context.Context
-	cancel    context.CancelFunc
-	testEnv   *envtest.Environment
-	cfg       *rest.Config
-	k8sClient client.Client
+	ctx       context.Context      //nolint:gochecknoglobals // Shared state across the Ginkgo suite.
+	cancel    context.CancelFunc   //nolint:gochecknoglobals // Shared state across the Ginkgo suite.
+	testEnv   *envtest.Environment //nolint:gochecknoglobals // Shared state across the Ginkgo suite.
+	cfg       *rest.Config         //nolint:gochecknoglobals // Shared state across the Ginkgo suite.
+	k8sClient client.Client        //nolint:gochecknoglobals // Shared state across the Ginkgo suite.
 )
 
 func TestControllers(t *testing.T) {
+	t.Parallel()
+
 	RegisterFailHandler(Fail)
 
 	RunSpecs(t, "Controller Suite")
@@ -57,15 +61,17 @@ func TestControllers(t *testing.T) {
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
-	ctx, cancel = context.WithCancel(context.TODO())
+	ctx, cancel = context.WithCancel(context.TODO()) //nolint:fatcontext // BeforeSuite runs only once.
 
 	var err error
+
 	err = koujouoanqounetv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
+
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
@@ -104,15 +110,19 @@ var _ = AfterSuite(func() {
 // properly set up, run 'make setup-envtest' beforehand.
 func getFirstFoundEnvTestBinaryDir() string {
 	basePath := filepath.Join("..", "..", "bin", "k8s")
+
 	entries, err := os.ReadDir(basePath)
 	if err != nil {
 		logf.Log.Error(err, "Failed to read directory", "path", basePath)
+
 		return ""
 	}
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			return filepath.Join(basePath, entry.Name())
 		}
 	}
+
 	return ""
 }
