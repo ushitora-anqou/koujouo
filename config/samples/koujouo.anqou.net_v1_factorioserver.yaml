@@ -1,0 +1,9 @@
+apiVersion: koujouo.anqou.net.koujouo.anqou.net/v1
+kind: FactorioServer
+metadata:
+  labels:
+    app.kubernetes.io/name: koujouo
+    app.kubernetes.io/managed-by: kustomize
+  name: factorioserver-sample
+spec:
+  # TODO(user): Add fields here
