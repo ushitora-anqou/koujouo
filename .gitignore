@@ -5,7 +5,10 @@
 *.so
 *.dylib
 bin/*
-Dockerfile.cross
+
+# Nix build output symlink
+result
+result-*
 
 # Test binary, built with `go test -c`
 *.test
