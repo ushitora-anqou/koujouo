@@ -6,10 +6,23 @@
   };
 
   outputs = inputs: {
-    packages = builtins.mapAttrs (system: pkgs: {
-      hello = pkgs.hello;
+    formatter = builtins.mapAttrs (system: pkgs: pkgs.alejandra) inputs.nixpkgs.legacyPackages;
 
-      default = inputs.self.packages.${system}.hello;
-    }) inputs.nixpkgs.legacyPackages;
+    devShells =
+      builtins.mapAttrs (system: pkgs: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            go
+            golangci-lint
+          ];
+        };
+      })
+      inputs.nixpkgs.legacyPackages;
+
+    #packages = builtins.mapAttrs (system: pkgs: {
+    #  hello = pkgs.hello;
+
+    #  default = inputs.self.packages.${system}.hello;
+    #}) inputs.nixpkgs.legacyPackages;
   };
 }
