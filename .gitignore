@@ -31,4 +31,5 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
-factorio.yaml
+
+misc
