@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Factorio Server Plan</title>
+<link rel="stylesheet" href="../../../.claude/skills/html-plan/runtime/htmlplan.css">
+<script src="../../../.claude/skills/html-plan/runtime/htmlplan.js" defer></script>
+<style data-mock-shared>
+  .dc { font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #313338; border-radius: 8px; padding: 10px 12px; }
+  .dc .msg { display: flex; gap: 10px; padding: 3px 0; }
+  .dc .msg + .msg { margin-top: 2px; }
+  .dc .av { width: 28px; height: 28px; border-radius: 50%; background: #5865f2; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 15px; flex: none; }
+  .dc .nm { color: #f2f3f5; font-weight: 600; }
+  .dc .tg { background: #5865f2; color: #fff; font-size: 10px; font-weight: 600; border-radius: 4px; padding: 1px 5px; margin: 0 6px; vertical-align: 1px; }
+  .dc .tm { color: #949ba4; font-size: 11.5px; margin-left: 4px; }
+  .dc .tx { color: #dbdee1; }
+  .fc { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: rgba(11, 37, 69, .92); color: #fff; border-radius: 8px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.14); }
+  .fc .ln { padding: 2px 0; text-shadow: 0 1px 2px rgba(0,0,0,.7); }
+  .fc .sv { color: #ffd200; font-weight: 600; }
+  .fc .dim2 { color: #b8c7e0; }
+</style>
+<body>
+
+<header>
+  <h1>Hosting Factorio Servers in koujouo</h1>
+  <doc-changes new="13" changed="8" deleted="1"></doc-changes>
+  <details class="thread"><summary>Why · 5 requests</summary>
+    <doc-quote via="prompt" from="the user">koujouo は Factorio https://www.factorio.com/ の headless サーバーを Kubernetes 上でホストするための Kubernetes controller である。koujouo は FactorioServer CRD を導入する。</doc-quote>
+    <doc-quote via="prompt" from="the user">agent の Docker image には Factorio のゲームバイナリを埋め込まない。これはライセンスの観点からも有用である；これにより agent の Docker image は public registry から配布できる。また同様にゲームの設定なども ConfigMap 経由ではなく Cap'n Proto 経由で渡す。</doc-quote>
+    <doc-quote via="prompt" from="the user">Factorio のログにはユーザーがサーバーに join/leave したことを示す出力が行われるため、これを見て join/leave を Discord に通知する。</doc-quote>
+    <doc-quote via="prompt" from="the user">agent は Factorio サーバーを停止する際には優雅に停止させる。…1. サーバー内にプレイヤーが join しているかを確認する。join している場合は rcon を使ってメッセージを送り、サーバーが停止するので退出するよう求める。2. プレイヤーがいなくなったら SIGINT を送る。…3. プレイヤーが全員退出していない場合でも、メッセージの送信から .spec.leaveTimeout 時間だけ待機したら 2 を実施する。</doc-quote>
+    <doc-quote via="prompt" from="the user">CNPG を参考にし、agent の Docker image を更新する際に Factorio server を止めずに行えるようにする。これは controller から agent にプロセスバイナリを Cap'n Proto で送りつけたうえで agent がそのバイナリに exec(2) することで行えるはず。</doc-quote>
+  </details>
+</header>
+
+<main>
+<doc-plan>
+
+<!-- ═══ 1 ═════════════════════════════════════════════════════════ -->
+<doc-claim>
+  <p>A FactorioServer resource runs one Factorio server.</p>
+  <doc-mock frame="terminal" title="kubectl" w="470"><template>
+<span class="dim">$</span> kubectl apply -f factorioserver.yaml
+factorioserver.koujouo.anqou.net/factorio created
+<span class="dim">$</span> kubectl get factorioserver factorio
+NAME      STATUS    VERSION   PLAYERS
+factorio  <span class="g">Running</span>   2.1.24    3
+</template>
+    <doc-pin at="88%,62%" title="From the agent">The controller polls the agent for this.</doc-pin>
+  </doc-mock>
+
+  <doc-claim>
+    <p>The controller creates one StatefulSet for each FactorioServer.</p>
+    <doc-calls title="Reconcile" caption="The controller owns every object it makes.">
+<script type="text/plain">
+~ Reconcile(ctx, req)                          @ internal/controller/factorioserver_controller.go:52
++   **ensureStatefulSet**(server)              @ internal/controller/resources/statefulset.go:20
++   **dialAgent**(pod)                         @ internal/controller/agentclient.go:24
++     Agent.configure(Config)                   @ rpc/koujouo.capnp:12
++   **syncStatus**(server, agentStatus)        @ internal/controller/status.go:12
+~ SetupWithManager(mgr): .Owns() + .Watches()  @ internal/controller/factorioserver_controller.go:59
+</script>
+    </doc-calls>
+    <doc-note tone="info"><strong>RBAC</strong> Add markers for statefulsets, pods, configmaps, secrets and events.</doc-note>
+    <doc-claim at="internal/controller/resources/statefulset.go:20">
+      <p><b>statefulset.go:20</b> · buildStatefulSet()</p>
+      <doc-code title="statefulset.go · sketch" lang="yaml">
+<script type="text/plain">
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: factorio                    # = the FactorioServer name, with an owner ref
+spec:
+  replicas: 1
+  serviceName: factorio
+  template:
+    spec:
+      containers:
+        - name: agent
+          image: <the controller image>     # it ships the agent binary
+          command: ["/kojouo/agent"]       # PID 1; no tini, the agent reaps
+          ports:
+            - { name: game, containerPort: 34197, protocol: UDP }
+          volumeMounts:
+            - { name: saves, mountPath: /var/lib/koujouo }
+            - { name: cache, mountPath: /opt/koujouo }
+      volumes:
+        - name: saves
+          persistentVolumeClaim: { claimName: data-factorio }  # spec.saveDataPVCName
+        - name: cache                 # generic ephemeral volume
+          ephemeral:
+            volumeClaimTemplate:
+              spec: { storageClassName: topolvm-provisioner }
+</script>
+        <doc-pin line="13" title="PID 1">The agent reaps the children; tini goes.</doc-pin>
+        <doc-pin line="21" title="Existing PVC">The claim exists before the FactorioServer.</doc-pin>
+        <doc-pin line="22" title="Ephemeral volume">The game binary lands here.</doc-pin>
+      </doc-code>
+    </doc-claim>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The operator creates no Service. The user's chart holds it.</p>
+    <doc-code title="statefulset.go · sketch" lang="yaml">
+<script type="text/plain">
+containers:
+  - name: agent
+    ports:
+      - { name: game, containerPort: 34197, protocol: UDP }
+</script>
+      <doc-pin line="4" title="Port only">A Service for the players sits in the Helm chart.</doc-pin>
+    </doc-code>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The agent downloads the game binary onto the ephemeral volume.</p>
+    <doc-mock frame="terminal" title="agent log" w="470"><template>
+<span class="b">agent</span>     no binary at /opt/koujouo/factorio-2.1.24
+<span class="b">agent</span>     GET get-download/2.1.24/headless/linux64  61 MB
+<span class="b">agent</span>     extracted, sha256 ok
+<span class="b">agent</span>     no save found; created /var/lib/koujouo/saves/map.zip
+<span class="b">agent</span>     factorio 2.1.24 (pid 39) <span class="g">Running</span>
+<span class="dim">factorio</span>  22:04:11 [JOIN] anqou joined the game
+</template>
+      <doc-pin at="8%,70%" title="No login">Stable builds need no account. Experimental builds need a token.</doc-pin>
+    </doc-mock>
+
+    <doc-claim at="internal/agent/download.go:16">
+      <p><b>download.go:16</b> · ensureBinary()</p>
+      <doc-code title="download.go · sketch" lang="go" start="16">
+<script type="text/plain">
+func ensureBinary(ctx context.Context, version string) (string, error) {
+	dir := filepath.Join("/opt/koujouo", "factorio-"+version)
+	if _, err := os.Stat(filepath.Join(dir, "bin/x64/factorio")); err == nil {
+		return dir, nil // already on the ephemeral volume
+	}
+	u := "https://factorio.com/get-download/" + version + "/headless/linux64"
+	if creds != nil { // spec.downloadCredentials, a Secret
+		u += "?username=" + creds.Username + "&token=" + creds.Token
+	}
+	return extractTarXz(ctx, u, dir) // ~61 MB; needs an xz package
+}
+</script>
+        <doc-pin line="24" title="Login" >Old and experimental builds ask for a Factorio username and token.</doc-pin>
+        <doc-pin line="26" title="tar.xz">Go ships no xz reader; add one dependency.</doc-pin>
+      </doc-code>
+    </doc-claim>
+  </doc-claim>
+
+  <doc-claim>
+    <p>The controller sends settings and secrets over Cap'n Proto, not over volumes.</p>
+    <doc-schema id="capnp" lang="capnp" title="rpc/koujouo.capnp · sketch" caption="The webhook URL and the S3 keys go as fields of Config.">
+<script type="text/plain">
+@0xd4a1b2c3d5e6f7a8;
+
+interface Agent {
+  struct File  { name @0 :Text; content @1 :Data; }
+  struct Config {
+    gameVersion    @0 :Text;
+    files          @1 :List(File);   # config.ini, whitelist.json, …
+    discordWebhook @2 :Text;         # from the Secret; empty = off
+    leaveTimeoutNs @3 :Int64;
+    backup         @4 :BackupSettings;  # endpoint, bucket, keys, retention
+  }
+
+  configure @0 (cfg :Config) -> ();   # idempotent; drains first on a version change
+  status    @1 () -> (phase :Text, gameVersion :Text, players :UInt16);
+  stop      @2 () -> ();              # drain + save, then exit the game
+  upgrade   @3 (bin :ByteStream) -> ();
+}
+
+interface ByteStream {                # chunks of the new agent binary
+  write @0 (chunk :Data) -> ();
+  done  @1 (sha256 :Data) -> ();
+}
+</script>
+      <doc-pin line="9" title="From ConfigMaps">The controller reads gameConfig.configMapRef and sends the bytes.</doc-pin>
+      <doc-pin line="10" title="From a Secret">The URL never sits in the CR or in env vars.</doc-pin>
+    </doc-schema>
+    <doc-note tone="info"><strong>Recovery</strong> The agent caches the last config on the save volume. A restarted pod resumes without the controller.</doc-note>
+
+    <doc-claim at="internal/controller/agentclient.go:24">
+      <p><b>agentclient.go:24</b> · dialAgent()</p>
+      <doc-code title="agentclient.go · sketch (capnp v3)" lang="go" start="24">
+<script type="text/plain">
+func (r *Reconciler) dial(ctx context.Context, pod *corev1.Pod) (agent.Agent, error) {
+	addr := net.JoinHostPort(pod.Status.PodIP, "9550")
+	conn, err := net.Dial("tcp", addr) // plain TCP, pod network only
+	if err != nil {
+		return nil, fmt.Errorf("dial agent: %w", err)
+	}
+	c := rpc.NewConn(rpc.NewStream(conn), &rpc.Options{})
+	return agent.Agent(c.Bootstrap(ctx)), nil // check the v3 API while coding
+}
+</script>
+        <doc-pin line="26" title="Plain TCP">No TLS; the pod network carries the link.</doc-pin>
+      </doc-code>
+    </doc-claim>
+
+    <doc-claim>
+      <p>CI runs unit tests, envtest tests and e2e tests.</p>
+      <doc-tree caption="The e2e test drives a real Factorio binary on kind.">
+<script type="text/plain">
+internal/agent/*_test.go   # unit: stop, log parse, download, backup
+internal/controller/       # envtest: STS, suspend, version change
+test/e2e/                  # kind + the real binary + a Discord post
+.github/workflows/         # lint, test, test-e2e exist; extend them
+</script>
+      </doc-tree>
+      <doc-note tone="info"><strong>Rule</strong> Do not end the work before every test passes.</doc-note>
+    </doc-claim>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═══ 2 ═════════════════════════════════════════════════════════ -->
+<doc-claim>
+  <p>Each stop waits for the players, then writes the save.</p>
+  <doc-machine name="stop" caption="Tap a state to see what the user sees.">
+<script type="text/plain">
+machine stop initial running
+state running   # The game serves the players.
+state draining  # rcon asked the players to leave.
+state saving    # Factorio writes the save file.
+state stopped final   # The save file sits on the PVC.
+
+| running | draining | saving | stopped |
+
+running  -stop->    draining : stop call
+draining -empty->   saving   : no players
+draining -timeout-> saving   : leaveTimeout
+saving   -saved->   stopped  : exit 0
+</script>
+    <div data-state="running"><doc-mock frame="terminal" title="kubectl" w="440"><template>
+<span class="dim">$</span> kubectl get factorioserver factorio
+NAME      STATUS     VERSION   PLAYERS
+factorio  Running    2.1.24    3
+</template></doc-mock></div>
+    <div data-state="draining"><doc-mock frame="none" w="440"><template>
+<div class="fc">
+  <div class="ln"><span class="sv">[server]</span> Server stops in 60 s. Please leave the game.</div>
+  <div class="ln"><span class="dim2">anqou left the game.</span></div>
+</div>
+</template></doc-mock></div>
+    <div data-state="saving"><doc-mock frame="terminal" title="kubectl" w="440"><template>
+<span class="dim">$</span> kubectl get factorioserver factorio
+NAME      STATUS     VERSION   PLAYERS
+factorio  Saving     2.1.24    0
+</template></doc-mock></div>
+    <div data-state="stopped"><doc-mock frame="terminal" title="kubectl" w="440"><template>
+<span class="dim">$</span> kubectl get factorioserver factorio
+NAME      STATUS      VERSION   PLAYERS
+factorio  Suspended   2.1.24    0
+</template></doc-mock></div>
+  </doc-machine>
+
+  <doc-claim>
+    <p>The agent warns the players, then sends SIGINT to Factorio.</p>
+    <doc-code title="stop.go · sketch" lang="go" start="12">
+<script type="text/plain">
+func (a *Agent) stopGraceful(ctx context.Context) error {
+	if n := a.rcon.PlayersOnline(ctx); n > 0 {
+		_ = a.rcon.Chat(ctx, "The server stops in "+a.leaveTimeout+". Please leave.")
+		select {
+		case <-a.lastPlayerLeft: // the last player left the game
+		case <-time.After(a.leaveTimeout):
+		}
+	}
+	_ = a.factorio.Process.Signal(syscall.SIGINT) // writes the save, then exits
+	return a.factorio.Wait()
+}
+</script>
+      <doc-pin line="16" title="rcon">rcon binds to 127.0.0.1 with a random password; no Service exposes it.</doc-pin>
+      <doc-pin line="20" title="SIGINT">Factorio writes the save file, then exits with code 0.</doc-pin>
+    </doc-code>
+    <doc-note tone="warn"><strong>Pod stop</strong> kubelet sends SIGTERM to the agent. The agent answers with this same path, never a fast exit.</doc-note>
+  </doc-claim>
+
+  <doc-claim>
+    <p>A game version change drains first, then starts the new binary.</p>
+    <doc-calls title="Version change" caption="The agent does the drain; the controller only waits.">
+<script type="text/plain">
+~ Reconcile(ctx, req)                          @ internal/controller/factorioserver_controller.go:52
++   if agentStatus.gameVersion != spec.gameVersion
++     stopGraceful(ctx)                        @ internal/agent/stop.go:12
++     ensureBinary(spec.gameVersion)           @ internal/agent/download.go:16
++     startFactorio()                          @ internal/agent/factorio.go:30
++   syncStatus(server, agentStatus)            @ internal/controller/status.go:12
+</script>
+    </doc-calls>
+  </doc-claim>
+
+  <doc-claim>
+    <p><code>.spec.suspend</code> drains the game, then the controller deletes the StatefulSet.</p>
+    <doc-code title="Reconcile · sketch" lang="go" start="60">
+<script type="text/plain">
+if server.Spec.Suspend {
+	ag, err := r.dial(ctx, podFor(server))
+	if err == nil {
+		_ = ag.Stop(ctx) // drain + save, as above
+	}
+	if err := r.Delete(ctx, stsFor(server)); err != nil {
+		return ctrl.Result{}, err
+	}
+	meta.SetStatusCondition(&server.Status.Conditions, suspendedTrue)
+	return ctrl.Result{}, nil // no requeue while suspended
+}
+</script>
+      <doc-pin line="66" title="PVC stays">The controller never deletes the claim.</doc-pin>
+    </doc-code>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═══ 3 ═════════════════════════════════════════════════════════ -->
+<doc-claim>
+  <p>The agent sends a Discord message for each join and each leave.</p>
+  <doc-mock frame="none" w="430"><template>
+<div class="dc">
+  <div class="msg"><span class="av">⚙</span><div><div><span class="nm" data-ref="bot">Factorio</span><span class="tg">BOT</span><span class="tm">Today at 22:04</span></div><div class="tx" data-ref="msg">anqou joined the game</div></div></div>
+  <div class="msg"><span class="av">⚙</span><div><div><span class="nm">Factorio</span><span class="tg">BOT</span><span class="tm">Today at 22:31</span></div><div class="tx">kofuk left the game</div></div></div>
+</div>
+</template>
+    <doc-pin ref="bot" title="Webhook bot">The name comes from the post body, as in factorio.yaml.</doc-pin>
+    <doc-pin ref="msg" anchor="r" offset="12,0" title="One post per event">factorio-notify-bot2 goes; the agent does this.</doc-pin>
+  </doc-mock>
+
+  <doc-claim>
+    <p>The agent reads the game output line by line.</p>
+    <doc-code title="logs.go · sketch" lang="go" start="14" caption="Check the two patterns against a live server log.">
+<script type="text/plain">
+var (
+	reJoin  = regexp.MustCompile(`\[JOIN\] (\S+) joined the game`)
+	reLeave = regexp.MustCompile(`\[LEAVE\] (\S+) left the game`)
+)
+
+func (a *Agent) copyOutput(rd io.Reader) {
+	sc := bufio.NewScanner(rd)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		a.log.Info("Factorio", "line", line) // game log → agent log
+		if m := reJoin.FindStringSubmatch(line); m != nil {
+			a.notify(m[1] + " joined the game")
+		}
+		if m := reLeave.FindStringSubmatch(line); m != nil {
+			a.notify(m[1] + " left the game")
+		}
+	}
+}
+</script>
+    </doc-code>
+  </doc-claim>
+
+  <doc-claim>
+    <p>One webhook post goes out per event.</p>
+    <doc-code title="notify.go · sketch" lang="go" start="10">
+<script type="text/plain">
+func (a *Agent) notify(msg string) {
+	if a.webhookURL == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"username": "Factorio", "content": msg})
+	req, err := http.NewRequestWithContext(a.ctx, http.MethodPost, a.webhookURL,
+		strings.NewReader(string(body)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	_, _ = a.http.Do(req) // retry 3 times, then log an error
+}
+</script>
+    </doc-code>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═══ 4 ═════════════════════════════════════════════════════════ -->
+<doc-claim>
+  <p>An agent upgrade does not stop the game.</p>
+  <doc-calls title="Upgrade" caption="The pod never restarts during an upgrade.">
+<script type="text/plain">
+~ manager Deployment: new image             @ config/manager/manager.yaml:66
++ controller compares agent.version with its own build
++   Agent.upgrade(ByteStream)                @ rpc/koujouo.capnp:33
++     agent writes /opt/koujouo/agent.next
++     reexec("/opt/koujouo/agent.next")      @ internal/agent/upgrade.go:20
+    Factorio (child) keeps running
+</script>
+  </doc-calls>
+  <doc-note tone="info"><strong>One image</strong> The controller image ships the agent binary.</doc-note>
+
+  <doc-claim at="internal/agent/upgrade.go:20">
+    <p>The agent writes the new binary and calls exec(2) on it.</p>
+    <doc-code title="upgrade.go · sketch" lang="go" start="20">
+<script type="text/plain">
+func reexec(next string) error {
+	os.Setenv("KOUJOUO_FACTORIO_PID", strconv.Itoa(a.factorio.Pid))
+	if err := os.Chmod(next, 0o755); err != nil {
+		return err
+	}
+	return syscall.Exec(next, os.Args, os.Environ()) // same PID, same children
+}
+
+// After exec: the new agent reads KOUJOUO_FACTORIO_PID and
+// re-attaches to the running Factorio process (still its child).
+</script>
+      <doc-pin line="25" title="exec(2)">Child processes keep running across exec.</doc-pin>
+      <doc-pin line="21" title="Env carries the pid">The environment survives exec(2).</doc-pin>
+    </doc-code>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═══ 5 ═════════════════════════════════════════════════════════ -->
+<doc-claim>
+  <p>The agent copies the save file to S3.</p>
+  <doc-mock frame="terminal" title="agent log" w="470"><template>
+<span class="b">agent</span>   uploaded saves/map.zip → s3://example-bucket/factorio-map-20261123-131000.zip
+</template>
+  </doc-mock>
+  <doc-note tone="info"><strong>Copy only</strong> Uploads run hourly and after each stop. Old objects stay.</doc-note>
+
+  <doc-claim at="internal/agent/backup.go:12">
+    <p>A loop uploads the save file, then prunes old objects.</p>
+    <doc-code title="backup.go · sketch" lang="go" start="12">
+<script type="text/plain">
+func (a *Agent) backupLoop(ctx context.Context) {
+	t := time.NewTicker(time.Hour)
+	for {
+		key := "factorio-map-" + time.Now().UTC().Format("20060102-150405") + ".zip"
+		if err := a.s3.Upload(ctx, a.savePath, key); err != nil {
+			a.log.Error(err, "Failed to upload save")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+</script>
+      <doc-pin line="16" title="S3-compatible">aws-sdk-go-v2 with a custom endpoint covers Backblaze B2.</doc-pin>
+    </doc-code>
+  </doc-claim>
+</doc-claim>
+
+<!-- ═══ shared ════════════════════════════════════════════════════ -->
+<doc-claim aux="shared">
+  <p>Shared: the FactorioServer spec and status.</p>
+  <doc-schema id="spec" lang="go" diff title="api/v1/factorioserver_types.go · proposed" caption="Green is new; the Foo field goes.">
+<script type="text/plain">
+ type FactorioServerSpec struct {
+-	// foo is an example field of FactorioServer.
+-	Foo *string `json:"foo,omitempty"`
++	// gameVersion pins the release, for example "2.1.24".
++	GameVersion string `json:"gameVersion"`
++	// suspend stops the game and deletes the StatefulSet. The PVC stays.
++	Suspend bool `json:"suspend,omitempty"`
++	// leaveTimeout waits for players before a forced save. Default 1m.
++	LeaveTimeout *metav1.Duration `json:"leaveTimeout,omitempty"`
++	// saveDataPVCName holds the saves. It exists before this resource.
++	SaveDataPVCName string `json:"saveDataPVCName"`
++	// ephemeralVolumeStorageClassName holds the game binary.
++	EphemeralVolumeStorageClassName string `json:"ephemeralVolumeStorageClassName,omitempty"`
++	Agent        *AgentSpec        `json:"agent,omitempty"`
++	Notification *NotificationSpec `json:"notification,omitempty"`
++	Backup       *BackupSpec       `json:"backup,omitempty"`
++	GameConfig   *GameConfigSpec   `json:"gameConfig,omitempty"`
++	// optional: a username/token Secret for experimental builds
+ }
+
+type AgentSpec struct {
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+type NotificationSpec struct {
+	DiscordWebhook *corev1.SecretKeySelector `json:"discordWebhook,omitempty"`
+}
+type BackupSpec struct {
+	Endpoint      string           `json:"endpoint"`
+	Bucket        string           `json:"bucket"`
+	S3Credentials *S3Credentials `json:"s3Credentials"` // 2 selectors
+}
+type GameConfigSpec struct {
+	ConfigMapRef   *corev1.LocalObjectReference `json:"configMapRef,omitempty"`
+	WhitelistCMRef *corev1.LocalObjectReference `json:"whitelistConfigMapRef,omitempty"`
+}
+// Status: phase (Pending|Downloading|Running|Draining|Saving|Suspended|Failed),
+// currentGameVersion, players + metav1.Conditions.
+</script>
+    <doc-pin line="25" title="Secret, not a field">The old manifest held the URL in clear text.</doc-pin>
+    <doc-pin line="28" title="Added">factorio.yaml used an endpoint and a bucket too.</doc-pin>
+  </doc-schema>
+  <doc-note tone="info"><strong>Group name</strong> The scaffold doubled the group name. Use koujouo.anqou.net.</doc-note>
+  <doc-note tone="info"><strong>Names</strong> Rename every field against Kubernetes API conventions before coding.</doc-note>
+</doc-claim>
+
+<doc-claim aux="scope">
+  <p>Not changing: the scaffold, mods, and auto-updates.</p>
+  <ul>
+    <li>The kubebuilder layout and the Nix flake stay. Follow AGENTS.md.</li>
+    <li>No mod or scenario downloads. The mods folder sits on the save volume.</li>
+    <li>No auto-update to <code>stable</code>. The user pins <code>.spec.gameVersion</code>.</li>
+    <li>No daily restart. The old CronJobs in factorio.yaml did both.</li>
+    <li>rcon stays inside the pod. The old rcon Service goes.</li>
+    <li>The game port stays UDP 34197.</li>
+    <li>Use maintained libraries. Write as little as you can.</li>
+    <li>One subagent runs at a time, in order.</li>
+  </ul>
+</doc-claim>
+
+</doc-plan>
+</main>
+</body>
+</html>

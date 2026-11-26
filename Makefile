@@ -3,6 +3,14 @@ IMG ?= controller:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
+# VERSION is baked into the manager and the agent binaries through LDFLAGS.
+# It is the short git revision, suffixed with -dirty over uncommitted changes:
+# the same value the Nix flake bakes into the image, so a locally built
+# manager recognizes the agents of an image built from the same tree as
+# agents of its own version.
+VERSION ?= $(shell git describe --always --dirty --exclude='*' 2>/dev/null || echo dev)
+LDFLAGS ?= -X koujouo.anqou.net/project/internal/version.Agent=$(VERSION)
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -47,8 +55,12 @@ help: ## Display this help.
 manifests: ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
+.PHONY: generate-capnp
+generate-capnp: ## Generate Go code from rpc/koujouo.capnp.
+	go generate ./rpc
+
 .PHONY: generate
-generate: ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+generate: generate-capnp ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
 
 .PHONY: fmt
@@ -110,11 +122,11 @@ lint-config: ## Verify golangci-lint linter configuration
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -ldflags "$(LDFLAGS)" -o bin/manager ./cmd/manager
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run -ldflags "$(LDFLAGS)" ./cmd/manager
 
 # The image is built by the Nix flake (see .#dockerImage in flake.nix) and
 # loaded into the local container runtime, then re-tagged with ${IMG}.

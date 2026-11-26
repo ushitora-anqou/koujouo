@@ -40,6 +40,7 @@ import (
 
 	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
 	"koujouo.anqou.net/project/internal/controller"
+	"koujouo.anqou.net/project/internal/version"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -57,6 +58,11 @@ type managerConfig struct {
 	metricsCertName      string
 	metricsCertKey       string
 }
+
+// controllerImageEnv names the environment variable that carries the
+// controller image deployed to the agent StatefulSets. The Kustomize
+// deployment injects it with the same value as the manager image.
+const controllerImageEnv = "KOUJOUO_CONTROLLER_IMAGE"
 
 func main() {
 	cfg := managerConfig{} //nolint:exhaustruct_v5 // Fields are populated from flags.
@@ -141,9 +147,23 @@ func run(cfg managerConfig, scheme *runtime.Scheme, setupLog logr.Logger) error 
 		return fmt.Errorf("failed to start manager: %w", err)
 	}
 
+	controllerImage := os.Getenv(controllerImageEnv)
+	if controllerImage == "" {
+		setupLog.Info(controllerImageEnv + " is not set; agent StatefulSets cannot be created")
+	}
+
+	// The poll, retry and progress intervals fall back to the reconciler
+	// defaults.
 	err = (&controller.FactorioServerReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:                    mgr.GetClient(),
+		Scheme:                    mgr.GetScheme(),
+		ControllerImage:           controllerImage,
+		AgentBinaryPath:           "", // The agent binary of the controller image.
+		Dialer:                    &controller.TCPAgentDialer{},
+		Recorder:                  mgr.GetEventRecorder("factorioserver"),
+		PollInterval:              0,
+		RetryInterval:             0,
+		ConfigureProgressInterval: 0,
 	}).SetupWithManager(mgr)
 	if err != nil {
 		return fmt.Errorf("failed to create controller: %w", err)
@@ -160,7 +180,7 @@ func run(cfg managerConfig, scheme *runtime.Scheme, setupLog logr.Logger) error 
 		return fmt.Errorf("failed to set up ready check: %w", err)
 	}
 
-	setupLog.Info("Starting manager")
+	setupLog.Info("Starting manager", "version", version.Agent)
 
 	err = mgr.Start(ctrl.SetupSignalHandler())
 	if err != nil {

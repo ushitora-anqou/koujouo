@@ -65,6 +65,11 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+          # The agent StatefulSets run the same image as the controller.
+          # The value is substituted by Kustomize from the image above.
+          - name: KOUJOUO_CONTROLLER_IMAGE
+            value: $(KOUJOUO_CONTROLLER_IMAGE)
         ports:
         - containerPort: 8081
           name: health

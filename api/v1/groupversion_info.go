@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package v1 contains API Schema definitions for the koujouo.anqou.net v1 API group.
 // +kubebuilder:object:generate=true
-// +groupName=koujouo.anqou.net.koujouo.anqou.net
+// +groupName=koujouo.anqou.net
 package v1
 
 import (
@@ -32,7 +32,7 @@ var (
 	// This name is used by applyconfiguration generators (e.g. controller-gen).
 	//
 	//nolint:gochecknoglobals // Standard scheme registration pattern.
-	SchemeGroupVersion = schema.GroupVersion{Group: "koujouo.anqou.net.koujouo.anqou.net", Version: "v1"}
+	SchemeGroupVersion = schema.GroupVersion{Group: "koujouo.anqou.net", Version: "v1"}
 
 	// GroupVersion is an alias for SchemeGroupVersion, for backward compatibility.
 	//

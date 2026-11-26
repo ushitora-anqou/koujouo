@@ -1,0 +1,12 @@
+# The PVC that stores the save data. It must exist before the
+# FactorioServer is created; the controller never creates or deletes it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: factorioserver-sample-saves
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi

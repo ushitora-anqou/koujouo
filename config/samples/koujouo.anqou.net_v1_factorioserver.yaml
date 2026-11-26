@@ -1,4 +1,4 @@
-apiVersion: koujouo.anqou.net.koujouo.anqou.net/v1
+apiVersion: koujouo.anqou.net/v1
 kind: FactorioServer
 metadata:
   labels:
@@ -6,4 +6,53 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: factorioserver-sample
 spec:
-  # TODO(user): Add fields here
+  # gameVersion pins the Factorio release to run.
+  gameVersion: "2.1.24"
+  # Name of the existing PVC that stores the save data.
+  savePersistentVolumeClaimName: factorioserver-sample-saves
+  # How long the agent waits for players to leave after warning them
+  # before it forces a save and shutdown. Defaults to 60.
+  leaveTimeoutSeconds: 60
+  gameConfig:
+    config:
+      name: factorioserver-sample-config
+      key: config.ini
+    serverWhitelist:
+      name: factorioserver-sample-config
+      key: server-whitelist.json
+  notification:
+    discordWebhookURL:
+      name: factorioserver-sample-secrets
+      key: discordWebhookURL
+  backup:
+    endpointURL: https://s3.us-west-00.backblazeb2.com
+    bucket: example-bucket
+    credentials:
+      accessKeyId:
+        name: factorioserver-sample-secrets
+        key: s3AccessKeyId
+      secretAccessKey:
+        name: factorioserver-sample-secrets
+        key: s3SecretAccessKey
+  # agent:
+  #   resources:
+  #     requests:
+  #       cpu: "1"
+  #       memory: 1Gi
+  #     limits:
+  #       memory: 1500Mi
+  # ephemeralVolume:
+  #   volumeClaimTemplate:
+  #     spec:
+  #       storageClassName: fast-storage
+  #       accessModes: ["ReadWriteOnce"]
+  #       resources:
+  #         requests:
+  #           storage: 2Gi
+  # downloadCredentials:
+  #   username:
+  #     name: factorioserver-sample-secrets
+  #     key: factorioUsername
+  #   token:
+  #     name: factorioserver-sample-secrets
+  #     key: factorioToken

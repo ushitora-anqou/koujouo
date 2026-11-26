@@ -1,0 +1,25 @@
+# config.ini and the server whitelist, referenced by
+# spec.gameConfig of the FactorioServer sample.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: factorioserver-sample-config
+data:
+  config.ini: |
+    [path]
+    read-data=__PATH__executable__/../../data
+    write-data=/var/lib/koujouo/write-data
+
+    [other]
+    autosave-interval=5
+    autosave-slots=3
+
+    [multiplayer-lobby]
+    name=factorioserver-sample
+    max-players=0
+    only-admins-can-pause=true
+    autosave-only-on-server=true
+    non-blocking-saving=true
+    verify-user-identity=true
+  server-whitelist.json: |
+    ["player1", "player2"]
