@@ -25,6 +25,11 @@ jobs:
         uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1.2.1
 
       - name: Running Test e2e
+        # DISCORD_WEBHOOK_URL is optional: without the repository secret the
+        # suite creates no webhook Secret and the FactorioServer runs
+        # without Discord notifications.
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           go mod tidy
           make test-e2e

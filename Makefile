@@ -79,9 +79,14 @@ test: manifests generate fmt vet ## Run tests.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # kubectl kuberc is disabled by default for test isolation; enable with:
 # - KUBECTL_KUBERC=true
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
+# CertManager is not needed: the project has no webhook, so test-e2e skips its installation.
+# DISCORD_WEBHOOK_URL, when set, is handed to the FactorioServer of the suite
+# (as a Secret); the suite runs without Discord notifications otherwise.
 KIND_CLUSTER ?= koujouo-test-e2e
+# The suite builds the image with Nix, deploys the operator and lets the
+# agent download the Factorio headless build, which takes longer than the
+# ten minutes go test allows by default.
+E2E_TIMEOUT ?= 40m
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -99,7 +104,8 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) CERT_MANAGER_INSTALL_SKIP=true \
+		go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e

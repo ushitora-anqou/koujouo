@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 // Package utils provides helpers shared by the e2e test suite, such as
-// running kubectl and managing the cert-manager installation.
+// running kubectl, following pod logs, inspecting volumes and managing
+// the cert-manager installation.
 package utils
 
 import (
@@ -27,6 +28,14 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck // Ginkgo DSL import is the framework convention.
 )
@@ -39,10 +48,37 @@ const (
 	defaultKindCluster = "kind"
 
 	outputFilePermission = 0o644
+
+	// inspectorImage runs the volume inspector. It is pinned so that the
+	// suite does not depend on a moving tag.
+	inspectorImage = "busybox:1.36"
+
+	// inspectorContainer is the name of the container of the inspector Pod.
+	inspectorContainer = "inspect"
+
+	// inspectorUID is the user of the inspector Pod: the agent user, whose
+	// files it reads. It matches the nonroot user of the controller image.
+	inspectorUID = int64(65532)
+
+	// inspectorVolume is the name of the volume of the inspector Pod and
+	// inspectorMountPath is where it mounts the claim.
+	inspectorVolume    = "volume"
+	inspectorMountPath = "/mnt"
+
+	// inspectorPoll and inspectorTimeout bound the wait for the
+	// inspector Pod to finish; the timeout includes the image pull.
+	inspectorPoll    = 2 * time.Second
+	inspectorTimeout = 5 * time.Minute
+
+	// inspectorDeleteTimeout bounds the deletion of the inspector Pod.
+	inspectorDeleteTimeout = 1 * time.Minute
 )
 
 // errCodeNotFound is returned when the target snippet is missing from the file.
 var errCodeNotFound = errors.New("unable to find the code to be uncommented")
+
+// errInspectorFailed marks an inspector Pod whose script exited non-zero.
+var errInspectorFailed = errors.New("the inspector Pod failed")
 
 func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
@@ -274,5 +310,233 @@ func writeUncommentedTarget(out *bytes.Buffer, target, prefix string) error {
 		if err != nil {
 			return fmt.Errorf("failed to write to output: %w", err)
 		}
+	}
+}
+
+// Kubectl runs kubectl with args and returns its combined output. The
+// command inherits the environment of the suite, so the kuberc setting
+// of the suite applies to it.
+func Kubectl(ctx context.Context, args ...string) (string, error) {
+	//nolint:gosec // kubectl is a fixed binary; the arguments come from the suite itself.
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+
+	return Run(cmd)
+}
+
+// PodLogFollower streams the logs of a Pod into memory, from the first
+// line on, until the container terminates or the stream is stopped. The
+// text stays available after the Pod is gone, so the suite can assert on
+// the logs of a Pod whose deletion it triggers itself.
+type PodLogFollower struct {
+	stop context.CancelFunc
+	done chan struct{}
+	mu   sync.Mutex
+	text bytes.Buffer
+}
+
+// FollowPodLogs starts following the logs of the Pod namespace/name.
+func FollowPodLogs(ctx context.Context, namespace, name string) (*PodLogFollower, error) {
+	ctx, cancel := context.WithCancel(ctx)
+
+	//nolint:gosec // kubectl is a fixed binary; the arguments come from the suite itself.
+	cmd := exec.CommandContext(ctx, "kubectl", "logs", "--namespace", namespace, "--follow", name)
+
+	follower := &PodLogFollower{
+		stop: cancel,
+		done: make(chan struct{}),
+		mu:   sync.Mutex{},
+		text: bytes.Buffer{},
+	}
+	cmd.Stdout = follower
+	cmd.Stderr = follower
+
+	err := cmd.Start()
+	if err != nil {
+		cancel()
+
+		return nil, fmt.Errorf("could not follow the logs of Pod %s: %w", name, err)
+	}
+
+	go func() {
+		// The exit of kubectl is not an error of the suite: the stream
+		// ends with the container, and kubectl reports its own failures
+		// on the captured standard error.
+		_ = cmd.Wait()
+
+		close(follower.done)
+	}()
+
+	return follower, nil
+}
+
+// Write appends to the captured log, which makes the follower the
+// standard output and error of kubectl.
+func (f *PodLogFollower) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	written, err := f.text.Write(p)
+	if err != nil {
+		return written, fmt.Errorf("could not capture the log output: %w", err)
+	}
+
+	return written, nil
+}
+
+// Text returns the logs captured so far.
+func (f *PodLogFollower) Text() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.text.String()
+}
+
+// Done is closed once the log stream ended, which is when the container
+// terminated or the follower was stopped.
+func (f *PodLogFollower) Done() <-chan struct{} {
+	return f.done
+}
+
+// Stop ends the log stream and waits until it ended.
+func (f *PodLogFollower) Stop() {
+	f.stop()
+	<-f.done
+}
+
+// RunVolumeInspector runs a short-lived busybox Pod named name that
+// mounts claim read-only at /mnt, runs script and returns the output of
+// the script. The Pod is deleted before the function returns.
+func RunVolumeInspector(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	namespace, claim, name, script string,
+) (string, error) {
+	pods := clientset.CoreV1().Pods(namespace)
+
+	_, err := pods.Create(ctx, newInspectorPod(namespace, claim, name, script), metav1.CreateOptions{})
+	if err != nil {
+		return "", fmt.Errorf("could not create the inspector Pod %s: %w", name, err)
+	}
+
+	defer func() {
+		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inspectorDeleteTimeout)
+		defer cancel()
+
+		err := pods.Delete(deleteCtx, name, metav1.DeleteOptions{})
+		if err != nil {
+			warnError(fmt.Errorf("could not delete the inspector Pod %s: %w", name, err))
+		}
+	}()
+
+	err = wait.PollUntilContextTimeout(ctx, inspectorPoll, inspectorTimeout, true, inspectorFinished(pods, name))
+	if err != nil {
+		return "", fmt.Errorf("the inspector Pod %s did not finish: %w: %s", name, err, podOutput(ctx, pods, name))
+	}
+
+	err = inspectorResult(ctx, pods, name)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, podOutput(ctx, pods, name))
+	}
+
+	output, err := podLogs(ctx, pods, name)
+	if err != nil {
+		return "", fmt.Errorf("could not read the output of the inspector Pod %s: %w", name, err)
+	}
+
+	return output, nil
+}
+
+// inspectorResult checks that the inspector Pod name ran its script to
+// completion.
+func inspectorResult(ctx context.Context, pods typedcorev1.PodInterface, name string) error {
+	pod, err := pods.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("could not get the inspector Pod %s: %w", name, err)
+	}
+
+	if pod.Status.Phase != corev1.PodSucceeded {
+		return fmt.Errorf("%w with phase %s", errInspectorFailed, pod.Status.Phase)
+	}
+
+	return nil
+}
+
+// inspectorFinished reports whether the inspector Pod name stopped
+// running, successfully or not.
+func inspectorFinished(pods typedcorev1.PodInterface, name string) wait.ConditionWithContextFunc {
+	return func(ctx context.Context) (bool, error) {
+		pod, err := pods.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Errorf("could not get the inspector Pod %s: %w", name, err)
+		}
+
+		phase := pod.Status.Phase
+
+		return phase == corev1.PodSucceeded || phase == corev1.PodFailed, nil
+	}
+}
+
+// podLogs returns the logs of the Pod name.
+func podLogs(ctx context.Context, pods typedcorev1.PodInterface, name string) (string, error) {
+	logs, err := pods.GetLogs(name, &corev1.PodLogOptions{}).Do(ctx).Raw()
+	if err != nil {
+		return "", fmt.Errorf("could not read the logs of Pod %s: %w", name, err)
+	}
+
+	return string(logs), nil
+}
+
+// podOutput returns the logs of the Pod name, or the error of the log
+// request, so that it can be embedded in an error message.
+func podOutput(ctx context.Context, pods typedcorev1.PodInterface, name string) string {
+	logs, err := podLogs(ctx, pods, name)
+	if err != nil {
+		return fmt.Sprintf("could not read the logs of the inspector Pod: %v", err)
+	}
+
+	return logs
+}
+
+// newInspectorPod returns a Pod that mounts claim read-only and runs
+// script with busybox. The Pod satisfies the restricted Pod Security
+// Standards and runs as the agent user, so that it can read the files
+// the agent wrote.
+func newInspectorPod(namespace, claim, name, script string) *corev1.Pod {
+	runtimeDefault := &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot:   new(true),
+				RunAsUser:      new(inspectorUID),
+				RunAsGroup:     new(inspectorUID),
+				FSGroup:        new(inspectorUID),
+				SeccompProfile: runtimeDefault,
+			},
+			Containers: []corev1.Container{{
+				Name:    inspectorContainer,
+				Image:   inspectorImage,
+				Command: []string{"sh", "-c", script},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: inspectorVolume, MountPath: inspectorMountPath, ReadOnly: true},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: new(false),
+					ReadOnlyRootFilesystem:   new(true),
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: inspectorVolume,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: claim,
+						ReadOnly:  true,
+					},
+				},
+			}},
+		},
 	}
 }
