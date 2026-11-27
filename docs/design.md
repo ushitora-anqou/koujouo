@@ -324,7 +324,7 @@ log:
 
 ログは `log.development`（コンソール / JSON の選択）と `log.level`（`zapcore.Level.Set` でパースする debug / info / warn / error など）で決め、`zap.Options{Development, Level}` に渡す。全キーと既定値は `examples/manager.yaml` と `examples/agent.yaml` にコメント付きで置く。読み込みは `cmd/manager/config_test.go` と `cmd/agent/config_test.go` で unit テストする（既定値・全キー・欠落とパース失敗）。
 
-設定ファイルの配置は Helm chart が担う（manager は ConfigMap を `/etc/koujouo/manager.yaml` に mount、agent は image 内のファイル）。image に manager 用の設定を焼き込まない理由は、`controllerImage` などがリリースごとに変わるため。
+設定ファイルの配置は Helm chart（`charts/koujouo`）が担う（manager は chart が生成する ConfigMap を `/etc/koujouo/manager.yaml` に mount、agent は image 内のファイル）。image に manager 用の設定を焼き込まない理由は、`controllerImage` などがリリースごとに変わるため。chart は自身の `image` values を `controllerImage` に書き込むので、manager と agent のイメージは常に一致する。
 
 ---
 
@@ -710,8 +710,19 @@ internal/agent/
   backup.go                新規  backupLoop（1 時間毎 + graceful stop 後）、S3 PutObject
   rcon.go                  新規  gorcon の薄ラッパ（PlayersOnline/Chat）
 
-config/samples/            修正  FactorioServer のサンプル CR
-config/crd, config/rbac    自動  make manifests
+charts/koujouo/
+  Chart.yaml               新規  apiVersion v2 / type application / version 0.1.0 / appVersion "0.0.1"
+  values.yaml              新規  image・manager の設定・securityContext・ServiceMonitor・NetworkPolicy
+  templates/               新規  Deployment・ConfigMap・ServiceAccount・RBAC・metrics Service など
+  templates/koujouo.anqou.net_factorioservers.yaml  自動  make manifests（CRD）
+  templates/manager-role.yaml                       自動  make manifests（manager の ClusterRole）
+
+examples/
+  pvc.yaml                 移動  config/samples/ から（保存用 PVC）
+  configmap.yaml           移動  config/samples/ から（config.ini と whitelist）
+  secret.yaml              移動  config/samples/ から（プレースホルダーの Secret）
+  factorioserver.yaml      移動  config/samples/ から（FactorioServer のサンプル CR）
+  README.md                新規  適用順（PVC → ConfigMap/Secret → FactorioServer）
 
 test/e2e/
   e2e_suite_test.go        修正  （必要なら）タイムアウト延長
@@ -779,7 +790,7 @@ controller のロジックを実際の API server で検証。agent は動かな
 
 ### 7.3 e2e（kind、`make test-e2e`）
 
-既存の `test/e2e` 枠組み（`make docker-build IMG=...` → `utils.LoadImageToKindClusterWithName` → `make deploy`）をそのまま使う。`BeforeSuite` がこの 3 ステップと `make install` を 1 回だけ行い、2 つのコンテナが同じ operator を使う。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image ビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 40m）を指定する。
+既存の `test/e2e` 枠組み（`make docker-build IMG=...` → `utils.LoadImageToKindClusterWithName` → `helm upgrade --install koujouo charts/koujouo -n koujouo-system --set image.repository=... --set image.tag=...`）をそのまま使う。`BeforeSuite` がこの 3 ステップを 1 回だけ行い、2 つのコンテナが同じ operator を使う。Namespace `koujouo-system` は事前に作り、`restricted` の Pod Security Standards を enforce する（chart は Namespace を作らない）。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image ビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 40m）を指定する。
 
 | コンテナ | ファイル | 内容 |
 |---|---|---|
@@ -831,5 +842,5 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 9. **過去バージョンのゲームバイナリ**: ephemeral volume に残る（約 313 MB / 版）。Pod 再作成で消える。既定 2Gi では数回のバージョン変更で埋まる。
 10. **GitHub Actions 上での e2e**: ローカルの kind（docker 29.9.3 / kind v0.33.0）でのみ確認済み。runner 上では未実行。Docker Hub と factorio.com への外向き通信が必要。
 11. **`agent-state.json`**: save volume に最終 Config を保存するため、Discord の webhook URL と S3 の鍵が平文で入る（パーミッション 0600）。
-12. **`config/` の Kustomize マニフェストと e2e の追従**: 両バイナリのフラグと環境変数を廃止したため、`config/manager/manager.yaml` の `args`（`--leader-elect` など）と `KOUJOUO_CONTROLLER_IMAGE`、`config/default/manager_metrics_patch.yaml` は現行のバイナリに合わない。Helm chart が manager の設定を ConfigMap として書き、Deployment の `args` を `--config` だけにする。e2e（`test/e2e`）はこの chart もしくは更新後の `config/` でデプロイする必要がある。
+12. **`config/` の Kustomize マニフェストと e2e の追従**: → 解消。Kustomize のツリー（`config/`）は削除し、Helm chart `charts/koujouo` が manager の設定を ConfigMap（`koujouo-config`）として書き、Deployment の `args` を `--config /etc/koujouo/manager.yaml` だけにした。`controllerImage` は chart が自身の `image` values から書くので、`KOUJOUO_CONTROLLER_IMAGE` も `config/default/manager_metrics_patch.yaml` も不要になった。`make manifests` は CRD と manager の ClusterRole を `charts/koujouo/templates/` に直接生成し、`make lint` が `helm lint charts/koujouo` を回す。サンプルは `examples/` に移した（適用順は `examples/README.md`）。e2e（`test/e2e`）の Helm 化は次の段で行う。
 13. **reconcile のタイムアウトと configure / stop の待機**: 待機と進捗の status パッチは `context.WithoutCancel` で reconcile の期限から切り離してある。controller の停止時のみ中断され、次の reconcile が続きを行う。

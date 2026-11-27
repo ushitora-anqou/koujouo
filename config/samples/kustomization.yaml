@@ -1,7 +1,0 @@
-## Append samples of your project ##
-resources:
-- koujouo.anqou.net_v1_factorioserver.yaml
-- pvc.yaml
-- configmap.yaml
-- secret.yaml
-# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,7 +1,11 @@
+# Protects the metrics endpoint with authentication and authorization: only
+# users and service accounts the API server allows may read it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: metrics-auth-role
+  name: {{ include "koujouo.fullname" . }}-metrics-auth-role
+  labels:
+    {{- include "koujouo.labels" . | nindent 4 }}
 rules:
 - apiGroups:
   - authentication.k8s.io

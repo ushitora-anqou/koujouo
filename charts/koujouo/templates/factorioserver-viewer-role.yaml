@@ -4,14 +4,12 @@
 # Grants read-only access to koujouo.anqou.net resources.
 # This role is intended for users who need visibility into these resources
 # without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
-
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
+  name: {{ include "koujouo.fullname" . }}-factorioserver-viewer
   labels:
-    app.kubernetes.io/name: koujouo
-    app.kubernetes.io/managed-by: kustomize
-  name: factorioserver-viewer-role
+    {{- include "koujouo.labels" . | nindent 4 }}
 rules:
 - apiGroups:
   - koujouo.anqou.net

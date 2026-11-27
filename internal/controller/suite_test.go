@@ -72,8 +72,11 @@ var _ = BeforeSuite(func() {
 
 	By("bootstrapping test environment")
 
+	// The chart holds the CRD `make manifests` generates. The path names the
+	// file rather than its directory, which also holds the other templates.
+	crdPath := filepath.Join("..", "..", "charts", "koujouo", "templates", "koujouo.anqou.net_factorioservers.yaml")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths:     []string{crdPath},
 		ErrorIfCRDPathMissing: true,
 	}
 

@@ -1,0 +1,15 @@
+{{- /* The manager reads its configuration from this file; the Deployment
+mounts the ConfigMap at /etc/koujouo. controllerImage always follows the image
+of the Deployment, so the agent StatefulSets run the manager's own image. */ -}}
+{{- $config := deepCopy .Values.config -}}
+{{- $_ := set $config "controllerImage" (include "koujouo.image" .) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "koujouo.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "koujouo.labels" . | nindent 4 }}
+data:
+  manager.yaml: |
+    {{- toYaml $config | nindent 4 }}

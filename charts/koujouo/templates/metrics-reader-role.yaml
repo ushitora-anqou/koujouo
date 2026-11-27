@@ -1,0 +1,13 @@
+# Grants the read-only access to the metrics endpoint that the metrics Service
+# exposes. Bind it to the users or service accounts that scrape the metrics.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "koujouo.fullname" . }}-metrics-reader
+  labels:
+    {{- include "koujouo.labels" . | nindent 4 }}
+rules:
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get

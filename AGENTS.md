@@ -28,12 +28,12 @@ internal/version/version.go       Build version shared by the manager and the ag
 rpc/koujouo.capnp                 Controller <-> agent protocol (edit this)
 rpc/koujouo.capnp.go              Auto-generated (DO NOT EDIT; from `make generate-capnp`)
 rpc/generate.go                   `go:generate` directive of the schema
-config/crd/bases/*                Generated CRDs (DO NOT EDIT)
-config/manager/                   Manager Deployment; its image also becomes the agent image
-config/rbac/role.yaml             Generated RBAC (DO NOT EDIT)
-config/samples/*                  PVC, ConfigMap, Secret (placeholders) and a FactorioServer
+charts/koujouo/Chart.yaml          Helm chart metadata (version, appVersion)
+charts/koujouo/values.yaml         Helm values: image, configuration, security contexts, ServiceMonitor
+charts/koujouo/templates/          Helm templates; the CRD and manager-role.yaml are generated
 examples/manager.yaml             Manager configuration (every key with its default)
 examples/agent.yaml               Agent configuration (every key with its default)
+examples/*.yaml                   PVC, ConfigMap, Secret (placeholders) and a FactorioServer
 test/e2e/                         E2E suite (build tag `e2e`); test/utils/ holds its helpers
 docs/design.md                    Design notes (Japanese): libraries, CRD and capnp schemas, tests
 docs/factorio-server-plan*.html   The plan docs/design.md was derived from
@@ -46,8 +46,9 @@ Makefile                          Build/test/deploy commands
 PROJECT                           Kubebuilder metadata Auto-generated (DO NOT EDIT)
 ```
 
-`internal/webhook/` and `config/webhook/` do not exist until `kubebuilder create webhook`
-scaffolds them.
+`internal/webhook/` and the webhook manifests do not exist until
+`kubebuilder create webhook` scaffolds them (`config/webhook/manifests.yaml`, which
+belongs in `charts/koujouo/templates/` like the other generated manifests).
 
 **Multi-group layout** (for projects with multiple API groups):
 ```
@@ -110,7 +111,7 @@ them with `go install` or download them manually (the Go tools of go.mod are
 the exception: they run as `go tool <name>`, never installed):
 
 ```bash
-nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, kustomize,
+nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, helm, yq,
               # setup-envtest, controller-gen, capnp
 ```
 
@@ -158,9 +159,9 @@ otherwise your edits are silently excluded from the build.
 ## Critical Rules
 
 ### Never Edit These (Auto-Generated)
-- `config/crd/bases/*.yaml` - from `make manifests`
-- `config/rbac/role.yaml` - from `make manifests`
-- `config/webhook/manifests.yaml` - from `make manifests` (once a webhook exists)
+- `charts/koujouo/templates/koujouo.anqou.net_factorioservers.yaml` - from `make manifests`
+- `charts/koujouo/templates/manager-role.yaml` - from `make manifests`
+- the webhook manifests of the chart - from `make manifests` (once a webhook exists)
 - `**/zz_generated.*.go` - from `make generate`
 - `rpc/koujouo.capnp.go` - from `make generate-capnp`; edit `rpc/koujouo.capnp` instead
 - `PROJECT` - from `kubebuilder [OPTIONS]`
@@ -184,15 +185,15 @@ The manager and the agent are upgraded separately: the agent of a running game k
 binary until the new manager replaces it. Keep these couplings intact:
 
 - **Image layout**: `/manager` (entrypoint) and `/kojouo/agent` are referenced in `flake.nix`,
-  `config/manager/manager.yaml`, `internal/controller/resources/statefulset.go` (`AgentCommand`)
-  and `internal/controller/agentupgrade.go` (`defaultAgentBinaryPath`). Rename them together.
+  `charts/koujouo/templates/deployment.yaml` (the image), `internal/controller/resources/statefulset.go`
+  (`AgentCommand`) and `internal/controller/agentupgrade.go` (`defaultAgentBinaryPath`). Rename them
+  together.
 - **Controller image**: the `controllerImage` key of the manager configuration (the ConfigMap
   mounted at `/etc/koujouo/manager.yaml`) names the image the agent StatefulSets run; it normally
   holds the manager's own image. Empty leaves the controller unable to create a StatefulSet
-  (`errControllerImageUnset`). The manager container must stay `containers[0]` of the manager
-  Deployment, whose image the configuration mirrors. The Kustomize deployment of `config/` still
-  passes the removed command-line flags and the removed `KOUJOUO_CONTROLLER_IMAGE` environment
-  variable: it is superseded by the Helm chart, which writes the configuration file.
+  (`errControllerImageUnset`). The chart writes that ConfigMap itself: it sets `controllerImage` to
+  its `image` values, so the manager Deployment and the agents always run the same image. The
+  manager container must stay `containers[0]` of the manager Deployment.
 - **In-place agent upgrade**: the build stamps the same version into both binaries
   (`internal/version.Agent`). An agent that reports another version receives `/kojouo/agent` from
   the manager and `execve(2)s` it without stopping the game. Consequences:
@@ -228,7 +229,7 @@ suite needs.
 
 **After editing `*_types.go` or markers:**
 ```
-make manifests  # Regenerate CRDs/RBAC from markers
+make manifests  # Regenerate the CRD and the manager ClusterRole of the chart from markers
 make generate   # Regenerate DeepCopy methods
 ```
 
@@ -411,13 +412,16 @@ git add -A  # the flake only sees git-tracked files when building the image
 # 1. Regenerate manifests
 make manifests generate
 
-# 2. Build & deploy
+# 2. Build & push the image, then install the chart with it
 export IMG=<registry>/koujouo:tag
 make docker-build docker-push IMG=$IMG  # Image built by Nix, loaded into the local runtime, re-tagged to ${IMG}
-make deploy IMG=$IMG                    # Also rewrites the image in config/manager/kustomization.yaml
+helm upgrade --install koujouo charts/koujouo -n koujouo-system --create-namespace \
+  --set image.repository=<registry>/koujouo --set image.tag=tag
 
 # 3. Create a server: the PVC, the ConfigMap and the Secret it refers to, then the FactorioServer
-kubectl apply -k config/samples/
+kubectl apply -n <namespace> -f examples/pvc.yaml
+kubectl apply -n <namespace> -f examples/configmap.yaml -f examples/secret.yaml
+kubectl apply -n <namespace> -f examples/factorioserver.yaml
 
 # 4. Debug
 kubectl logs -n koujouo-system deployment/koujouo-controller-manager -c manager -f
@@ -425,10 +429,16 @@ kubectl logs -n <namespace> <factorioserver-name>-0 -c agent -f   # agent log wi
 kubectl get factorioserver                                        # short name: fsrv
 ```
 
-A `FactorioServer` refers to three objects that you create yourself (see `config/samples/`):
+The chart in `charts/koujouo/` is the only way to deploy the operator; there is no Kustomize
+tree any more. `make manifests` writes the CRD and the manager ClusterRole straight into
+`charts/koujouo/templates/`, so a change of the markers shows up as a chart change. The chart
+creates no Namespace: it installs into the namespace of the release (`koujouo-system` above,
+which the e2e creates and labels with the `restricted` Pod Security Standards).
+
+A `FactorioServer` refers to three objects that you create yourself (see `examples/`):
 the save PVC (`.spec.savePersistentVolumeClaimName`), a ConfigMap with `config.ini` and the server
 whitelist (`.spec.gameConfig`), and a Secret with the Discord webhook URL, the S3 credentials and,
-for experimental or old builds, the Factorio download credentials. `config/samples/secret.yaml`
+for experimental or old builds, the Factorio download credentials. `examples/secret.yaml`
 holds placeholders: substitute real values in what you apply, never in the tracked file.
 
 ### API Design
@@ -541,22 +551,21 @@ Generated code includes: status conditions (`metav1.Condition`), finalizers, own
 
 ## Distribution Options
 
-### Option 1: YAML Bundle (Kustomize)
+### Option 1: Helm Chart
 
 ```bash
-# Generate dist/install.yaml from Kustomize manifests
-make build-installer IMG=<registry>/<project>:tag
+# Install the chart shipped in this repository
+helm upgrade --install koujouo charts/koujouo -n koujouo-system --create-namespace \
+  --set image.repository=<registry>/koujouo --set image.tag=<tag>
 ```
 
 **Key points:**
-- The `dist/install.yaml` is generated from Kustomize manifests (CRDs, RBAC, Deployment)
-- Commit this file to your repository for easy distribution
-- Users only need `kubectl` to install (no additional tools required)
-
-**Example:** Users install with a single command:
-```bash
-kubectl apply -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/dist/install.yaml
-```
+- `charts/koujouo/` holds the CRD, the RBAC, the configuration ConfigMap and the manager Deployment
+- The CRD carries `helm.sh/resource-policy: keep`, so `helm uninstall` keeps it and the
+  `FactorioServer`s it holds; delete the CRD yourself once none is left
+- `helm package charts/koujouo` produces an archive for users without a checkout
+- `make lint` runs `helm lint charts/koujouo`; `make manifests` refreshes the generated parts of
+  the chart
 
 ### Publish Container Image
 

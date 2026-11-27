@@ -316,7 +316,9 @@ func newMetricsServerOptions(
 	cfg managerConfig,
 	setupLog logr.Logger,
 ) metricsserver.Options {
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'.
+	// The metrics endpoint is configured in the chart: the deployment passes
+	// the address through metricsBindAddress and secureMetrics of the manager
+	// configuration.
 	// The Metrics options configure the server. More info:
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/metrics/server
 	// - https://book.kubebuilder.io/reference/metrics.html
@@ -328,8 +330,8 @@ func newMetricsServerOptions(
 	if cfg.SecureMetrics {
 		// FilterProvider is used to protect the metrics endpoint with authn/authz.
 		// These configurations ensure that only authorized users and service accounts
-		// can access the metrics endpoint. The RBAC are configured in
-		// 'config/rbac/kustomization.yaml'. More info:
+		// can access the metrics endpoint. The chart ships that RBAC in
+		// charts/koujouo/templates/metrics-auth-role.yaml. More info:
 		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/metrics/filters#WithAuthenticationAndAuthorization
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}

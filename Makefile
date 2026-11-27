@@ -51,9 +51,19 @@ help: ## Display this help.
 
 ##@ Development
 
+# The chart holds the generated manifests: the CRD goes straight into its
+# templates, and the manager ClusterRole is rewritten so that Helm names it
+# after the release. The intermediate RBAC output stays under bin/, which git
+# and the flake ignore.
 .PHONY: manifests
-manifests: ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+manifests: ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects into the Helm chart.
+	rm -rf bin/rbac
+	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." \
+		output:crd:artifacts:config=charts/koujouo/templates \
+		output:rbac:artifacts:config=bin/rbac
+	"$(YQ)" -i '.metadata.annotations."helm.sh/resource-policy" = "keep"' charts/koujouo/templates/koujouo.anqou.net_factorioservers.yaml
+	"$(YQ)" '.metadata.name = "{{ include \"koujouo.fullname\" . }}-manager-role"' bin/rbac/role.yaml > charts/koujouo/templates/manager-role.yaml
+	rm -rf bin/rbac
 
 .PHONY: generate-capnp
 generate-capnp: ## Generate Go code from rpc/koujouo.capnp.
@@ -109,8 +119,9 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: lint
-lint: ## Run golangci-lint linter
+lint: ## Run golangci-lint on the Go code and helm lint on the chart.
 	"$(GOLANGCI_LINT)" run
+	"$(HELM)" lint charts/koujouo
 
 .PHONY: lint-fix
 lint-fix: ## Run golangci-lint linter and perform fixes
@@ -148,37 +159,6 @@ docker-build: ## Build docker image with the manager via Nix.
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
-.PHONY: build-installer
-build-installer: manifests generate ## Generate a consolidated YAML with CRDs and deployment.
-	mkdir -p dist
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default > dist/install.yaml
-
-##@ Deployment
-
-ifndef ignore-not-found
-  ignore-not-found = false
-endif
-
-.PHONY: install
-install: manifests ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" apply -f -; else echo "No CRDs to install; skipping."; fi
-
-.PHONY: uninstall
-uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
-
-.PHONY: deploy
-deploy: manifests ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
-
-.PHONY: undeploy
-undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
-
 ##@ Dependencies
 
 ## Tool Binaries
@@ -189,7 +169,8 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 ##     nix develop
 KUBECTL ?= kubectl
 KIND ?= kind
-KUSTOMIZE ?= kustomize
+HELM ?= helm
+YQ ?= yq
 CONTROLLER_GEN ?= controller-gen
 ENVTEST ?= setup-envtest
 GOLANGCI_LINT ?= golangci-lint

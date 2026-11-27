@@ -53,26 +53,28 @@ make docker-build docker-push IMG=<some-registry>/koujouo:tag
 And it is required to have access to pull the image from the working environment.
 Make sure you have the proper permission to the registry if the above commands don’t work.
 
-**Install the CRDs into the cluster:**
+**Install the CRD, the RBAC and the manager with the Helm chart:**
 
 ```sh
-make install
+helm upgrade --install koujouo charts/koujouo -n koujouo-system --create-namespace \
+  --set image.repository=<some-registry>/koujouo --set image.tag=tag
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
-make deploy IMG=<some-registry>/koujouo:tag
-```
+The chart in [`charts/koujouo`](charts/koujouo) holds the `FactorioServer` CRD,
+the RBAC, the configuration ConfigMap and the manager Deployment. It creates no
+Namespace itself: the command above creates `koujouo-system`, and the chart
+installs into the namespace of the release. Its
+[`values.yaml`](charts/koujouo/values.yaml) lists the settings you can
+override. The CRD carries the `helm.sh/resource-policy: keep` annotation, so
+`helm uninstall` leaves it (and the `FactorioServer`s it holds) behind.
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
 privileges or be logged in as admin.
 
 The manager reads its configuration from `/etc/koujouo/manager.yaml`, which the
-deployment mounts from a ConfigMap (see [Configuration](#configuration)). The
-scaffolded Kustomize manifests in `config/` still start the manager with the
-command-line flags it no longer takes; they need to mount the configuration file
-and pass `--config` instead.
+Deployment mounts from the ConfigMap the chart writes (see
+[Configuration](#configuration)). The image also runs the agent Pods: the chart
+puts its own image into `controllerImage` there.
 
 **Create a server**
 
@@ -84,13 +86,15 @@ A `FactorioServer` refers to three things that you create first:
 | ConfigMap | `config.ini` and the server whitelist (`.spec.gameConfig`) |
 | Secret | the Discord webhook URL, the S3 credentials and, for experimental or old builds, the Factorio download credentials |
 
-The samples in `config/samples/` show all of them. Edit the placeholders in
-`config/samples/secret.yaml` and, if your cluster has no default
-StorageClass, set `storageClassName` in `config/samples/pvc.yaml`. Then apply
-them:
+The samples in [`examples/`](examples/) show all of them; see
+[`examples/README.md`](examples/README.md) for the order. Edit the placeholders
+in `examples/secret.yaml` and, if your cluster has no default StorageClass, set
+`storageClassName` in `examples/pvc.yaml`. Then apply them:
 
 ```sh
-kubectl apply -k config/samples/
+kubectl apply -n <namespace> -f examples/pvc.yaml
+kubectl apply -n <namespace> -f examples/configmap.yaml -f examples/secret.yaml
+kubectl apply -n <namespace> -f examples/factorioserver.yaml
 ```
 
 The controller creates the StatefulSet, the agent downloads Factorio
@@ -148,7 +152,9 @@ The manager's `controllerImage` is the image the agent Pods run: the controller
 deploys it for the StatefulSets it creates and streams `/kojouo/agent` from its
 own filesystem to the agents of another build, so it normally holds the
 manager's own image. With an empty `controllerImage` the controller cannot
-create a StatefulSet.
+create a StatefulSet. The Helm chart always sets it to its own image, so the
+`image` values of the chart are the single place to change it; the
+`controllerImage` key of `examples/manager.yaml` is for `make run` only.
 
 `make run` runs the manager on the host with `examples/manager.yaml`.
 
@@ -169,67 +175,46 @@ create a StatefulSet.
 **Delete the instances (CRs) from the cluster:**
 
 ```sh
-kubectl delete -k config/samples/
+kubectl delete -n <namespace> -f examples/factorioserver.yaml
 ```
 
 Deleting a `FactorioServer` deletes its StatefulSet. The PersistentVolumeClaim
 is yours and is not deleted.
 
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
 **UnDeploy the controller from the cluster:**
 
 ```sh
-make undeploy
+helm uninstall koujouo -n koujouo-system
+```
+
+**Delete the API(CRD) from the cluster:**
+
+The CRD carries the `helm.sh/resource-policy: keep` annotation, so
+`helm uninstall` keeps it — together with the `FactorioServer`s it holds.
+Delete it yourself once no FactorioServer is left (this deletes them all):
+
+```sh
+kubectl delete crd factorioservers.koujouo.anqou.net
 ```
 
 ## Project Distribution
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/koujouo:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/koujouo/<tag or branch>/dist/install.yaml
-```
-
 ### By providing a Helm Chart
 
-1. Build the chart using the optional helm plugin
+The chart lives in [`charts/koujouo`](charts/koujouo) and is what the
+[quick start](#to-deploy-on-the-cluster) installs. Users can install it from a
+checkout of this repository as shown there, or package it into an archive of
+its own:
 
 ```sh
-kubebuilder edit --plugins=helm/v2-alpha
+helm package charts/koujouo
+helm upgrade --install koujouo koujouo-0.1.0.tgz -n koujouo-system --create-namespace \
+  --set image.repository=<some-registry>/koujouo --set image.tag=tag
 ```
 
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
+`make manifests` refreshes the generated parts of the chart (the CRD and the
+manager ClusterRole), so commit the chart together with the API changes it
+reflects.
 
 ## Contributing
 Enter the development shell first; it provides every tool:
@@ -240,8 +225,9 @@ nix develop
 
 | Command | What it does |
 | --- | --- |
-| `make manifests generate` | Regenerates the CRDs, RBAC and DeepCopy code after editing `api/` |
+| `make manifests generate` | Regenerates the CRD and the manager ClusterRole of the Helm chart and the DeepCopy code after editing `api/` |
 | `make generate-capnp` | Regenerates `rpc/koujouo.capnp.go` after editing `rpc/koujouo.capnp` |
+| `make lint` | Runs golangci-lint and `helm lint charts/koujouo` |
 | `make lint-fix` | Runs golangci-lint and fixes what it can |
 | `make test` | Unit tests and envtest tests |
 | `make test-e2e` | End-to-end tests on a dedicated Kind cluster with the real Factorio binary |

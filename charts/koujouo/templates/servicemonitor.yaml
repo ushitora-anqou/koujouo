@@ -1,0 +1,24 @@
+{{- if .Values.serviceMonitor.enabled }}
+# Prometheus Monitor Service (Metrics)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "koujouo.fullname" . }}-controller-manager-metrics-monitor
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "koujouo.labels" . | nindent 4 }}
+spec:
+  endpoints:
+    - path: /metrics
+      port: https # Ensure this is the name of the port that exposes HTTPS metrics
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        # The manager serves the metrics endpoint with the self-signed
+        # certificate controller-runtime generates unless config.metricsCertPath
+        # points to a certificate.
+        insecureSkipVerify: {{ .Values.serviceMonitor.insecureSkipVerify }}
+  selector:
+    matchLabels:
+      {{- include "koujouo.selectorLabels" . | nindent 6 }}
+{{- end }}

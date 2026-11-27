@@ -162,7 +162,8 @@
               kubebuilder
               kind
               kubectl
-              kustomize
+              kubernetes-helm
+              yq-go
               setup-envtest
               kubernetes-controller-tools
               capnproto

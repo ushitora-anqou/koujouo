@@ -4,14 +4,12 @@
 # Grants full permissions ('*') over koujouo.anqou.net.
 # This role is intended for users authorized to modify roles and bindings within the cluster,
 # enabling them to delegate specific permissions to other users or groups as needed.
-
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
+  name: {{ include "koujouo.fullname" . }}-factorioserver-admin
   labels:
-    app.kubernetes.io/name: koujouo
-    app.kubernetes.io/managed-by: kustomize
-  name: factorioserver-admin-role
+    {{- include "koujouo.labels" . | nindent 4 }}
 rules:
 - apiGroups:
   - koujouo.anqou.net

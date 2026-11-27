@@ -1,0 +1,111 @@
+# Default values for koujouo.
+#
+# The chart installs the controller manager of the koujouo operator, its RBAC
+# and the FactorioServer CRD.
+
+# fullnameOverride gives the resources of this chart their documented names
+# (koujouo-controller-manager, koujouo-manager-role, ...), which the e2e suite
+# and the documentation refer to. Leave it as it is unless you know what you
+# are doing.
+fullnameOverride: "koujouo"
+
+# nameOverride overrides the app.kubernetes.io/name label (the chart name).
+nameOverride: ""
+
+image:
+  # The image holds both binaries: /manager (the entrypoint) and
+  # /kojouo/agent. The chart passes the same image to the manager's
+  # controllerImage, so the agent StatefulSets run it as well.
+  repository: ghcr.io/ushitora-anqou/koujouo
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  # Create the ServiceAccount the manager runs as, which the RBAC of the chart
+  # refers to.
+  create: true
+  # Name of the ServiceAccount; empty uses <fullname>-controller-manager.
+  name: ""
+  annotations: {}
+  # Mount the API credentials into the manager Pod.
+  automount: true
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod security context of the manager. The chart adheres to the `restricted`
+# Pod Security Standards, which the e2e namespaces enforce.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Security context of the manager container.
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+resources: {}
+# limits:
+#   cpu: 500m
+#   memory: 128Mi
+# requests:
+#   cpu: 10m
+#   memory: 64Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra volumes and volume mounts of the manager Pod; the chart always mounts
+# the configuration ConfigMap at /etc/koujouo.
+extraVolumes: []
+extraVolumeMounts: []
+
+# Configuration of the manager (cmd/manager), which the chart writes into the
+# ConfigMap it mounts at /etc/koujouo/manager.yaml. The file accepts every key
+# of examples/manager.yaml, and a key left out keeps the default of the
+# binary.
+#
+# Do not set controllerImage: the chart always sets it to the image above,
+# which is the image the agent StatefulSets run.
+config:
+  # Address the metrics endpoint binds to, ":8443" for HTTPS, or "0" to
+  # disable the metrics server.
+  metricsBindAddress: ":8443"
+  # Address the health probes (GET /healthz and /readyz) bind to.
+  healthProbeBindAddress: ":8081"
+  # Elect a leader, so that only one manager of several replicas is active.
+  # The chart runs a single replica, so this stays false.
+  leaderElection: false
+  # Serve the metrics endpoint over HTTPS, authenticated and authorized by the
+  # API server. Takes effect only when metricsBindAddress is not "0".
+  secureMetrics: true
+  log:
+    # Log in the human-readable console encoding instead of JSON.
+    development: false
+    # Minimum level to log: debug, info, warn, error, dpanic, panic or fatal.
+    level: info
+
+# Prometheus ServiceMonitor of the metrics endpoint; it needs the
+# monitoring.coreos.com CRDs of the Prometheus Operator.
+serviceMonitor:
+  enabled: false
+  # Skip the verification of the certificate controller-runtime generates for
+  # the metrics server. Set config.metricsCertPath to use your own certificate
+  # and turn this off.
+  insecureSkipVerify: true
+
+# NetworkPolicy of the metrics endpoint: only Pods of the namespaces labeled
+# `metrics: enabled` may scrape it.
+networkPolicy:
+  enabled: false

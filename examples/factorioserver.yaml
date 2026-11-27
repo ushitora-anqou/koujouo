@@ -3,7 +3,6 @@ kind: FactorioServer
 metadata:
   labels:
     app.kubernetes.io/name: koujouo
-    app.kubernetes.io/managed-by: kustomize
   name: factorioserver-sample
 spec:
   # gameVersion pins the Factorio release to run.
