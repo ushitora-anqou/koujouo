@@ -112,6 +112,23 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhasePending))
 			expectCondition(server, "Progressing", metav1.ConditionTrue, "AgentUnavailable")
 		})
+
+		It("should not write the StatefulSet again while nothing drifts", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			created := expectAgentStatefulSet(ctx, serverName, serverName+"-saves")
+
+			// The second reconcile finds the StatefulSet as desired, so
+			// CreateOrUpdate must leave it untouched: a write would bump the
+			// resource version, which is set to a new value on every update.
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(
+				expectAgentStatefulSet(ctx, serverName, serverName+"-saves").ResourceVersion,
+			).To(Equal(created.ResourceVersion))
+		})
 	})
 
 	Context("When the agent is reachable", func() {

@@ -28,12 +28,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -44,7 +46,7 @@ import (
 	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
-var errControllerImageUnset = errors.New("controller image is not set (KOUJOUO_CONTROLLER_IMAGE)")
+var errControllerImageUnset = errors.New("controllerImage of the manager configuration is not set")
 
 const (
 	// defaultPollInterval is how often the agent status is polled.
@@ -65,8 +67,8 @@ type FactorioServerReconciler struct {
 	Scheme *runtime.Scheme
 
 	// ControllerImage is the container image deployed for the agent
-	// containers. It is injected into the manager via the
-	// KOUJOUO_CONTROLLER_IMAGE environment variable.
+	// containers. It is the controllerImage key of the manager
+	// configuration, so it normally holds the image of the manager itself.
 	ControllerImage string
 
 	// AgentBinaryPath is the agent binary of the controller image that
@@ -141,8 +143,17 @@ func (r *FactorioServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	err := ctrl.NewControllerManagedBy(mgr).
-		For(&koujouoanqounetv1.FactorioServer{}). //nolint:exhaustruct_v5 // The builder only needs the type.
-		Owns(&appsv1.StatefulSet{}).
+		// The controller writes the status itself, so a status-only update
+		// must not enqueue the next reconcile: the agent is polled through
+		// the requeue interval and through the Pod watch.
+		For(
+			&koujouoanqounetv1.FactorioServer{}, //nolint:exhaustruct_v5 // The builder only needs the type.
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
+		// The rollout of the agent Pod shows in the StatefulSet status,
+		// which the Pod watch already covers; only a spec change is
+		// reconciled here.
+		Owns(&appsv1.StatefulSet{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Watches(
 			&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(r.podToFactorioServer),
@@ -417,8 +428,8 @@ func agentPodUnavailable(pod *corev1.Pod, found bool) bool {
 	return !found || pod.Status.PodIP == "" || !podIsReady(pod)
 }
 
-// ensureStatefulSet creates the StatefulSet of server when missing and
-// synchronizes the fields the controller owns.
+// ensureStatefulSet creates the StatefulSet of server when it is missing
+// and synchronizes the fields the controller owns on an existing one.
 func (r *FactorioServerReconciler) ensureStatefulSet(
 	ctx context.Context,
 	log logr.Logger,
@@ -433,73 +444,75 @@ func (r *FactorioServerReconciler) ensureStatefulSet(
 		return fmt.Errorf("could not build the desired StatefulSet: %w", err)
 	}
 
-	existing := &appsv1.StatefulSet{}
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace},
+	}
 
-	err = r.Get(ctx, client.ObjectKeyFromObject(server), existing)
+	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
+		// CreateOrUpdate hands over the empty shell above when the
+		// StatefulSet is missing and the object it fetched when it exists,
+		// so the ownership is (re)applied on both paths.
+		ownerErr := controllerutil.SetControllerReference(server, statefulSet, r.Scheme)
+		if ownerErr != nil {
+			return fmt.Errorf("could not set the controller reference: %w", ownerErr)
+		}
+
+		applyStatefulSet(statefulSet, desired)
+
+		return nil
+	})
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return r.createStatefulSet(ctx, log, server, desired)
-		}
-
-		return fmt.Errorf("could not get StatefulSet: %w", err)
+		return fmt.Errorf("could not ensure the StatefulSet: %w", err)
 	}
 
-	if syncStatefulSet(existing, desired) {
-		err = r.Update(ctx, existing)
-		if err != nil {
-			return fmt.Errorf("could not update StatefulSet: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// createStatefulSet creates the desired StatefulSet.
-func (r *FactorioServerReconciler) createStatefulSet(
-	ctx context.Context,
-	log logr.Logger,
-	server *koujouoanqounetv1.FactorioServer,
-	desired *appsv1.StatefulSet,
-) error {
-	err := r.Create(ctx, desired)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("could not create StatefulSet: %w", err)
-	}
-
-	if err == nil {
+	if result == controllerutil.OperationResultCreated {
 		log.Info("Created StatefulSet", "name", server.Name)
 		r.recordEvent(server, "StatefulSetCreated", "Created StatefulSet "+server.Name)
 	}
 
+	if result == controllerutil.OperationResultUpdated {
+		log.Info("Updated StatefulSet", "name", server.Name)
+	}
+
 	return nil
 }
 
-// syncStatefulSet copies the fields the controller owns from desired
-// into existing and reports whether existing changed.
-func syncStatefulSet(existing, desired *appsv1.StatefulSet) bool {
-	changed := false
+// applyStatefulSet copies the desired state into the StatefulSet given to
+// the mutate function of CreateOrUpdate. The empty shell of a StatefulSet
+// that does not exist yet carries no creation timestamp: it gets the whole
+// spec and the labels, while an existing one only receives the fields the
+// controller owns, because selector and serviceName are immutable.
+func applyStatefulSet(statefulSet, desired *appsv1.StatefulSet) {
+	if !statefulSet.CreationTimestamp.IsZero() {
+		syncStatefulSet(statefulSet, desired)
 
+		return
+	}
+
+	statefulSet.Labels = desired.Labels
+	desired.Spec.DeepCopyInto(&statefulSet.Spec)
+}
+
+// syncStatefulSet copies the fields the controller owns from desired into
+// existing. Everything else keeps its live value; the immutable fields
+// (selector, serviceName) are never touched.
+func syncStatefulSet(existing, desired *appsv1.StatefulSet) {
 	desiredContainer := &desired.Spec.Template.Spec.Containers[0]
 
 	existingContainer := containerOf(existing, desiredContainer.Name)
 	if existingContainer == nil {
 		existing.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
-		changed = true
 	} else if containerDrifted(existingContainer, desiredContainer) {
 		syncContainer(existingContainer, desiredContainer)
-
-		changed = true
 	}
 
 	if !equality.Semantic.DeepEqual(existing.Spec.UpdateStrategy, desired.Spec.UpdateStrategy) {
 		existing.Spec.UpdateStrategy = desired.Spec.UpdateStrategy
-		changed = true
 	}
 
 	template := &existing.Spec.Template
 	if !equality.Semantic.DeepEqual(template.Labels, desired.Spec.Template.Labels) {
 		template.Labels = desired.Spec.Template.Labels
-		changed = true
 	}
 
 	podSpec := &template.Spec
@@ -507,22 +520,17 @@ func syncStatefulSet(existing, desired *appsv1.StatefulSet) bool {
 
 	if !equality.Semantic.DeepEqual(podSpec.SecurityContext, desiredPodSpec.SecurityContext) {
 		podSpec.SecurityContext = desiredPodSpec.SecurityContext
-		changed = true
 	}
 
 	if !equality.Semantic.DeepEqual(
 		podSpec.TerminationGracePeriodSeconds, desiredPodSpec.TerminationGracePeriodSeconds,
 	) {
 		podSpec.TerminationGracePeriodSeconds = desiredPodSpec.TerminationGracePeriodSeconds
-		changed = true
 	}
 
 	if volumesDrifted(podSpec.Volumes, desiredPodSpec.Volumes) {
 		podSpec.Volumes = desiredPodSpec.Volumes
-		changed = true
 	}
-
-	return changed
 }
 
 // syncContainer copies the container fields the controller owns.
