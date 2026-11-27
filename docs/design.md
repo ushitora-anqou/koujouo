@@ -833,7 +833,15 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 
 ### 7.4 CI
 
-既存 3 workflow（`lint.yml` / `test.yml` / `test-e2e.yml`）をそのまま使う。追加変更は test-e2e.yml の `Running Test e2e` ステップに `env: DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}` を渡すことのみ。リポジトリ secret に実値を設定する（factorio.yaml の値を使い回さない、新規に発行する）。リポジトリ secret が無ければ値は空になり、suite は Secret を作らずに通知なしで動く。runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`nix build .#dockerImage` → `docker load` → tag）と `kind load docker-image`、kind 内での `curlimages/curl` と `busybox` の pull がそのまま動く。`go mod tidy` は各 workflow の既存 step が行うため、新依存はそこで解決される。e2e のテストファイルは `//go:build e2e` のため `make lint` の対象外（`test/utils` は対象内）。flake は go2nix を lockfile 無しで使うため（§2.3）`vendorHash` の更新は無く、`go.mod` / `go.sum` を更新する PR もそのままビルドできる。CI は dev shell の中で `make` を回すので、go2nix の Nix プラグインは shellHook が設定する `NIX_CONFIG` 経由で読み込まれる。
+既存 3 workflow（`lint.yml` / `test.yml` / `test-e2e.yml`）をそのまま使う（リリース用の workflow は下に追加する）。追加変更は test-e2e.yml の `Running Test e2e` ステップに `env: DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}` を渡すことのみ。リポジトリ secret に実値を設定する（factorio.yaml の値を使い回さない、新規に発行する）。リポジトリ secret が無ければ値は空になり、suite は Secret を作らずに通知なしで動く。runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`nix build .#dockerImage` → `docker load` → tag）と `kind load docker-image`、kind 内での `curlimages/curl` と `busybox` の pull がそのまま動く。`go mod tidy` は各 workflow の既存 step が行うため、新依存はそこで解決される。e2e のテストファイルは `//go:build e2e` のため `make lint` の対象外（`test/utils` は対象内）。flake は go2nix を lockfile 無しで使うため（§2.3）`vendorHash` の更新は無く、`go.mod` / `go.sum` を更新する PR もそのままビルドできる。CI は dev shell の中で `make` を回すので、go2nix の Nix プラグインは shellHook が設定する `NIX_CONFIG` 経由で読み込まれる。
+
+**リリース workflow（`.github/workflows/release.yml`）**: `master` への push と `v*` tag の push で image を GHCR（`ghcr.io/ushitora-anqou/koujouo`、§2.4 の名前）へ publish する。Dockerfile は使わず、flake の `.#dockerImage` を runner 上でビルドする。job は 3 つ:
+
+1. `meta`: `nix eval --json .#dockerImage --apply 'p: {repo = p.imageName; tag = p.imageTag;}'` でリポジトリ名を取り、`docker/metadata-action` で最終タグを決める。`master` push は `master` と `latest`、`v*` tag は `vX.Y.Z` のみ（`latest` は default branch に限るので、古い tag で `latest` が巻き戻らない）
+2. `build`: `linux/amd64`（`ubuntu-latest`）と `linux/arm64`（`ubuntu-26.04-arm`）の matrix。`nix build .#dockerImage` は runner の native system を評価するので cross も emulation も無い。各 arch は `<version>-linux-<arch>` を push し、digest を artifact で `merge` に渡す
+3. `merge`: `docker buildx imagetools create` で per-arch digest から最終タグを原子的に作る（buildx は v0.31.0 に固定。v0.31.1 以降 `imagetools create` が GHCR で壊れているため: docker/buildx#3708）。最後に `imagetools inspect` で検証する
+
+`make` は通さず `nix build` を直接呼ぶが、go2nix の Nix プラグイン（§2.3）が評価に要るので全 job が dev shell に入る。`latest` が付くのは `master` への push だけなので、`v*` tag のビルドが済んだ image をそのまま配るには `vX.Y.Z` を指す。
 
 ---
 

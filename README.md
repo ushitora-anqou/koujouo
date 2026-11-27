@@ -216,6 +216,25 @@ helm upgrade --install koujouo koujouo-0.1.0.tgz -n koujouo-system --create-name
 manager ClusterRole), so commit the chart together with the API changes it
 reflects.
 
+### By pulling the published image
+
+The `Release image` workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml))
+builds the image with Nix and publishes it to GHCR, so you do not have to build
+it yourself:
+
+| What is pushed | Tags of the image |
+| --- | --- |
+| a commit on `master` | `master` and `latest` |
+| a `v*` tag, for example `v0.1.0` | that tag only (`v0.1.0`), so an old tag never moves `latest` |
+
+It is one multi-arch image (`linux/amd64` and `linux/arm64`), each architecture
+built natively on its own runner. Point the chart at it:
+
+```sh
+helm upgrade --install koujouo charts/koujouo -n koujouo-system --create-namespace \
+  --set image.repository=ghcr.io/ushitora-anqou/koujouo --set image.tag=latest
+```
+
 ## Contributing
 Enter the development shell first; it provides every tool:
 

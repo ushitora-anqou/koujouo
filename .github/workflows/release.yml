@@ -1,0 +1,234 @@
+# Release workflow: build the image with Nix and publish it to GHCR.
+#
+# Flow: meta (image name + final tags) -> build (matrix over the platforms,
+# native runners, per-arch tag push) -> merge (imagetools create).
+#
+# Conventions:
+# - image: imageName and imageTag are evaluated from the flake package
+#   (.#dockerImage, ghcr.io/ushitora-anqou/koujouo:latest), so flake.nix is the
+#   single place that names the registry and the repository.
+# - build: `nix build .#dockerImage` resolves to the runner's native system, so
+#   each platform builds natively on its own runner (arm64 on an arm64 runner;
+#   no cross-compilation, no emulation).
+# - tags: each platform pushes <version>-linux-<arch> first, and the final tags
+#   are created atomically by the merge job, so a final tag never names a
+#   half-published image.
+# - buildx: pinned to v0.31.0 in merge (docker/buildx#3708: `imagetools create`
+#   is broken on GHCR since v0.31.1).
+# - go2nix: evaluating the flake needs its Nix plugin
+#   (builtins.resolveGoPackages), which the shellHook of the dev shell appends
+#   to NIX_CONFIG. Every job that evaluates the flake enters the dev shell
+#   first, because nix-develop exports that environment to the later steps.
+# - the workflow does not go through `make`: it runs `nix build .#dockerImage`
+#   directly, so a change of the Makefile cannot break the release.
+
+name: Release image
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ── Meta: image name from the flake, final tags from the ref ──────────────
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      repo: ${{ steps.flake-meta.outputs.repo }}
+      build_tag: ${{ steps.flake-meta.outputs.build_tag }}
+      tags: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Enter the Nix dev shell
+        uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1.2.1
+
+      - name: Extract the image name from the flake
+        id: flake-meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          meta="$(nix eval --json .#dockerImage --apply 'p: {repo = p.imageName; tag = p.imageTag;}')"
+          repo="$(printf '%s' "$meta" | jq -r .repo)"
+          build_tag="$(printf '%s' "$meta" | jq -r .tag)"
+          if [ -z "$repo" ] || [ "$repo" = "null" ]; then
+            echo "::error::The flake did not give an image name"
+            exit 1
+          fi
+          {
+            echo "repo=${repo}"
+            echo "build_tag=${build_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      # `latest` follows the default branch only: a v* tag publishes vX.Y.Z
+      # (and nothing else), so an old release tag cannot move `latest` back.
+      - name: Compute the final tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.flake-meta.outputs.repo }}
+          tags: |
+            type=ref,event=branch,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=ref,event=tag
+
+  # ── Per-platform build (native runner, per-arch tag push) ─────────────────
+  build:
+    name: build - ${{ matrix.platform }}
+    needs: meta
+    # NOTE: do NOT use matrix.include for the platform -> runner mapping. An
+    # include entry makes GitHub Actions spawn an extra build when its platform
+    # value is not in the matrix; runs-on accepts expressions, so use a ternary.
+    runs-on: ${{ contains(matrix.platform, 'arm64') && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["linux/amd64", "linux/arm64"]
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Enter the Nix dev shell
+        uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1.2.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `nix build .#dockerImage` resolves to the runner's native system:
+      # packages.x86_64-linux on amd64, packages.aarch64-linux on arm64. The
+      # build needs no docker (dockerTools writes the archive itself).
+      - name: Build the image with Nix
+        run: nix build .#dockerImage
+
+      - name: Load the image and push the per-arch tag
+        id: push
+        env:
+          REPO: ${{ needs.meta.outputs.repo }}
+          BUILD_TAG: ${{ needs.meta.outputs.build_tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${VERSION}" ]; then
+            echo "::error::metadata-action produced no version for ${GITHUB_REF}"
+            exit 1
+          fi
+          docker load -i result
+          safe="${PLATFORM//\//-}" # linux/arm64 -> linux-arm64
+          per_arch="${REPO}:${VERSION}-${safe}"
+          # The archive holds the flake's own tag (latest), which every platform
+          # would overwrite, so retag it to the per-arch tag before pushing.
+          docker tag "${REPO}:${BUILD_TAG}" "${per_arch}"
+          docker push "${per_arch}"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${per_arch}" | cut -d@ -f2)"
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::No digest produced (${PLATFORM})"
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/digest"
+          printf '%s\n' "$digest" > "${RUNNER_TEMP}/digest/digest-${safe}.txt"
+          echo "safe=${safe}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${PLATFORM}: ${per_arch} ${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ steps.push.outputs.safe }}
+          path: ${{ runner.temp }}/digest
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── Merge: create the final multi-arch tags atomically ────────────────────
+  merge:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx (pinned)
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # docker/buildx#3708: `imagetools create` is broken on GHCR since
+          # v0.31.1, so hold buildx at the last version that works there.
+          version: v0.31.0
+
+      - name: Download the per-platform digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Create the multi-arch manifest
+        env:
+          REPO: ${{ needs.meta.outputs.repo }}
+          TAGS: ${{ needs.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find digests -type f -print | sort)
+          if [ "${#files[@]}" -lt 1 ]; then
+            echo "::error::No digest files found"
+            exit 1
+          fi
+          sources=()
+          for f in "${files[@]}"; do
+            d="$(tr -d '[:space:]' < "$f")"
+            case "$d" in
+              sha256:*) : ;;
+              *) echo "::error::Bad digest in $f: $d"; exit 1 ;;
+            esac
+            sources+=("${REPO}@${d}")
+          done
+          tag_args=()
+          n_tags=0
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            tag_args+=(-t "$t")
+            n_tags=$((n_tags + 1))
+          done <<< "${TAGS}"
+          if [ "${n_tags}" -lt 1 ]; then
+            echo "::error::metadata-action produced no final tag"
+            exit 1
+          fi
+          echo "Merging ${#files[@]} digest(s) into ${n_tags} tag(s)" | tee -a "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+
+      - name: Verify the merged manifests
+        env:
+          TAGS: ${{ needs.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            echo "::group::${t}"
+            docker buildx imagetools inspect "${t}" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          done <<< "${TAGS}"

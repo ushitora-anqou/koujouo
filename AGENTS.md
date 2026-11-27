@@ -260,7 +260,7 @@ nix build .#dockerImage   # Verify it still builds (load the go2nix plugin as de
 ## CI
 
 GitHub Actions workflows install Nix via `DeterminateSystems/nix-installer-action`
-and run `make` targets inside the dev shell using
+and work inside the dev shell using
 [`nicknovitski/nix-develop`](https://github.com/nicknovitski/nix-develop), which
 exports the dev shell environment to subsequent steps. All actions are pinned by
 commit SHA. Dependabot (`.github/dependabot.yml`) updates Go modules and the
@@ -270,10 +270,24 @@ pinned actions weekly.
 - `test.yml`: `go mod tidy`, `make test`
 - `test-e2e.yml`: `go mod tidy`, `make test-e2e`, with `DISCORD_WEBHOOK_URL` from a repository
   secret of the same name when one is configured
+- `release.yml`: `nix build .#dockerImage`, published to GHCR
 
-All three run on every push and pull request. No workflow compares the regenerated files with
-the committed ones, so run the `make` targets under "After Making Changes" yourself and commit
-their output.
+The first three run on every push and pull request. No workflow compares the regenerated files
+with the committed ones, so run the `make` targets under "After Making Changes" yourself and
+commit their output.
+
+`release.yml` publishes the image on a push to `master` and on a `v*` tag: a `master` push tags
+`master` and `latest`, a `v*` tag tags `vX.Y.Z` only, so an old tag cannot move `latest`. It runs
+three jobs. `meta` takes the repository name from the flake (`dockerImage.imageName`) and lets
+`docker/metadata-action` compute the final tags. `build` runs once per platform — `linux/amd64` on
+`ubuntu-latest`, `linux/arm64` on `ubuntu-26.04-arm` — and `nix build .#dockerImage` resolves to
+the runner's own system there, so each architecture is built natively (no cross-compilation or
+emulation); each run pushes `<version>-linux-<arch>` and uploads its digest. `merge` assembles the
+per-arch digests into the final multi-arch tags with `docker buildx imagetools create`, which
+needs buildx pinned to v0.31.0 (`imagetools create` is broken on GHCR since v0.31.1,
+docker/buildx#3708). The workflow runs `nix build` rather than a `make` target, but every job still
+enters the dev shell: evaluating the flake needs go2nix's Nix plugin, which the `shellHook` exports
+through `NIX_CONFIG`.
 
 ## CLI Commands Cheat Sheet
 
