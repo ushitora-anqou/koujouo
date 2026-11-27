@@ -63,7 +63,7 @@ func stringReader(content string) io.Reader {
 // testHTTPClient returns a client without redirects or timeouts that
 // would slow the tests down.
 func testHTTPClient() *http.Client {
-	return &http.Client{Timeout: 5 * time.Second} //nolint:exhaustruct_v5 // Only the overall timeout matters.
+	return &http.Client{Timeout: 5 * time.Second}
 }
 
 // webhookRequest is one captured webhook post.
@@ -175,7 +175,7 @@ type logSink struct {
 
 // newLogSink returns a logger that records its messages.
 func newLogSink() (logr.Logger, *logSink) {
-	sink := &logSink{} //nolint:exhaustruct_v5 // Starts with no recorded line.
+	sink := &logSink{}
 
 	return logr.New(sink), sink
 }

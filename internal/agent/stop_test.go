@@ -68,7 +68,7 @@ type fakeGame struct {
 
 // newFakeGame returns a running fake game.
 func newFakeGame() *fakeGame {
-	return &fakeGame{ //nolint:exhaustruct_v5 // Starts running with no signal received.
+	return &fakeGame{
 		pid:    testPid,
 		exited: make(chan struct{}),
 	}
@@ -143,7 +143,7 @@ type fakeRcon struct {
 // newFakeRcon returns a connection answering with the given player
 // counts, one per query (the last one repeats).
 func newFakeRcon(players ...int) *fakeRcon {
-	return &fakeRcon{ //nolint:exhaustruct_v5 // Starts with no error and no chat sent.
+	return &fakeRcon{
 		players: players,
 	}
 }
@@ -197,7 +197,7 @@ func (f *fakeRcon) recordedChats() []string {
 func newStopTestAgent(t *testing.T, conn rconConn) (*Agent, *fakeGame) {
 	t.Helper()
 
-	gameAgent, err := New(logr.Discard(), Options{ //nolint:exhaustruct_v5 // The defaults fill the optional fields.
+	gameAgent, err := New(logr.Discard(), Options{
 		SaveDir:           t.TempDir(),
 		CacheDir:          t.TempDir(),
 		DrainPollInterval: stopTestDrainPoll,
@@ -210,7 +210,7 @@ func newStopTestAgent(t *testing.T, conn rconConn) (*Agent, *fakeGame) {
 	game := newFakeGame()
 
 	gameAgent.mu.Lock()
-	gameAgent.config = &Config{ //nolint:exhaustruct_v5 // Only the leave timeout matters here.
+	gameAgent.config = &Config{
 		GameVersion:         testGameVersion,
 		LeaveTimeoutSeconds: stopTestLeaveTimeoutSeconds,
 	}
@@ -339,7 +339,7 @@ func TestStopTimesOut(t *testing.T) {
 func TestStopWithoutRcon(t *testing.T) {
 	t.Parallel()
 
-	conn := &fakeRcon{ //nolint:exhaustruct_v5 // Only the error is scripted.
+	conn := &fakeRcon{
 		err: errRconDown,
 	}
 
@@ -388,7 +388,7 @@ func assertSuspended(t *testing.T, gameAgent *Agent) {
 func TestStopWithoutGame(t *testing.T) {
 	t.Parallel()
 
-	gameAgent, err := New(logr.Discard(), Options{ //nolint:exhaustruct_v5 // The defaults fill the optional fields.
+	gameAgent, err := New(logr.Discard(), Options{
 		SaveDir:  t.TempDir(),
 		CacheDir: t.TempDir(),
 	})
@@ -470,11 +470,11 @@ func TestExitAfterInterrupt(t *testing.T) {
 func waitResult(t *testing.T, command string) error {
 	t.Helper()
 
-	err := exec.Command("sh", "-c", command).Run() //nolint:noctx,gosec // Local shell run.
+	err := exec.Command("sh", "-c", command).Run() //nolint:noctx // Local shell run.
 
 	if _, isExitError := errors.AsType[*exec.ExitError](err); !isExitError {
 		t.Fatalf("could not obtain an exit error from %q: %v", command, err)
 	}
 
-	return err //nolint:wrapcheck // The raw wait result is the test fixture.
+	return err
 }

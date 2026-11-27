@@ -139,7 +139,7 @@ func TestEnsureBinaryReportsADownloadFailure(t *testing.T) {
 
 	cacheDir := t.TempDir()
 
-	client := &http.Client{ //nolint:exhaustruct_v5 // Only the transport matters.
+	client := &http.Client{
 		Timeout:   testHTTPClient().Timeout,
 		Transport: newRewriteTransport(t, server.URL),
 	}
@@ -175,7 +175,7 @@ func assertEmptyDir(t *testing.T, dir string) {
 func assertExtractedGame(t *testing.T, cacheDir, binary string) {
 	t.Helper()
 
-	content, err := os.ReadFile(binary) //nolint:gosec // The path is built by the test itself.
+	content, err := os.ReadFile(binary)
 	if err != nil {
 		t.Fatalf("could not read the extracted binary: %v", err)
 	}
@@ -293,7 +293,7 @@ func serveArchive(t *testing.T) *downloadEndpoint {
 		"factorio/data/core":        fileEntry(0o644, "core\n"),
 	})
 
-	endpoint := &downloadEndpoint{} //nolint:exhaustruct_v5 // Filled in below.
+	endpoint := &downloadEndpoint{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/get-download/"+archiveVersion+"/headless/linux64" {
@@ -314,7 +314,7 @@ func serveArchive(t *testing.T) *downloadEndpoint {
 
 	t.Cleanup(server.Close)
 
-	endpoint.client = &http.Client{ //nolint:exhaustruct_v5 // Only the transport matters.
+	endpoint.client = &http.Client{
 		Timeout:   testHTTPClient().Timeout,
 		Transport: newRewriteTransport(t, server.URL),
 	}
@@ -345,7 +345,7 @@ func newRewriteTransport(t *testing.T, target string) rewriteTransport {
 func (t rewriteTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	request = t.toEndpoint(request)
 
-	return t.wrapped.RoundTrip(request) //nolint:wrapcheck // The test transport passes the response through.
+	return t.wrapped.RoundTrip(request)
 }
 
 // toEndpoint returns the request with a factorio.com URL mapped to the
@@ -422,7 +422,7 @@ func TestExtractTarXzSymlink(t *testing.T) {
 
 // tarHeaderFor returns the tar header of a test entry.
 func tarHeaderFor(name string, entry tarEntry) *tar.Header {
-	header := &tar.Header{ //nolint:exhaustruct_v5 // Only the fields of a plain file entry matter.
+	header := &tar.Header{
 		Name: name,
 		Mode: int64(entry.mode.Perm()),
 		Size: int64(len(entry.content)),

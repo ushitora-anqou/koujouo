@@ -150,7 +150,7 @@ func (c *uploadCapture) waitForCount(t *testing.T, count int) []capturedUpload {
 func newUploadCaptureServer(t *testing.T) (*httptest.Server, *uploadCapture) {
 	t.Helper()
 
-	capture := &uploadCapture{} //nolint:exhaustruct_v5 // Starts with no request.
+	capture := &uploadCapture{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		content, err := io.ReadAll(request.Body)

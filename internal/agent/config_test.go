@@ -91,10 +91,10 @@ func TestStateRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
 	state := &persistedState{
-		Config: &Config{ //nolint:exhaustruct_v5 // The optional settings stay disabled.
+		Config: &Config{
 			GameVersion: testGameVersion,
 			Files:       []ConfigFile{{Name: configFileIniName, Content: "[path]\nwrite-data=/var/lib/koujouo\n"}},
-			Backup: &BackupSettings{ //nolint:exhaustruct_v5 // The round trip also covers a missing key.
+			Backup: &BackupSettings{
 				EndpointURL: "https://s3.us-west-00.backblazeb2.com",
 				Bucket:      "example",
 				AccessKeyID: "key-id",
@@ -144,16 +144,16 @@ func TestLoadStateMissing(t *testing.T) {
 func TestConfigsEqual(t *testing.T) {
 	t.Parallel()
 
-	base := &Config{GameVersion: testGameVersion, LeaveTimeoutSeconds: 60} //nolint:exhaustruct_v5 // Compared fields only.
+	base := &Config{GameVersion: testGameVersion, LeaveTimeoutSeconds: 60}
 
-	same := &Config{GameVersion: testGameVersion, LeaveTimeoutSeconds: 60} //nolint:exhaustruct_v5 // Compared fields only.
+	same := &Config{GameVersion: testGameVersion, LeaveTimeoutSeconds: 60}
 
-	otherVersion := &Config{ //nolint:exhaustruct_v5 // Compared fields only.
+	otherVersion := &Config{
 		GameVersion:         testNewGameVersion,
 		LeaveTimeoutSeconds: 60,
 	}
 
-	otherFiles := &Config{ //nolint:exhaustruct_v5 // Compared fields only.
+	otherFiles := &Config{
 		GameVersion:         testGameVersion,
 		LeaveTimeoutSeconds: 60,
 		Files:               []ConfigFile{{Name: configFileIniName, Content: "x"}},

@@ -104,7 +104,7 @@ func TestAgentUpgradeRoundTrip(t *testing.T) {
 
 	plantFakeFactorio(t, cacheDir, testGameVersion)
 
-	recorder := &execRecord{} //nolint:exhaustruct_v5 // Starts with no recorded exec.
+	recorder := &execRecord{}
 
 	client, gameAgent := newRPCAgent(t, logr.Discard(), roundTripOptions(t.TempDir(), cacheDir, recorder.record))
 
@@ -181,7 +181,7 @@ func assertExecHandoff(
 }
 
 // assertOutputSurvivesExec verifies that the game output descriptors
-// are no longer closed on exec, so they survive the exec(2) of a real
+// are no longer closed on exec, so they survive the execve(2) of a real
 // upgrade.
 func assertOutputSurvivesExec(t *testing.T, game gameHandle) {
 	t.Helper()
@@ -207,7 +207,7 @@ func TestAgentUpgradeRejectsABadChecksum(t *testing.T) {
 
 	plantFakeFactorio(t, cacheDir, testGameVersion)
 
-	recorder := &execRecord{} //nolint:exhaustruct_v5 // Starts with no recorded exec.
+	recorder := &execRecord{}
 
 	client, gameAgent := newRPCAgent(t, logr.Discard(), roundTripOptions(t.TempDir(), cacheDir, recorder.record))
 
@@ -245,7 +245,7 @@ func TestAgentUpgradeRejectsABadChecksum(t *testing.T) {
 }
 
 // TestAgentResumeAfterAnExecHandoff simulates what the new agent
-// process finds after an upgrade exec(2): the pid and the output
+// process finds after an upgrade execve(2): the pid and the output
 // descriptors of the running game in the environment, and the cached
 // state on the save volume. It must re-attach to the game.
 func TestAgentResumeAfterAnExecHandoff(t *testing.T) { //nolint:paralleltest // t.Setenv requires a sequential test.
@@ -300,7 +300,7 @@ func TestAgentResumeAfterAnExecHandoff(t *testing.T) { //nolint:paralleltest // 
 }
 
 // stageExecHandoff prepares what the previous agent process leaves
-// behind right before the exec(2) of an upgrade: the cached state on
+// behind right before the execve(2) of an upgrade: the cached state on
 // the save volume, and the pid and the output descriptors of its still
 // running game in the environment. It returns the running game.
 func stageExecHandoff(t *testing.T, saveDir, webhookURL string) *echoGame {
@@ -499,7 +499,7 @@ func TestReapIfExited(t *testing.T) {
 func startChild(t *testing.T, script string) *exec.Cmd {
 	t.Helper()
 
-	cmd := exec.Command("sh", "-c", script) //nolint:noctx,gosec // Local shell run.
+	cmd := exec.Command("sh", "-c", script) //nolint:noctx // Local shell run.
 
 	err := cmd.Start()
 	if err != nil {
@@ -515,7 +515,7 @@ func startChild(t *testing.T, script string) *exec.Cmd {
 }
 
 // TestClearCloexec verifies that an upgrade makes a descriptor survive
-// the exec(2) without touching its other flags.
+// the execve(2) without touching its other flags.
 func TestClearCloexec(t *testing.T) {
 	t.Parallel()
 
@@ -582,7 +582,7 @@ func writeStream(ctx context.Context, stream rpcapi.ByteStream, binary []byte, s
 			return params.SetChunk(binary[start:end])
 		})
 		if err != nil {
-			return err //nolint:wrapcheck // The test reports the raw stream error.
+			return err
 		}
 	}
 
@@ -593,15 +593,15 @@ func writeStream(ctx context.Context, stream rpcapi.ByteStream, binary []byte, s
 
 	_, err := done.Struct()
 
-	return err //nolint:wrapcheck // The test reports the raw stream error.
+	return err
 }
 
 // probeProcess verifies that the process is still running.
 func probeProcess(pid int) error {
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		return err //nolint:wrapcheck // The test wants the raw probe result.
+		return err
 	}
 
-	return process.Signal(syscall.Signal(0)) //nolint:wrapcheck // The test wants the raw probe result.
+	return process.Signal(syscall.Signal(0))
 }

@@ -137,7 +137,7 @@ func newRPCAgent(t *testing.T, log logr.Logger, options Options) (rpcapi.Agent, 
 
 	server := capnprpc.NewConn(
 		capnprpc.NewStreamTransport(serverEnd),
-		&capnprpc.Options{ //nolint:exhaustruct_v5 // Only the bootstrap capability matters.
+		&capnprpc.Options{
 			BootstrapClient: capnp.Client(rpcapi.Agent_ServerToClient(gameAgent)),
 		},
 	)
@@ -164,7 +164,7 @@ func plantFakeFactorio(t *testing.T, cacheDir, version string) {
 
 	script := []byte(fakeFactorioScript(version))
 
-	err = os.WriteFile(binary, script, 0o755) //nolint:gosec // The fake game binary must be executable.
+	err = os.WriteFile(binary, script, 0o755)
 	if err != nil {
 		t.Fatalf("could not write the fake game binary: %v", err)
 	}
@@ -172,7 +172,7 @@ func plantFakeFactorio(t *testing.T, cacheDir, version string) {
 
 // roundTripOptions returns the agent options of the RPC round trips.
 func roundTripOptions(saveDir, cacheDir string, exec func(string, []string, []string) error) Options {
-	return Options{ //nolint:exhaustruct_v5 // The defaults fill the optional fields.
+	return Options{
 		SaveDir:           saveDir,
 		CacheDir:          cacheDir,
 		DrainPollInterval: roundTripDrainPoll,
@@ -183,7 +183,7 @@ func roundTripOptions(saveDir, cacheDir string, exec func(string, []string, []st
 
 // roundTripConfig returns the configuration of the RPC round trips.
 func roundTripConfig() *Config {
-	return &Config{ //nolint:exhaustruct_v5 // The optional settings stay disabled.
+	return &Config{
 		GameVersion:         testGameVersion,
 		Files:               []ConfigFile{{Name: configFileIniName, Content: deliveredConfigIni}},
 		LeaveTimeoutSeconds: 1,
@@ -281,7 +281,7 @@ func tryConfigure(ctx context.Context, client rpcapi.Agent, config *Config) erro
 
 	_, err := future.Struct()
 	if err != nil {
-		return err //nolint:wrapcheck // The raw RPC error is what the test inspects.
+		return err
 	}
 
 	return nil
@@ -323,12 +323,12 @@ func callStop(t *testing.T, client rpcapi.Agent) {
 func fillConfigureParams(params rpcapi.Agent_configure_Params, config *Config) error {
 	out, err := params.NewCfg()
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	err = out.SetGameVersion(config.GameVersion)
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	err = fillConfigureFiles(out, config)
@@ -338,7 +338,7 @@ func fillConfigureParams(params rpcapi.Agent_configure_Params, config *Config) e
 
 	err = out.SetDiscordWebhookURL(config.DiscordWebhookURL)
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	out.SetLeaveTimeoutSeconds(config.LeaveTimeoutSeconds)
@@ -350,28 +350,28 @@ func fillConfigureParams(params rpcapi.Agent_configure_Params, config *Config) e
 
 	err = out.SetDownloadUsername(config.DownloadUsername)
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
-	return out.SetDownloadToken(config.DownloadToken) //nolint:wrapcheck // The test reports the raw parameter error.
+	return out.SetDownloadToken(config.DownloadToken)
 }
 
 // fillConfigureFiles writes the delivered files into the params.
 func fillConfigureFiles(out rpcapi.Config, config *Config) error {
-	files, err := out.NewFiles(int32(len(config.Files))) //nolint:gosec // The test sends a handful of files.
+	files, err := out.NewFiles(int32(len(config.Files)))
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	for index, file := range config.Files {
 		err = files.At(index).SetName(file.Name)
 		if err != nil {
-			return err //nolint:wrapcheck // The test reports the raw parameter error.
+			return err
 		}
 
 		err = files.At(index).SetContent([]byte(file.Content))
 		if err != nil {
-			return err //nolint:wrapcheck // The test reports the raw parameter error.
+			return err
 		}
 	}
 
@@ -386,34 +386,34 @@ func fillConfigureBackup(out rpcapi.Config, config *Config) error {
 
 	backup, err := out.NewBackup()
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	err = backup.SetEndpointURL(config.Backup.EndpointURL)
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	err = backup.SetBucket(config.Backup.Bucket)
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	err = backup.SetAccessKeyID(config.Backup.AccessKeyID)
 	if err != nil {
-		return err //nolint:wrapcheck // The test reports the raw parameter error.
+		return err
 	}
 
 	err = backup.SetSecretAccessKey(config.Backup.SecretAccessKey)
 
-	return err //nolint:wrapcheck // The test reports the raw parameter error.
+	return err
 }
 
 // readFile reads a file, failing the test on errors.
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 
-	content, err := os.ReadFile(path) //nolint:gosec // The path is built by the test itself.
+	content, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("could not read %s: %v", path, err)
 	}
@@ -743,7 +743,7 @@ type blockingRcon struct {
 
 // newBlockingRcon returns a blocking connection.
 func newBlockingRcon() *blockingRcon {
-	return &blockingRcon{release: make(chan struct{})} //nolint:exhaustruct_v5 // Starts locked.
+	return &blockingRcon{release: make(chan struct{})}
 }
 
 // PlayersOnline waits for the release, then reports no player.
@@ -775,7 +775,7 @@ func TestAgentStatusAnswersDuringADrain(t *testing.T) {
 
 	plantFakeFactorio(t, cacheDir, testGameVersion)
 
-	client, gameAgent := newRPCAgent(t, logr.Discard(), Options{ //nolint:exhaustruct_v5 // Defaults apply.
+	client, gameAgent := newRPCAgent(t, logr.Discard(), Options{
 		SaveDir:           t.TempDir(),
 		CacheDir:          cacheDir,
 		DialRcon:          func(_ string, _ string) (rconConn, error) { return rcon, nil },

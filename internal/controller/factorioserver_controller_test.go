@@ -148,7 +148,7 @@ var _ = Describe("FactorioServer Controller", func() {
 
 			statefulSet := expectAgentStatefulSet(ctx, serverName, serverName+"-saves")
 
-			// The agent binary is replaced in place with exec(2), so the
+			// The agent binary is replaced in place with execve(2), so the
 			// pod must not be rolled when the controller image changes.
 			Expect(statefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
 
@@ -381,7 +381,7 @@ var _ = Describe("FactorioServer Controller", func() {
 
 			result, err := reconcileOnce(ctx, reconciler, serverName)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result).To(Equal(ctrl.Result{})) //nolint:exhaustruct_v5 // An empty result requires no requeue.
+			Expect(result).To(Equal(ctrl.Result{}))
 
 			Expect(fakeAgent.stopCount()).To(Equal(1))
 
@@ -404,7 +404,7 @@ var _ = Describe("FactorioServer Controller", func() {
 
 			result, err = reconcileOnce(ctx, reconciler, serverName)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result).To(Equal(ctrl.Result{})) //nolint:exhaustruct_v5 // An empty result requires no requeue.
+			Expect(result).To(Equal(ctrl.Result{}))
 
 			stsLookupErr = k8sClient.Get(ctx, stsKey, &appsv1.StatefulSet{})
 			Expect(errors.IsNotFound(stsLookupErr)).To(BeTrue())
@@ -614,7 +614,7 @@ func newTestReconciler(agent *fakeAgentServer) *controller.FactorioServerReconci
 		Scheme:          k8sClient.Scheme(),
 		ControllerImage: testControllerImage,
 		AgentBinaryPath: "",
-		Dialer: &fakeAgentDialer{ //nolint:exhaustruct_v5 // A direct capability needs no connection.
+		Dialer: &fakeAgentDialer{
 			agent: agent,
 		},
 		Recorder:                  newFakeEventRecorder(),
@@ -684,7 +684,7 @@ func markPodTerminating(ctx context.Context, serverName string) {
 
 // fetchServer returns the named FactorioServer.
 func fetchServer(ctx context.Context, name string) *koujouoanqounetv1.FactorioServer {
-	server := &koujouoanqounetv1.FactorioServer{} //nolint:exhaustruct_v5 // Fetched from the API server.
+	server := &koujouoanqounetv1.FactorioServer{}
 
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, server)).To(Succeed())
 
@@ -749,7 +749,7 @@ func createTestSecret(ctx context.Context, name string) {
 // createMinimalServer creates a FactorioServer with only the required
 // spec fields.
 func createMinimalServer(ctx context.Context, name, pvcName string) {
-	server := &koujouoanqounetv1.FactorioServer{ //nolint:exhaustruct_v5 // Only the required spec fields are set.
+	server := &koujouoanqounetv1.FactorioServer{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name},
 		Spec:       minimalServerSpec(testGameVersion, pvcName),
 	}
@@ -776,7 +776,7 @@ func minimalServerSpec(gameVersion, pvcName string) koujouoanqounetv1.FactorioSe
 // createFullServer creates a FactorioServer exercising every optional
 // spec section. It expects the test ConfigMap and Secret to exist.
 func createFullServer(ctx context.Context, name string) {
-	server := &koujouoanqounetv1.FactorioServer{ //nolint:exhaustruct_v5 // TypeMeta and status are set by the API server.
+	server := &koujouoanqounetv1.FactorioServer{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name},
 		Spec:       fullServerSpec(name),
 	}
@@ -910,7 +910,7 @@ func deleteTestPVC(ctx context.Context, name string) {
 
 // fetchServerQuietly returns the named FactorioServer or an empty shell.
 func fetchServerQuietly(ctx context.Context, name string) *koujouoanqounetv1.FactorioServer {
-	server := &koujouoanqounetv1.FactorioServer{} //nolint:exhaustruct_v5 // May not exist anymore.
+	server := &koujouoanqounetv1.FactorioServer{}
 
 	_ = k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, server)
 

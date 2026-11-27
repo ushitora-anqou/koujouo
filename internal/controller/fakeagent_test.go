@@ -41,7 +41,7 @@ var (
 	errNoFakeAgent = errors.New("no fake agent is configured")
 
 	// errFakeChecksum is the answer of an upgrade whose sha256 does not
-	// match, like the real agent returns without exec(2)ing.
+	// match, like the real agent returns without execve(2)ing.
 	errFakeChecksum = errors.New("the received agent binary is invalid")
 )
 
@@ -90,7 +90,7 @@ type fakeAgentServer struct {
 	dropFirstChunk   bool
 	keepAgentVersion bool
 
-	// onExec runs in place of the exec(2) that ends an upgrade; the RPC
+	// onExec runs in place of the execve(2) that ends an upgrade; the RPC
 	// dialer uses it to drop the connection the upgrade arrived on.
 	onExec func()
 
@@ -104,7 +104,7 @@ type fakeAgentServer struct {
 // newFakeAgentServer returns a fake agent in the pending phase that
 // runs the version of this build.
 func newFakeAgentServer() *fakeAgentServer {
-	return &fakeAgentServer{ //nolint:exhaustruct_v5 // Starts with no configuration received.
+	return &fakeAgentServer{
 		phase:        rpcapi.Phase_pending,
 		agentVersion: version.Agent,
 	}
@@ -151,7 +151,7 @@ func readConfigureArgs(call rpcapi.Agent_configure) (*recordedConfig, error) {
 		return nil, fmt.Errorf("could not read the configure arguments: %w", err)
 	}
 
-	recorded := &recordedConfig{} //nolint:exhaustruct_v5 // Filled in below.
+	recorded := &recordedConfig{}
 
 	recorded.gameVersion, err = config.GameVersion()
 	if err != nil {
@@ -320,7 +320,7 @@ func (f *fakeAgentServer) Upgrade(_ context.Context, call rpcapi.Agent_upgrade) 
 		return fmt.Errorf("could not allocate the upgrade results: %w", err)
 	}
 
-	stream := rpcapi.ByteStream_ServerToClient(&fakeByteStream{agent: f}) //nolint:exhaustruct_v5 // Starts empty.
+	stream := rpcapi.ByteStream_ServerToClient(&fakeByteStream{agent: f})
 
 	err = results.SetBin(stream)
 	if err != nil {
@@ -348,7 +348,7 @@ func (f *fakeAgentServer) setPhase(phase rpcapi.Phase) {
 
 // fakeByteStream implements rpcapi.ByteStream_Server: it collects the
 // chunks of one agent upgrade and verifies their sha256 when the stream
-// ends, like the real agent before it exec(2)s the binary.
+// ends, like the real agent before it execve(2)s the binary.
 type fakeByteStream struct {
 	agent  *fakeAgentServer
 	buffer bytes.Buffer
@@ -402,7 +402,7 @@ func (s *fakeByteStream) Done(_ context.Context, call rpcapi.ByteStream_done) er
 
 // exec ends an upgrade the way the real agent does: it records what
 // arrived, refuses a binary whose sha256 does not match, switches to the
-// version of the new binary and runs in place of the exec(2).
+// version of the new binary and runs in place of the execve(2).
 func (f *fakeAgentServer) exec(stream *fakeByteStream, sum []byte) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -446,7 +446,7 @@ func (f *fakeAgentServer) currentAgentVersion() string {
 	return f.agentVersion
 }
 
-// setOnExec installs the hook that runs in place of the exec(2) ending
+// setOnExec installs the hook that runs in place of the execve(2) ending
 // an upgrade.
 func (f *fakeAgentServer) setOnExec(onExec func()) {
 	f.mutex.Lock()
@@ -499,7 +499,7 @@ func (f *fakeAgentServer) setAgentVersion(agentVersion string) {
 // or fails when no agent is configured. By default it hands out a direct
 // capability; newRPCFakeAgentDialer switches it to a real Cap'n Proto
 // connection over an in-process pipe, so an upgrade can drop the
-// connection the way the exec(2) of the real agent does.
+// connection the way the execve(2) of the real agent does.
 type fakeAgentDialer struct {
 	agent *fakeAgentServer
 	rpc   bool
@@ -513,7 +513,7 @@ type fakeAgentDialer struct {
 // real Cap'n Proto connection. close must be called when the tests are
 // done.
 func newRPCFakeAgentDialer(agent *fakeAgentServer) *fakeAgentDialer {
-	return &fakeAgentDialer{agent: agent, rpc: true} //nolint:exhaustruct_v5 // No connection was made yet.
+	return &fakeAgentDialer{agent: agent, rpc: true}
 }
 
 // Dial connects the controller to the fake agent.
@@ -539,12 +539,12 @@ func (d *fakeAgentDialer) Dial(ctx context.Context, _ *corev1.Pod) (*controller.
 
 	server := capnprpc.NewConn(
 		capnprpc.NewStreamTransport(serverEnd),
-		&capnprpc.Options{ //nolint:exhaustruct_v5 // Only the bootstrap capability matters.
+		&capnprpc.Options{
 			BootstrapClient: capnp.Client(rpcapi.Agent_ServerToClient(d.agent)),
 		},
 	)
 
-	// The exec(2) of an upgrade closes the sockets of the agent process.
+	// The execve(2) of an upgrade closes the sockets of the agent process.
 	d.agent.setOnExec(func() { _ = serverEnd.Close() })
 
 	d.mutex.Lock()

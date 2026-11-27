@@ -111,7 +111,7 @@ func TestCopyGameOutputUsesTheCurrentNotifier(t *testing.T) {
 	first, firstRequests := newCapturingWebhook(t, httpStatusNoContent)
 	second, secondRequests := newCapturingWebhook(t, httpStatusNoContent)
 
-	gameAgent, err := New(logr.Discard(), Options{ //nolint:exhaustruct_v5 // The defaults fill the optional fields.
+	gameAgent, err := New(logr.Discard(), Options{
 		SaveDir:  t.TempDir(),
 		CacheDir: t.TempDir(),
 	})
