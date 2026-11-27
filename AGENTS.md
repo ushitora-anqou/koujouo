@@ -47,8 +47,8 @@ PROJECT                           Kubebuilder metadata Auto-generated (DO NOT ED
 ```
 
 `internal/webhook/` and the webhook manifests do not exist until
-`kubebuilder create webhook` scaffolds them (`config/webhook/manifests.yaml`, which
-belongs in `charts/koujouo/templates/` like the other generated manifests).
+`kubebuilder create webhook` scaffolds them; the scaffolded manifests belong in
+`charts/koujouo/templates/` like the other generated manifests.
 
 **Multi-group layout** (for projects with multiple API groups):
 ```
