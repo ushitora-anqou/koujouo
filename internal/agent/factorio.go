@@ -46,7 +46,7 @@ type gameHandle interface {
 	Pid() int
 
 	// StdoutFd returns the file descriptor of the game stdout pipe.
-	// The agent passes it across exec(2) when upgrading itself.
+	// The agent passes it across execve(2) when upgrading itself.
 	StdoutFd() uintptr
 
 	// StderrFd returns the file descriptor of the game stderr pipe.
@@ -207,7 +207,7 @@ func closePipe(readEnd, writeEnd *os.File) {
 }
 
 // reattachGameProcess adopts the game process left behind by the
-// previous agent process after an upgrade exec(2). The process is still
+// previous agent process after an upgrade execve(2). The process is still
 // our child, so waitpid(2) keeps working, and the output pipes travel
 // in the inherited file descriptors.
 func reattachGameProcess(pid int, stdoutFd, stderrFd uintptr) (*gameProcess, error) {
@@ -352,7 +352,7 @@ func (g *gameProcess) reap(waitable waiter) {
 }
 
 // clearCloexec clears the close-on-exec flag of the file, so the
-// descriptor survives the exec(2) of an agent upgrade and the next
+// descriptor survives the execve(2) of an agent upgrade and the next
 // agent process can keep reading the game output.
 func clearCloexec(file *os.File) error {
 	descriptor := int(file.Fd())

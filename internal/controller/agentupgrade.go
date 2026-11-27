@@ -44,7 +44,7 @@ const (
 	agentBinaryChunkSize = 512 * 1024
 
 	// upgradeRedialPause is the wait between two attempts to reach the
-	// agent process an upgrade exec(2)d into.
+	// agent process an upgrade execve(2)d into.
 	upgradeRedialPause = 200 * time.Millisecond
 )
 
@@ -72,7 +72,7 @@ func needsAgentUpgrade(pod *corev1.Pod, reported *agentStatus) bool {
 }
 
 // upgradeAgent pushes the agent binary of the controller image to the
-// agent, which exec(2)s it and thereby drops the connection the binary
+// agent, which execve(2)s it and thereby drops the connection the binary
 // arrived on. It returns the connection to the upgraded agent with its
 // status. The caller keeps owning the capability of the outdated agent.
 func (r *FactorioServerReconciler) upgradeAgent(
@@ -101,7 +101,7 @@ func (r *FactorioServerReconciler) upgradeAgent(
 }
 
 // pushAgentBinary streams the agent binary of the controller image to
-// agent and ends the stream with its sha256. The agent exec(2)s the new
+// agent and ends the stream with its sha256. The agent execve(2)s the new
 // binary to complete the upgrade, which closes the connection before it
 // can answer, so a stream that ends in a disconnect is accepted too;
 // dialUpgradedAgent then confirms that the new agent answers.
@@ -214,7 +214,7 @@ func waitForStream(ctx context.Context, stream rpcapi.ByteStream) error {
 
 // dialUpgradedAgent connects to the agent of pod again and returns its
 // connection once the agent reports the version of this build. The
-// process an upgrade exec(2)d into needs a moment to listen again, so
+// process an upgrade execve(2)d into needs a moment to listen again, so
 // the attempts are repeated for the retry interval.
 func (r *FactorioServerReconciler) dialUpgradedAgent(
 	ctx context.Context,

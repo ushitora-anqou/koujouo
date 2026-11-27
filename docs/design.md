@@ -84,7 +84,7 @@ d, release := bin.Done(ctx, func(ps rpcapi.ByteStream_done_Params) error {
 
 `write @0 (chunk :Data) -> stream;` のように戻り値型 `stream`（`std/capnp/stream.capnp` の `StreamResult`）にするとストリーミングメソッドになり、「前回の write の promise が解決してから次の write を送る」でバックプレッシャーが得られる。
 
-agent は sha256 検証後に `exec(2)` するため、`done` の応答は接続切断で失敗する。controller は `capnp exc.IsType(err, exc.Disconnected)` を成功とみなし、再 dial して `agentVersion` が更新されたことで完了を判定する。
+agent は sha256 検証後に `execve(2)` するため、`done` の応答は接続切断で失敗する。controller は `capnp exc.IsType(err, exc.Disconnected)` を成功とみなし、再 dial して `agentVersion` が更新されたことで完了を判定する。
 
 選定理由: プランの決定事項。双方向 capability 渡しが必要な upgrade ユースケースに合う。
 
@@ -585,7 +585,7 @@ interface Agent {
   # upgrade replaces the agent binary: the agent returns a ByteStream
   # capability, the controller pushes the new binary through it and ends
   # the stream with done(sha256). The agent verifies the sha256, then
-  # exec(2)s the new binary. The Factorio child process keeps running;
+  # execve(2)s the new binary. The Factorio child process keeps running;
   # its pid travels in the environment.
   upgrade @3 () -> (bin :ByteStream);
 }
@@ -644,7 +644,7 @@ internal/agent/
                                    [--use-server-whitelist --server-whitelist ...])
   stop.go                  新規  stopGraceful(): rcon 警告 → 全員退出 or timeout →
                                   SIGINT → セーブ完了待ち（SIGTERM ハンドラもここ）
-  upgrade.go               新規  ByteStream 受信、sha256 検証、reexec(exec(2)、
+  upgrade.go               新規  ByteStream 受信、sha256 検証、reexec(execve(2)、
                                   KOUJOUO_FACTORIO_PID 環境変数で pid 引き継ぎ)
   logs.go                  新規  [JOIN]/[LEAVE] パース、agent ログへのミラー
   notify.go                新規  Discord webhook POST（リトライ付き）

@@ -33,7 +33,7 @@ import (
 	rpcapi "koujouo.anqou.net/project/rpc"
 )
 
-// Environment variables carrying the running game across the exec(2) of
+// Environment variables carrying the running game across the execve(2) of
 // an agent upgrade. The file descriptors of the game output pipes stay
 // valid because their close-on-exec flag is cleared before the exec.
 const (
@@ -59,7 +59,7 @@ var errUpgradeVerify = errors.New("the received agent binary is invalid")
 var errUpgradeOutput = errors.New("the game output cannot be passed across the exec")
 
 // binReceiver implements the ByteStream server of an upgrade: it
-// collects the chunks of the new agent binary and exec(2)s it once the
+// collects the chunks of the new agent binary and execve(2)s it once the
 // stream ends with a matching sha256.
 type binReceiver struct {
 	agent *Agent
@@ -123,7 +123,7 @@ func (r *binReceiver) Write(_ context.Context, call rpcapi.ByteStream_write) err
 }
 
 // Done verifies the sha256 of the received binary, installs it and
-// exec(2)s it. On success the call never returns, because the whole
+// execve(2)s it. On success the call never returns, because the whole
 // agent process is replaced.
 func (r *binReceiver) Done(_ context.Context, call rpcapi.ByteStream_done) error {
 	sum, err := call.Args().Sha256()
@@ -223,7 +223,7 @@ func (a *Agent) execInto(path string) error {
 }
 
 // appendGameEnv appends the variables that carry the running game
-// across the exec(2) of an upgrade. It must be called with the
+// across the execve(2) of an upgrade. It must be called with the
 // lifecycle lock held.
 func (a *Agent) appendGameEnv(environment []string) ([]string, error) {
 	game := a.game

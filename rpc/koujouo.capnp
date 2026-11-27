@@ -66,7 +66,7 @@ interface Agent {
   # upgrade replaces the agent binary: the agent returns a ByteStream
   # capability, the controller pushes the new binary through it and ends
   # the stream with done(sha256). The agent verifies the sha256, then
-  # exec(2)s the new binary. The Factorio child process keeps running;
+  # execve(2)s the new binary. The Factorio child process keeps running;
   # its pid travels in the environment.
   upgrade @3 () -> (bin :ByteStream);
 }

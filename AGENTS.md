@@ -161,7 +161,7 @@ binary until the new manager replaces it. Keep these couplings intact:
   deploying another tag.
 - **In-place agent upgrade**: the build stamps the same version into both binaries
   (`internal/version.Agent`). An agent that reports another version receives `/kojouo/agent` from
-  the manager and `exec(2)s` it without stopping the game. Consequences:
+  the manager and `execve(2)s` it without stopping the game. Consequences:
   - The StatefulSet uses the `OnDelete` update strategy. Do not switch to `RollingUpdate`: every
     image rollout would restart the game.
   - A new manager first calls `status` and `upgrade` on an agent that still runs the previous
@@ -335,7 +335,7 @@ Tests come in three layers:
 `make test` resolves envtest binaries via `setup-envtest` (downloaded on demand);
 the `ENVTEST_K8S_VERSION` is derived from `k8s.io/api` in go.mod. `make test`, `make build`,
 `make run` and `make test-e2e` regenerate the manifests and the code first
-(`manifests generate fmt vet`), so they can leave modified generated files behind.
+(`manifests generate fmt`), so they can leave modified generated files behind.
 
 `make run` needs `KOUJOUO_CONTROLLER_IMAGE` exported with the agent image, otherwise the manager
 cannot build a StatefulSet. It upgrades agents like a deployed manager does, by streaming

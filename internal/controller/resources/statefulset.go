@@ -99,7 +99,7 @@ func BuildStatefulSet(
 			Replicas:    new(int32(replicaCount)),
 			ServiceName: server.Name,
 			// The controller upgrades the agent binary in place with
-			// exec(2). A rollout would stop the game, so the pod is
+			// execve(2). A rollout would stop the game, so the pod is
 			// replaced only when it is deleted.
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.OnDeleteStatefulSetStrategyType,

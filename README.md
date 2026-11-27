@@ -21,7 +21,7 @@ The agent:
   `spec.leaveTimeoutSeconds` for them to leave, then sends SIGINT so Factorio
   writes the save file,
 - uploads the save file to S3-compatible storage,
-- replaces its own binary with `exec(2)` when the controller ships a newer one,
+- replaces its own binary with `execve(2)` when the controller ships a newer one,
   without stopping the game.
 
 The save data lives on a PersistentVolumeClaim that you create yourself. The

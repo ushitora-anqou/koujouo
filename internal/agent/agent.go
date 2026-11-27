@@ -228,7 +228,7 @@ func (o *Options) withDefaults() {
 }
 
 // Resume restores the game after a process start: an agent that was
-// exec(2)d into during an upgrade re-attaches to the running game,
+// execve(2)d into during an upgrade re-attaches to the running game,
 // otherwise the cached configuration resumes the game in the
 // background while the RPC server already answers.
 func (a *Agent) Resume(ctx context.Context) {
