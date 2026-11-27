@@ -148,16 +148,48 @@ func (r *binReceiver) Done(_ context.Context, call rpcapi.ByteStream_done) error
 	return err
 }
 
-// finish verifies, installs and execs the new binary. It must be called
-// with the receiver mutex held.
+// finish installs and execs the new binary. It must be called with the
+// receiver mutex held.
 func (r *binReceiver) finish(sum []byte) error {
-	defer func() {
-		closeErr := r.file.Close()
-		if closeErr != nil {
-			r.agent.log.Error(closeErr, "Could not close the agent binary file", "path", r.path)
-		}
-	}()
+	next, err := r.install(sum)
+	if err != nil {
+		return err
+	}
 
+	r.agent.log.Info("Execing the new agent binary", "path", next)
+
+	return r.agent.execInto(next)
+}
+
+// install verifies the received binary, seals it and moves it to the path
+// the next agent process runs. It must be called with the receiver mutex
+// held. The file is closed before it returns: execve(2) refuses a binary
+// that a process keeps open for writing (ETXTBSY).
+func (r *binReceiver) install(sum []byte) (string, error) {
+	sealErr := r.seal(sum)
+	closeErr := r.file.Close()
+
+	if sealErr != nil {
+		return "", sealErr
+	}
+
+	if closeErr != nil {
+		return "", fmt.Errorf("could not close the agent binary %s: %w", r.path, closeErr)
+	}
+
+	next := filepath.Join(r.agent.cacheDir, agentNextName)
+
+	err := os.Rename(r.path, next)
+	if err != nil {
+		return "", fmt.Errorf("could not install the agent binary %s: %w", next, err)
+	}
+
+	return next, nil
+}
+
+// seal verifies the sha256 of the received binary, makes it executable and
+// flushes it to the disk.
+func (r *binReceiver) seal(sum []byte) error {
 	if len(sum) != sha256LengthBytes {
 		return fmt.Errorf("could not verify the agent binary: sha256 must be %d bytes, got %d: %w",
 			sha256LengthBytes, len(sum), errUpgradeVerify)
@@ -181,16 +213,7 @@ func (r *binReceiver) finish(sum []byte) error {
 		return fmt.Errorf("could not sync the agent binary %s: %w", r.path, err)
 	}
 
-	next := filepath.Join(r.agent.cacheDir, agentNextName)
-
-	err = os.Rename(r.path, next)
-	if err != nil {
-		return fmt.Errorf("could not install the agent binary %s: %w", next, err)
-	}
-
-	r.agent.log.Info("Execing the new agent binary", "path", next)
-
-	return r.agent.execInto(next)
+	return nil
 }
 
 // execInto replaces this agent process with the binary at path. The

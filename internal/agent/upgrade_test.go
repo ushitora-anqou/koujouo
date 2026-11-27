@@ -74,6 +74,7 @@ type execRecord struct {
 	path  string
 	argv  []string
 	env   []string
+	probe error
 }
 
 // record implements the ExecBinary hook of the agent options.
@@ -82,6 +83,10 @@ func (r *execRecord) record(path string, argv []string, env []string) error {
 	defer r.mutex.Unlock()
 
 	r.path, r.argv, r.env = path, argv, env
+	// Exec'ing the installed binary right now probes what execve(2) of the
+	// real upgrade would see: the file must no longer be open for writing,
+	// which the kernel refuses with ETXTBSY.
+	r.probe = exec.Command(path).Run() //nolint:noctx // A short local run of the installed file.
 
 	return errExecStubbed
 }
@@ -92,6 +97,15 @@ func (r *execRecord) recorded() (string, []string, []string) {
 	defer r.mutex.Unlock()
 
 	return r.path, r.argv, r.env
+}
+
+// probeResult returns the result of exec'ing the installed binary while the
+// upgrade held it.
+func (r *execRecord) probeResult() error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	return r.probe
 }
 
 // TestAgentUpgradeRoundTrip streams a small binary over the ByteStream
@@ -173,6 +187,14 @@ func assertExecHandoff(
 	if !slices.Contains(execEnv, envFactorioPid+"="+strconv.Itoa(pid)) ||
 		!slices.Contains(execEnv, envFactorioStdoutFd+"="+strconv.Itoa(int(stdoutFd))) {
 		t.Errorf("exec env = %v, want the game pid and stdout descriptor", execEnv)
+	}
+
+	// The receiver must close the received file before the exec: the kernel
+	// refuses to execve(2) a binary some process keeps open for writing.
+	probeErr := recorder.probeResult()
+	if probeErr == nil || errors.Is(probeErr, syscall.ETXTBSY) {
+		t.Errorf("exec'ing the installed binary during the upgrade = %v, want an error other than ETXTBSY",
+			probeErr)
 	}
 
 	game := runningGame(gameAgent)
