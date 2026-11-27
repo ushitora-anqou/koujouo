@@ -32,4 +32,7 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 
+# Tool-managed directory (local agent configuration and state)
+.commandcode/
+
 misc

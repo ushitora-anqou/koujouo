@@ -5,8 +5,15 @@ linters:
     - depguard
     - exhaustruct
     - wsl
-  enable:
-    - exhaustruct_v5
+  exclusions:
+    rules:
+      # Tests build values partially on purpose and return the raw error of the
+      # code under test, so these linters do not apply to them.
+      - path: _test\.go
+        linters:
+          - exhaustruct_v5
+          - gosec
+          - wrapcheck
   settings:
     exhaustruct_v5:
       ignore-patterns:
