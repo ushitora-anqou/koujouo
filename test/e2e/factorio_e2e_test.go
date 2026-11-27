@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -121,13 +122,21 @@ echo "SHA256 $(sha256sum /mnt/saves/map.zip | cut -d ' ' -f1)"
 	logNotifyFail = "Could not notify Discord"
 	logWebhookErr = "webhook returned"
 
+	// The agent logs of an in-place upgrade: the old agent execs the
+	// binary the manager streamed, the new one adopts the running game.
+	logExecing        = "Execing the new agent binary"
+	logResumedUpgrade = "Resumed the game after an agent upgrade"
+
 	// Timeouts of the scenarios. A game start includes the download and
-	// the extraction of the headless build, so it gets the longest one.
+	// the extraction of the headless build, so it gets the longest one;
+	// upgradeTimeout bounds the wait for the new manager Deployment and
+	// for the agent binary it streams to the running agent.
 	pollInterval     = 5 * time.Second
 	resourceTimeout  = 5 * time.Minute
 	gameStartTimeout = 15 * time.Minute
 	logTimeout       = 2 * time.Minute
 	exitTimeout      = 5 * time.Minute
+	upgradeTimeout   = 10 * time.Minute
 
 	// phaseTraceInterval is the period of the status phase trace.
 	phaseTraceInterval = 3 * time.Second
@@ -501,7 +510,9 @@ var _ = Describe("FactorioServer", Ordered, func() {
 			g.Expect(podSpec.SecurityContext.FSGroup).To(HaveValue(BeEquivalentTo(int64(65532))))
 
 			agent := podSpec.Containers[0]
-			g.Expect(agent.Image).To(Equal(managerImage))
+			// The release starts with the image of the previous build; the
+			// upgrade scenario moves it to managerImage.
+			g.Expect(agent.Image).To(Equal(oldManagerImage))
 			g.Expect(agent.Command).To(Equal([]string{resources.AgentCommand}))
 			g.Expect(agent.VolumeMounts).To(ConsistOf(
 				HaveField("Name", resources.SavesVolumeName),
@@ -532,6 +543,100 @@ var _ = Describe("FactorioServer", Ordered, func() {
 
 	It("stores the save file and the agent state on the save volume", func() {
 		firstRun = inspectSave("first-run")
+	})
+
+	// The suite installed the release with oldManagerImage, so the agent
+	// of the running game still runs the binary of the previous build.
+	// Upgrading the release rolls the manager Deployment only: the
+	// StatefulSet is OnDelete, so the agent Pod stays. The new manager
+	// streams the agent binary of its image to the agent, which
+	// execve(2)s it and adopts the running game.
+	It("upgrades the agent without stopping the game", func() {
+		var (
+			podUID   types.UID
+			restarts int32
+		)
+
+		By("recording the uid and the restart count of the agent Pod")
+		Eventually(func(g Gomega) {
+			pod := &corev1.Pod{}
+			g.Expect(k8sClient.Get(ctx, podKey, pod)).To(Succeed())
+			// A Pod reports its containers only once the kubelet started
+			// them, which the kubelet does after the Pod reached the API
+			// server.
+			g.Expect(pod.Status.ContainerStatuses).NotTo(BeEmpty(), describePod(pod))
+
+			podUID = pod.UID
+			restarts = pod.Status.ContainerStatuses[0].RestartCount
+		}, resourceTimeout, pollInterval).Should(Succeed())
+
+		// The scenarios after this one compare the log against logOffset,
+		// which stays the offset of the game version change: the upgrade
+		// logs are only of interest here.
+		upgradeOffset := len(agentLogs.Text())
+
+		By("upgrading the Helm release to the image of this build")
+		_, tag, err := splitManagerImage(managerImage)
+		Expect(err).NotTo(HaveOccurred(), "Failed to split the manager image")
+
+		cmd := exec.Command("helm", "upgrade", helmReleaseName, chartPath,
+			"--namespace", namespace,
+			// The repository stays the one of the release: only the tag
+			// of the image moves to this build.
+			"--reuse-values",
+			"--set", "image.tag="+tag,
+		)
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to upgrade the Helm release")
+
+		By("waiting for the manager Deployment to roll out the new build")
+		cmd = exec.Command("kubectl", "rollout", "status", "deployment/"+managerDeploymentName,
+			"-n", namespace, "--timeout=5m")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to wait for the new manager Deployment")
+
+		By("waiting for the new manager to upgrade the agent in place")
+		Eventually(func(g Gomega) {
+			logs := agentLogs.Text()[upgradeOffset:]
+
+			g.Expect(logs).To(ContainSubstring(logExecing),
+				"the agent did not exec the binary the manager streamed")
+			g.Expect(logs).To(ContainSubstring(logResumedUpgrade),
+				"the agent did not adopt the running game after the upgrade")
+			// The agent replaces its own process inside the container: the
+			// log stream of the container ends only when it stops.
+			g.Expect(agentLogs.Done()).NotTo(BeClosed(), "the agent container stopped")
+		}, upgradeTimeout, pollInterval).Should(Succeed())
+
+		expectHealthyAgentLog(agentLogs.Text()[upgradeOffset:])
+
+		By("checking that the upgrade did not restart the game")
+		Expect(agentLogs.Text()[upgradeOffset:]).NotTo(ContainSubstring(logStarted),
+			"the upgrade started the game again")
+		Expect(agentLogs.Text()[upgradeOffset:]).NotTo(ContainSubstring(logExtracted),
+			"the upgrade downloaded the game again")
+		Expect(strings.Count(agentLogs.Text(), logStarted)).To(Equal(1),
+			"the game started more than once across the upgrade")
+
+		By("checking that the agent Pod kept its identity")
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, podKey, pod)).To(Succeed())
+		Expect(pod.UID).To(Equal(podUID), "the upgrade replaced the agent Pod")
+		Expect(pod.DeletionTimestamp).To(BeNil(), "the agent Pod is being deleted")
+		Expect(pod.Status.ContainerStatuses).NotTo(BeEmpty(), describePod(pod))
+		Expect(pod.Status.ContainerStatuses[0].RestartCount).To(Equal(restarts),
+			"the upgrade restarted the agent container")
+
+		By("checking that the FactorioServer is still running the game")
+		expectRunning(firstGameVersion, resourceTimeout)
+
+		By("waiting for the StatefulSet to name the image of the new manager")
+		Eventually(func(g Gomega) {
+			statefulSet := &appsv1.StatefulSet{}
+			g.Expect(k8sClient.Get(ctx, serverKey, statefulSet)).To(Succeed())
+			g.Expect(statefulSet.Spec.Template.Spec.Containers[0].Image).To(Equal(managerImage),
+				"the StatefulSet still names the image of the previous build")
+		}, resourceTimeout, pollInterval).Should(Succeed())
 	})
 
 	It("moves the game to another version", func() {

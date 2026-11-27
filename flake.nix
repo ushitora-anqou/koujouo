@@ -68,25 +68,29 @@
           then source.dirtyShortRev
           else "dev";
 
-        # The controller manager and agent binaries.
+        # The controller manager and agent binaries of the given version,
+        # which the build stamps into internal/version.Agent of both.
         # Note: the flake source only contains git-tracked files, so commit (or
         # at least `git add`) your changes before building the image.
-        manager = goEnv.buildGoApplication {
-          pname = "koujouo";
-          version = "0.0.1";
-          src = inputs.self;
-          subPackages = ["cmd/manager" "cmd/agent"];
-          # Static binaries, as the previous distroless image had.
-          CGO_ENABLED = 0;
-          # The controller tests need envtest (a real API server and etcd),
-          # which the Nix sandbox cannot run. `make test` runs them instead.
-          doCheck = false;
-          ldflags = [
-            "-s"
-            "-w"
-            "-X github.com/ushitora-anqou/koujouo/internal/version.Agent=${buildVersion}"
-          ];
-        };
+        mkManager = version:
+          goEnv.buildGoApplication {
+            pname = "koujouo";
+            version = "0.0.1";
+            src = inputs.self;
+            subPackages = ["cmd/manager" "cmd/agent"];
+            # Static binaries, as the previous distroless image had.
+            CGO_ENABLED = 0;
+            # The controller tests need envtest (a real API server and etcd),
+            # which the Nix sandbox cannot run. `make test` runs them instead.
+            doCheck = false;
+            ldflags = [
+              "-s"
+              "-w"
+              "-X github.com/ushitora-anqou/koujouo/internal/version.Agent=${version}"
+            ];
+          };
+
+        manager = mkManager buildVersion;
 
         # The go2nix Nix plugin, so that the Makefile and the CI workflows can
         # load it with `--option plugin-files` outside the dev shell.
@@ -108,42 +112,56 @@
         # OCI image of the controller manager and agent, equivalent to the
         # previous distroless-based Dockerfile (static binaries, nonroot user).
         # The StatefulSet runs /kojouo/agent as PID 1; the manager Deployment
-        # uses the image entrypoint /manager.
-        dockerImage = pkgs.dockerTools.buildImage {
-          name = "ghcr.io/ushitora-anqou/koujouo";
-          tag = "latest";
-          copyToRoot = [
-            (pkgs.runCommand "koujouo-root" {}
-              ''
-                mkdir -p $out/kojouo
-                ln -s ${manager}/bin/manager $out/manager
-                ln -s ${manager}/bin/agent $out/kojouo/agent
-                # The agent reads its configuration from the default path of
-                # cmd/agent/main.go (--config points elsewhere).
-                mkdir -p $out/etc/koujouo
-                cp ${agentConfig} $out/etc/koujouo/agent.yaml
-                # The official Factorio binary the agent downloads is
-                # dynamically linked, with the standard interpreter path of
-                # its architecture and no run path. The link to the Nix
-                # glibc loader provides it; the loader then finds the other
-                # glibc libraries in its own directory, which the image
-                # holds under /nix/store.
-                mkdir -p "$out$(dirname "${glibcLoader}")"
-                ln -s ${pkgs.glibc}${glibcLoader} "$out${glibcLoader}"
-              '')
-            pkgs.cacert
-            pkgs.tzdata
-          ];
-          config = {
-            Entrypoint = ["/manager"];
-            User = "65532:65532";
-            WorkingDir = "/";
-            Env = [
-              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-              "TZDIR=/share/zoneinfo"
+        # uses the image entrypoint /manager. The manager argument is the
+        # binary pair the image holds, so that the e2e suite can build the
+        # image of another version.
+        mkDockerImage = manager:
+          pkgs.dockerTools.buildImage {
+            name = "ghcr.io/ushitora-anqou/koujouo";
+            tag = "latest";
+            copyToRoot = [
+              (pkgs.runCommand "koujouo-root" {}
+                ''
+                  mkdir -p $out/kojouo
+                  ln -s ${manager}/bin/manager $out/manager
+                  ln -s ${manager}/bin/agent $out/kojouo/agent
+                  # The agent reads its configuration from the default path of
+                  # cmd/agent/main.go (--config points elsewhere).
+                  mkdir -p $out/etc/koujouo
+                  cp ${agentConfig} $out/etc/koujouo/agent.yaml
+                  # The official Factorio binary the agent downloads is
+                  # dynamically linked, with the standard interpreter path of
+                  # its architecture and no run path. The link to the Nix
+                  # glibc loader provides it; the loader then finds the other
+                  # glibc libraries in its own directory, which the image
+                  # holds under /nix/store.
+                  mkdir -p "$out$(dirname "${glibcLoader}")"
+                  ln -s ${pkgs.glibc}${glibcLoader} "$out${glibcLoader}"
+                '')
+              pkgs.cacert
+              pkgs.tzdata
             ];
+            config = {
+              Entrypoint = ["/manager"];
+              User = "65532:65532";
+              WorkingDir = "/";
+              Env = [
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                "TZDIR=/share/zoneinfo"
+              ];
+            };
           };
-        };
+
+        dockerImage = mkDockerImage manager;
+
+        # The image of a previous build, which only the e2e suite builds
+        # (`make docker-build-e2e-old`): both binaries carry the version
+        # "e2e-old" instead of the git revision, so that the suite can
+        # install it, upgrade the release to dockerImage and watch the new
+        # manager replace the agent binary of the running game. The image
+        # name and tag match dockerImage: the suite loads the archive and
+        # re-tags it itself.
+        dockerImageE2EOld = mkDockerImage (mkManager "e2e-old");
 
         default = dockerImage;
       }

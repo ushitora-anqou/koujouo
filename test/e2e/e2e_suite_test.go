@@ -37,6 +37,12 @@ import (
 var (
 	// managerImage is the manager image to be built and loaded for testing.
 	managerImage = "example.com/koujouo:v0.0.1"
+	// oldManagerImage is the image of a previous build: both binaries carry
+	// the version "e2e-old" (dockerImageE2EOld of flake.nix) instead of the
+	// git revision. The suite installs it first, so that the manager
+	// upgraded to managerImage finds an agent of another build and replaces
+	// its binary in place, with the game running.
+	oldManagerImage = "example.com/koujouo:e2e-old"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
 )
@@ -75,11 +81,25 @@ var _ = BeforeSuite(func() {
 	_, err := utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
 
+	// The upgrade scenario needs a manager and an agent of another build
+	// than the one under test: the same source with the version "e2e-old"
+	// baked in. The suite installs that image first and upgrades the
+	// release to managerImage later, which makes the new manager replace
+	// the binary of the running agent.
+	By("building the old manager image")
+	cmd = exec.Command("make", "docker-build-e2e-old", fmt.Sprintf("IMG=%s", oldManagerImage))
+	_, err = utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the old manager image")
+
 	// TODO(user): If you want to change the e2e test vendor from Kind,
 	// ensure the image is built and available, then remove the following block.
 	By("loading the manager image on Kind")
 	err = utils.LoadImageToKindClusterWithName(managerImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+
+	By("loading the old manager image on Kind")
+	err = utils.LoadImageToKindClusterWithName(oldManagerImage)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the old manager image into Kind")
 
 	configureKubectlKubeRC()
 	setupCertManager()
@@ -104,9 +124,12 @@ var _ = BeforeSuite(func() {
 	_, err = utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to delete the leftover CRD")
 
+	// The release starts with the image of the previous build: the agent
+	// of the first FactorioServer then runs the old binary, and the
+	// upgrade scenario upgrades the release to managerImage.
 	By("deploying the controller-manager with Helm")
-	repository, tag, err := splitManagerImage(managerImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to split the manager image")
+	repository, tag, err := splitManagerImage(oldManagerImage)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to split the old manager image")
 
 	cmd = exec.Command("helm", "upgrade", "--install", helmReleaseName, chartPath,
 		"--namespace", namespace,

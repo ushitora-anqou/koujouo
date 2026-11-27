@@ -1,5 +1,8 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+# IMAGE_NAME is the repository the Nix flake gives the image it builds: both
+# `docker-build` and `docker-build-e2e-old` load that name and re-tag it.
+IMAGE_NAME ?= ghcr.io/ushitora-anqou/koujouo
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -98,8 +101,11 @@ test: manifests generate fmt ## Run tests.
 KIND_CLUSTER ?= koujouo-test-e2e
 # The suite builds the image with Nix, installs the chart with Helm and lets
 # the agent download the Factorio headless build, which takes longer than the
-# ten minutes go test allows by default.
-E2E_TIMEOUT ?= 40m
+# ten minutes go test allows by default. The agent upgrade scenario adds the
+# build and load of the image of a previous build, the rollout of the manager
+# Deployment and the upgrade itself, so the budget is 60 minutes (the CI job
+# has timeout-minutes: 90).
+E2E_TIMEOUT ?= 60m
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -178,7 +184,19 @@ run: manifests generate fmt ## Run a controller from your host.
 docker-build: ## Build docker image with the manager via Nix.
 	nix build --option plugin-files "$$(nix build --no-link --print-out-paths .#go2nix-nix-plugin)/lib/nix/plugins/libgo2nix_plugin.so" -o result .#dockerImage
 	$(CONTAINER_TOOL) load --input ./result
-	$(CONTAINER_TOOL) tag ghcr.io/ushitora-anqou/koujouo:latest ${IMG}
+	$(CONTAINER_TOOL) tag $(IMAGE_NAME):latest ${IMG}
+
+# The e2e suite needs the image of a previous build: the same source with the
+# version "e2e-old" stamped into the manager and the agent instead of the git
+# revision. The suite installs that image, upgrades the release to the image
+# of this build and checks that the new manager replaces the agent binary of
+# the running game. `make all` does not build it: only `test-e2e` needs it.
+# `result-e2e-old` is ignored by git through the `result-*` rule of .gitignore.
+.PHONY: docker-build-e2e-old
+docker-build-e2e-old: ## Build the docker image of a previous build for the e2e agent upgrade.
+	nix build --option plugin-files "$$(nix build --no-link --print-out-paths .#go2nix-nix-plugin)/lib/nix/plugins/libgo2nix_plugin.so" -o result-e2e-old .#dockerImageE2EOld
+	$(CONTAINER_TOOL) load --input ./result-e2e-old
+	$(CONTAINER_TOOL) tag $(IMAGE_NAME):latest ${IMG}
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

@@ -232,7 +232,7 @@ suite needs.
 make all               # fmt generate manifests lint-config lint test test-e2e
 make check-uncomitted  # Fails unless the regeneration leaves nothing to commit
 ```
-`make all` includes `test-e2e` (Docker and up to 40 minutes). `check-uncomitted` fails on any
+`make all` includes `test-e2e` (Docker and up to 60 minutes). `check-uncomitted` fails on any
 uncommitted change by design, so commit (or at least `git add`) your work first and run it to
 learn whether the generated files are up to date.
 
@@ -422,18 +422,27 @@ and the errors of a missing or malformed one.
 **E2E suite** (`test/e2e/`, build tag `e2e`)
 
 The files carry `//go:build e2e`: `make test` skips the package and `make lint` does not see
-it. `BeforeSuite` builds the image (`make docker-build IMG=example.com/koujouo:v0.0.1`), loads
-it into Kind and installs the chart into `koujouo-system` with
-`helm upgrade --install koujouo charts/koujouo -n koujouo-system --set image.repository=...
---set image.tag=...`; the suite creates and labels that namespace itself, since the chart
-makes none. Two containers then run against it: the scaffolded `Manager` metrics checks and
+it. `BeforeSuite` builds two images, loads both into Kind and installs the chart into
+`koujouo-system` with `helm upgrade --install koujouo charts/koujouo -n koujouo-system --set
+image.repository=... --set image.tag=...`; the suite creates and labels that namespace itself,
+since the chart makes none. The first image is the one of the tree
+(`make docker-build IMG=example.com/koujouo:v0.0.1`); the second is the same source with the
+version `e2e-old` stamped into both binaries (`make docker-build-e2e-old
+IMG=example.com/koujouo:e2e-old`, `dockerImageE2EOld` of flake.nix), and the release *starts*
+with it. Two containers then run against it: the scaffolded `Manager` metrics checks and
 `FactorioServer` (`Ordered`), which walks one server through download and host → inspect the
-save volume → change the game version → suspend → resume from the same save. The scenarios
-assert on the `FactorioServer` status and on the agent log, which `utils.FollowPodLogs` keeps
-in memory after the Pod is deleted.
+save volume → upgrade the agent in place → change the game version → suspend → resume from
+the same save. The scenarios assert on the `FactorioServer` status and on the agent log, which
+`utils.FollowPodLogs` keeps in memory after the Pod is deleted.
 
+- The upgrade scenario is what covers the in-place agent upgrade of "Manager and Agent
+  Invariants": it `helm upgrade`s the release to the image of this build, which rolls the
+  manager Deployment but leaves the agent Pod of the `OnDelete` StatefulSet, and then asserts
+  that the agent logs `Execing the new agent binary` and `Resumed the game after an agent
+  upgrade`, that the Pod UID and the container restart count did not change, that `Started
+  Factorio` appears once, and that the StatefulSet pod template names the new image.
 - Needs Docker, outbound access to `factorio.com` (the agent downloads Factorio 2.1.24 and
-  2.1.25) and up to `E2E_TIMEOUT` (40 minutes by default); cert-manager is not installed.
+  2.1.25) and up to `E2E_TIMEOUT` (60 minutes by default); cert-manager is not installed.
 - The image comes from the Nix flake: stage or commit your changes first, otherwise the suite
   tests the last committed build against CRDs generated from the working tree.
 - `AfterSuite` uninstalls the release with `helm uninstall`, then deletes the CRD — it carries

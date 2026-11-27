@@ -793,35 +793,38 @@ controller のロジックを実際の API server で検証。agent は動かな
 既存の `test/e2e` 枠組み（Kind + `make docker-build IMG=example.com/koujouo:v0.0.1`）を使うが、デプロイは `make install` / `make deploy`（もう存在しない）ではなく Helm chart で行う。`BeforeSuite` が次の順で 1 回だけ実行し、2 つのコンテナが同じ operator を使う。
 
 1. `make docker-build IMG=<managerImage>` で image をビルドする
-2. `utils.LoadImageToKindClusterWithName` で Kind に load する
-3. Namespace `koujouo-system` を作り（既にあれば再利用する）、`restricted` の Pod Security Standards を enforce する（chart は Namespace を作らない）
-4. 前回の失敗が残した CRD を消す（`kubectl delete crd factorioservers.koujouo.anqou.net --ignore-not-found`）。CRD は `helm.sh/resource-policy: keep` を持つため `helm uninstall` では消えず、release が所有しない CRD が残っていると Helm の install が失敗する
-5. `helm upgrade --install koujouo charts/koujouo --namespace koujouo-system --set image.repository=<repo> --set image.tag=<tag>` でデプロイする。`managerImage` は `<repo>:<tag>` なので、registry のポートを repository 側に残すため最後の `/` より後ろの `:` で repository と tag に分ける
-6. `kubectl wait deployment/koujouo-controller-manager -n koujouo-system --for=condition=Available --timeout=5m` で待つ（Deployment 名・ServiceAccount 名・metrics Service 名・`koujouo-metrics-reader` ClusterRole 名は chart が `fullnameOverride: koujouo` で作る名前と一致する）
+2. `make docker-build-e2e-old IMG=<oldManagerImage>` で「古いイメージ」をビルドする。flake の `dockerImageE2EOld` は同じソースから version だけ `e2e-old` にした manager と agent を持つ（`mkManager` / `mkDockerImage` に version を引数で渡す。名前と tag は `dockerImage` と同じで、suite が load 後に re-tag する）
+3. `utils.LoadImageToKindClusterWithName` で 2 つの image を Kind に load する
+4. Namespace `koujouo-system` を作り（既にあれば再利用する）、`restricted` の Pod Security Standards を enforce する（chart は Namespace を作らない）
+5. 前回の失敗が残した CRD を消す（`kubectl delete crd factorioservers.koujouo.anqou.net --ignore-not-found`）。CRD は `helm.sh/resource-policy: keep` を持つため `helm uninstall` では消えず、release が所有しない CRD が残っていると Helm の install が失敗する
+6. `helm upgrade --install koujouo charts/koujouo --namespace koujouo-system --set image.repository=<repo> --set image.tag=<tag>` でデプロイする。`managerImage` は `<repo>:<tag>` なので、registry のポートを repository 側に残すため最後の `/` より後ろの `:` で repository と tag に分ける。**tag は旧イメージ（`oldManagerImage`）のもの**を使う: 初期の manager と agent は `e2e-old` で動き、シナリオ 3 が release を `managerImage` に upgrade する
+7. `kubectl wait deployment/koujouo-controller-manager -n koujouo-system --for=condition=Available --timeout=5m` で待つ（Deployment 名・ServiceAccount 名・metrics Service 名・`koujouo-metrics-reader` ClusterRole 名は chart が `fullnameOverride: koujouo` で作る名前と一致する）
 
-`AfterSuite` は `helm uninstall koujouo --namespace koujouo-system`（失敗しても続行）→ CRD の削除（keep annotation のため uninstall では消えない）→ manager Namespace の削除 → cert-manager の teardown の順で行う。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image ビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 40m）を指定する。
+`AfterSuite` は `helm uninstall koujouo --namespace koujouo-system`（失敗しても続行）→ CRD の削除（keep annotation のため uninstall では消えない）→ manager Namespace の削除 → cert-manager の teardown の順で行う。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image 2 つのビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 60m。agent upgrade の分だけ増やしてある。CI の job は `timeout-minutes: 90`）を指定する。
 
 | コンテナ | ファイル | 内容 |
 |---|---|---|
-| `Manager` | `e2e_test.go` | スキャフォールドの metrics テストをそのまま残す |
-| `FactorioServer`（`Ordered`） | `factorio_e2e_test.go` | 下の 5 シナリオをこの順で実行する |
+| `Manager` | `e2e_test.go` | スキャフォールドの metrics テストをそのまま残す（旧 manager でも通る） |
+| `FactorioServer`（`Ordered`） | `factorio_e2e_test.go` | 下の 6 シナリオをこの順で実行する |
 
 `FactorioServer` は専用 Namespace `koujouo-e2e-factorio`（Pod Security `restricted` を enforce）に PVC・ConfigMap（config.ini・server-whitelist.json）・FactorioServer を作る。バックアップと `downloadCredentials` は設定しない（どちらも optional で、未設定なら agent はアップロードも認証付きダウンロードもしない）。
 
 | # | シナリオ | 検証内容 |
 |---|---|---|
-| 1 | downloads the game and hosts the world | StatefulSet（replicas 1・`OnDelete`・`fsGroup: 65532`・`command: /kojouo/agent`・image は manager と同一・volume/mount）ができること。agent Pod が Running になり、`status.phase == Running`、`currentGameVersion == 2.1.24`、`observedGeneration == generation`、Ready 条件が True になること（タイムアウト 15 分。ダウンロードと展開を含む）。agent ログに `Extracted the game archive`、`No save found, creating one`（初回のみ）、`Started Factorio`、`Hosting game at IP ADDR:({0.0.0.0:34197})`、`Starting RCON interface at IP ADDR:({127.0.0.1:55555})`（ゲームポート UDP 34197 と RCON の bind を示す Factorio の起動行）があること。`Factorio exited unexpectedly` と Discord 通知失敗（`Could not notify Discord`）が無いこと |
+| 1 | downloads the game and hosts the world | StatefulSet（replicas 1・`OnDelete`・`fsGroup: 65532`・`command: /kojouo/agent`・image は旧イメージ `oldManagerImage`・volume/mount）ができること。agent Pod が Running になり、`status.phase == Running`、`currentGameVersion == 2.1.24`、`observedGeneration == generation`、Ready 条件が True になること（タイムアウト 15 分。ダウンロードと展開を含む）。agent ログに `Extracted the game archive`、`No save found, creating one`（初回のみ）、`Started Factorio`、`Hosting game at IP ADDR:({0.0.0.0:34197})`、`Starting RCON interface at IP ADDR:({127.0.0.1:55555})`（ゲームポート UDP 34197 と RCON の bind を示す Factorio の起動行）があること。`Factorio exited unexpectedly` と Discord 通知失敗（`Could not notify Discord`）が無いこと |
 | 2 | stores the save file and the agent state on the save volume | PVC を read-only で mount した一時 Pod（`test/utils.RunVolumeInspector`）で `agent-state.json`、`config.ini`、`server-whitelist.json`、`saves/map.zip` の存在を確認し、map.zip の size・mtime・sha256 を記録する |
-| 3 | moves the game to another version | `spec.gameVersion` を `2.1.25` に変更し、Running かつ `currentGameVersion == 2.1.25` になること。変更後の agent ログに `No players are online`（drain が RCON `/players online count` に成功した証拠）、`Saving map as` と `Goodbye`（graceful stop）、`Extracted the game archive`（新バージョンの取得）、`Started Factorio` と `Hosting game` があること。`No save found, creating one` が無いこと |
-| 4 | suspends the game and keeps the save volume | `spec.suspend: true` で agent が終了し、StatefulSet と Pod が削除され、`phase == Suspended`・Suspended 条件 True・`onlinePlayers == 0` になること。agent ログに `No players are online`、`Saving map as`、`Goodbye`、`Received signal, stopping the game gracefully`、`Stopped agent` があること。PVC は Bound のまま残ること。map.zip の mtime がシナリオ 2 より新しいこと（graceful stop がセーブを書き直した） |
-| 5 | resumes the game from the existing save | `spec.suspend: false` で Pod が再作成され（generic ephemeral volume は Pod と共に消えるため再ダウンロードする）、Running かつ `2.1.25` に戻ること。新 Pod の agent ログに `No save found, creating one` が無いこと。map.zip の size・mtime・sha256 がシナリオ 4 の記録と完全に一致すること |
+| 3 | upgrades the agent without stopping the game | 旧イメージ（version `e2e-old`）の manager と agent が動いている状態で、`helm upgrade koujouo charts/koujouo -n koujouo-system --reuse-values --set image.tag=<managerImage の tag>` を実行し、`kubectl rollout status deployment/koujouo-controller-manager` を待つ。`OnDelete` の StatefulSet は Pod を残すので、新しい manager が旧 agent に `/kojouo/agent` をストリームし、agent が execve(2) する。検証内容: (a) upgrade 前の Pod UID と container の `restartCount` を記録し、後で同じであること（`DeletionTimestamp` が nil）、(b) `agentLogs.Done` が閉じない（コンテナが終了しない）こと、(c) upgrade 前のオフセット以降の agent ログに `Execing the new agent binary` と `Resumed the game after an agent upgrade` があり、`Started Factorio` と `Extracted the game archive` が無いこと、(d) ログ全体の `Started Factorio` が 1 回だけであること（ゲームが再起動していない）、(e) `phase == Running` かつ `currentGameVersion == 2.1.24` のままであること、(f) StatefulSet の pod template の image が `managerImage` に更新されること（将来の Pod 用に manager が image を書き換えた）。(c) は 10 分待つ |
+| 4 | moves the game to another version | `spec.gameVersion` を `2.1.25` に変更し、Running かつ `currentGameVersion == 2.1.25` になること。変更後の agent ログに `No players are online`（drain が RCON `/players online count` に成功した証拠）、`Saving map as` と `Goodbye`（graceful stop）、`Extracted the game archive`（新バージョンの取得）、`Started Factorio` と `Hosting game` があること。`No save found, creating one` が無いこと |
+| 5 | suspends the game and keeps the save volume | `spec.suspend: true` で agent が終了し、StatefulSet と Pod が削除され、`phase == Suspended`・Suspended 条件 True・`onlinePlayers == 0` になること。agent ログに `No players are online`、`Saving map as`、`Goodbye`、`Received signal, stopping the game gracefully`、`Stopped agent` があること。PVC は Bound のまま残ること。map.zip の mtime がシナリオ 2 より新しいこと（graceful stop がセーブを書き直した） |
+| 6 | resumes the game from the existing save | `spec.suspend: false` で Pod が再作成され（generic ephemeral volume は Pod と共に消えるため再ダウンロードする）、Running かつ `2.1.25` に戻ること。新 Pod の agent ログに `No save found, creating one` が無いこと。map.zip の size・mtime・sha256 がシナリオ 5 の記録と完全に一致すること |
 
 実装上の要点:
 
 - agent ログは `test/utils.FollowPodLogs`（`kubectl logs -f` をメモリに取り続ける）で追いかける。Pod は suspend で削除されるため、削除後の assert はフォロワのバッファに対して行い、バージョン変更の前後比較はバッファのオフセットで行う
 - `agent-state.json` には webhook URL と RCON パスワードが入るため、一時 Pod はファイル名の一覧と map.zip の fingerprint だけを出力し、ファイル内容は出力しない
 - 失敗時は `AfterEach` が FactorioServer の YAML、StatefulSet と Pod の describe と logs（previous を含む）、PVC、PV、events、controller-manager のログ、追跡した agent ログ、status の phase 遷移を出力する
-- RCON の証拠: `status.onlinePlayers` は 0 のとき省略される（`omitempty`）ため、単独では RCON 成功を証明しない。drain 時（シナリオ 3・4）の `No players are online` で `/players online count` が `(0)` を返したことを確認する（RCON 失敗時は `Could not query the online players` になる）
+- RCON の証拠: `status.onlinePlayers` は 0 のとき省略される（`omitempty`）ため、単独では RCON 成功を証明しない。drain 時（シナリオ 4・5）の `No players are online` で `/players online count` が `(0)` を返したことを確認する（RCON 失敗時は `Could not query the online players` になる）
+- upgrade（シナリオ 3）はログのオフセットをローカル変数で持つ。`logOffset` はシナリオ 4 のバージョン変更が使うため上書きしない。upgrade 前後でログが途切れないのは、agent がコンテナの中で execve(2) するだけで、コンテナの stdout を `kubectl logs -f` が追い続けるためである
 - 再実行性: 2 つの Namespace（`koujouo-system` と `koujouo-e2e-factorio`）は存在を確認してから作る。`Manager` コンテナの `koujouo-metrics-binding` ClusterRoleBinding は cluster-scope で Namespace の削除に巻き込まれないため、`kubectl delete clusterrolebinding ... --ignore-not-found` してから create する（SA に metrics-reader を付ける意図は変えない）
 
 環境変数の扱い:
