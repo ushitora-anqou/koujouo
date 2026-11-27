@@ -173,6 +173,7 @@ Discord の Execute Webhook API は `POST {webhook URL}` に `{"content": "...",
 | RCON | `github.com/gorcon/rcon` | v1.4.0 |
 | S3 | `github.com/aws/aws-sdk-go-v2/{config,credentials,service/s3}` | latest (v1.x) |
 | Discord | なし（`net/http`） | — |
+| CLI / 設定 | `github.com/spf13/cobra` / `github.com/spf13/viper` | latest (v1.x) |
 
 ---
 
@@ -209,7 +210,7 @@ generate: generate-capnp ## Generate code containing DeepCopy, ...
 
 `capnp` / `capnpc-go` は §2.1 のとおり devShell 由来とし、Makefile 末尾のツール変数に `CAPNP ?= capnp` を追加しない（go:generate 内で PATH 解決する）。
 
-`make build` / `make run` は `cmd/main.go` から `cmd/manager/main.go` へパスを更新する。
+`make build` / `make run` は `cmd/main.go` から `cmd/manager/main.go` へパスを更新する。`make run` は `--config examples/manager.yaml` を渡す（§2.5）。
 
 ### 2.3 flake のサブパッケージ化（cmd/manager と cmd/agent）
 
@@ -285,6 +286,45 @@ StatefulSet 側は `command: ["/kojouo/agent"]` を明示するため、image �
 image のローダーはアーキテクチャで切り替える: agent がダウンロードする Factorio のバイナリは動的リンクで、x86_64 は `/lib64/ld-linux-x86-64.so.2`、aarch64 は `/lib/ld-linux-aarch64.so.1` を探す。`make docker-build` は Nix が作った image をローカルランタイムに load し、`${IMG}` に `docker tag` し直す。
 
 flake 変更後は `nix fmt .` と `nix build .#dockerImage` を必ず回す（AGENTS.md）。
+
+### 2.5 manager と agent の設定（Cobra + Viper）
+
+両バイナリのコマンドラインは root command 1 つだけで、フラグは `--config <path>` のみとする。設定は YAML ファイルで与え、キーは lowerCamelCase、既定値は Viper の `SetDefault` に入れてから構造体へ `Unmarshal` する。フラグ（旧 `--metrics-bind-address`、`--leader-elect`、`--zap-*`、agent の `--listen` など）と環境変数（旧 `KOUJOUO_CONTROLLER_IMAGE`、`KOJOUO_LISTEN` / `KOJOUO_SAVE_DIR` / `KOJOUO_CACHE_DIR`）は廃止した。ファイルが無い・読めない・パースできない場合はエラーで終了する（`SilenceUsage` / `SilenceErrors` を立て、`main` がエラーを stderr に出して exit 1）。
+
+- manager: 既定パス `/etc/koujouo/manager.yaml`。Deployment が ConfigMap として mount する（`controllerImage` はその ConfigMap が持つ）
+- agent: 既定パス `/etc/koujouo/agent.yaml`。image に焼き込む（`pkgs.writeText` で作り、`koujouo-root` の `runCommand` が `/etc/koujouo/agent.yaml` に置く）。manager 用の設定ファイルは image に含めない
+
+```yaml
+# manager
+metricsBindAddress: "0"
+healthProbeBindAddress: ":8081"
+leaderElection: false
+secureMetrics: true
+webhookCertPath: ""
+webhookCertName: tls.crt
+webhookCertKey: tls.key
+metricsCertPath: ""
+metricsCertName: tls.crt
+metricsCertKey: tls.key
+controllerImage: ""      # 旧 KOUJOUO_CONTROLLER_IMAGE。空だと StatefulSet を作れない
+log:
+  development: true
+  level: info
+```
+
+```yaml
+# agent
+listenAddress: ":9550"
+saveDir: /var/lib/koujouo
+cacheDir: /opt/koujouo
+log:
+  development: true
+  level: info
+```
+
+ログは `log.development`（コンソール / JSON の選択）と `log.level`（`zapcore.Level.Set` でパースする debug / info / warn / error など）で決め、`zap.Options{Development, Level}` に渡す。全キーと既定値は `examples/manager.yaml` と `examples/agent.yaml` にコメント付きで置く。読み込みは `cmd/manager/config_test.go` と `cmd/agent/config_test.go` で unit テストする（既定値・全キー・欠落とパース失敗）。
+
+設定ファイルの配置は Helm chart が担う（manager は ConfigMap を `/etc/koujouo/manager.yaml` に mount、agent は image 内のファイル）。image に manager 用の設定を焼き込まない理由は、`controllerImage` などがリリースごとに変わるため。
 
 ---
 
@@ -523,7 +563,7 @@ StatefulSet の要点（`internal/controller/resources/statefulset.go`）:
 
 - `replicas: 1`、`serviceName: <FactorioServer name>`（Service 自体は作らない）
 - `selector`/`template.labels` は `koujouo.anqou.net/factorioserver: <name>`
-- `template.spec.containers[0]`: name `agent`、image = controller イメージ（`spec.agent.image` なし。controller が自分のイメージを `Downward API` ではなく環境変数 `KOUJOUO_CONTROLLER_IMAGE`（Deployment 側で `imagePullPolicy` に合わせ設定）または manager の起動フラグで注入した値を使う）
+- `template.spec.containers[0]`: name `agent`、image = controller イメージ（`spec.agent.image` なし。controller が自分のイメージを `Downward API` ではなく manager の設定ファイルの `controllerImage`（Deployment が ConfigMap として mount する `/etc/koujouo/manager.yaml`、§2.5）から受け取る）
 - `command: ["/kojouo/agent"]`（PID 1、reaper は agent 自身）
 - `ports`: `{name: game, containerPort: 34197, protocol: UDP}` のみ
 - `volumeMounts`: `/var/lib/koujouo`（saves、spec.savePersistentVolumeClaimName）と `/opt/koujouo`（ephemeral、バイナリ）
@@ -636,9 +676,13 @@ api/v1/
   zz_generated.deepcopy.go 自動  make generate
 
 cmd/
-  manager/main.go          移動  cmd/main.go から（中身はほぼ変更なし）
-  agent/main.go            新規  agent エントリ: flag -listen :9550、
+  manager/main.go          移動  cmd/main.go から（Cobra + Viper、--config のみ）
+  agent/main.go            新規  agent エントリ: Cobra + Viper、--config のみ、
                                   /var/lib/koujouo の状態復元、rpc.Serve
+
+examples/
+  manager.yaml             新規  全キーと既定値（コメント付き）
+  agent.yaml               新規  全キーと既定値（コメント付き）
 
 internal/controller/
   factorioserver_controller.go 修正 Reconcile 本体、SetupWithManager(.Owns(StatefulSet)+Watches(Pod))
@@ -673,7 +717,7 @@ test/e2e/
   e2e_suite_test.go        修正  （必要なら）タイムアウト延長
   factorio_e2e_test.go     新規  §7 の e2e シナリオ
 
-flake.nix                   修正  §2（go2nix の manager、devShell、go2nix プラグイン、image）
+flake.nix                   修正  §2（go2nix の manager、devShell、go2nix プラグイン、image、agent の設定ファイル）
 Makefile                    修正  §2.2（generate-capnp、build/run のパス）
 .github/workflows/test-e2e.yml 修正 DISCORD_WEBHOOK_URL の env 透過
 docs/design.md              本書
@@ -778,7 +822,7 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 
 1. **capnp v3 が alpha タグ**: `v3.1.0-alpha.2` に依存する。破壊的変更の可能性は残る。生成コードと RPC API への依存は `rpc/`・`internal/controller/agentclient.go`・`internal/agent/agent.go` に局所化してある。
 2. **`capnpc-go` の Nix 化**: → 取りやめ。`capnpc-go` は go.mod の `tool` ディレクティブで管理し、`go tool capnpc-go` として実行する（flake はビルドしない）。`make generate-capnp` で再生成できる。
-3. **controller イメージ名の伝達**: → manager Deployment の env `KOUJOUO_CONTROLLER_IMAGE` に、Kustomize が `image:` と同じ値を注入する。
+3. **controller イメージ名の伝達**: → manager の設定ファイルの `controllerImage`（Deployment が ConfigMap として mount する `/etc/koujouo/manager.yaml`）で与える（§2.5）。環境変数 `KOUJOUO_CONTROLLER_IMAGE` は廃止した。
 4. **`players` の集計**: → agent が 10 秒ごとに rcon `/players online count` をポーリングし、失敗時は前回値を維持する。実測の応答は `Online players (0):\n`。
 5. **phase の二重管理**: → conditions を正とし、phase は conditions から合成する（`internal/controller/status.go`）。
 6. **`[JOIN]` / `[LEAVE]` の正確なログ形式**: **未検証のまま**。プレイヤー接続を要するため、unit テストのフィクスチャでしか確認していない。実運用でプレイヤーの出入りを確認し、必要なら `internal/agent/logs.go` の正規表現を調整すること。
@@ -787,4 +831,5 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 9. **過去バージョンのゲームバイナリ**: ephemeral volume に残る（約 313 MB / 版）。Pod 再作成で消える。既定 2Gi では数回のバージョン変更で埋まる。
 10. **GitHub Actions 上での e2e**: ローカルの kind（docker 29.9.3 / kind v0.33.0）でのみ確認済み。runner 上では未実行。Docker Hub と factorio.com への外向き通信が必要。
 11. **`agent-state.json`**: save volume に最終 Config を保存するため、Discord の webhook URL と S3 の鍵が平文で入る（パーミッション 0600）。
-12. **reconcile のタイムアウトと configure / stop の待機**: 待機と進捗の status パッチは `context.WithoutCancel` で reconcile の期限から切り離してある。controller の停止時のみ中断され、次の reconcile が続きを行う。
+12. **`config/` の Kustomize マニフェストと e2e の追従**: 両バイナリのフラグと環境変数を廃止したため、`config/manager/manager.yaml` の `args`（`--leader-elect` など）と `KOUJOUO_CONTROLLER_IMAGE`、`config/default/manager_metrics_patch.yaml` は現行のバイナリに合わない。Helm chart が manager の設定を ConfigMap として書き、Deployment の `args` を `--config` だけにする。e2e（`test/e2e`）はこの chart もしくは更新後の `config/` でデプロイする必要がある。
+13. **reconcile のタイムアウトと configure / stop の待機**: 待機と進捗の status パッチは `context.WithoutCancel` で reconcile の期限から切り離してある。controller の停止時のみ中断され、次の reconcile が続きを行う。

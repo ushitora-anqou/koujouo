@@ -92,6 +92,19 @@
         # load it with `--option plugin-files` outside the dev shell.
         go2nix-nix-plugin = nixPlugin;
 
+        # Configuration of the agent, which the agent reads from its default
+        # path in the image. The manager takes its configuration from a
+        # ConfigMap the deployment mounts at /etc/koujouo/manager.yaml
+        # instead, so the image holds no manager configuration.
+        agentConfig = pkgs.writeText "agent.yaml" ''
+          listenAddress: ":9550"
+          saveDir: /var/lib/koujouo
+          cacheDir: /opt/koujouo
+          log:
+            development: false
+            level: info
+        '';
+
         # OCI image of the controller manager and agent, equivalent to the
         # previous distroless-based Dockerfile (static binaries, nonroot user).
         # The StatefulSet runs /kojouo/agent as PID 1; the manager Deployment
@@ -105,6 +118,10 @@
                 mkdir -p $out/kojouo
                 ln -s ${manager}/bin/manager $out/manager
                 ln -s ${manager}/bin/agent $out/kojouo/agent
+                # The agent reads its configuration from the default path of
+                # cmd/agent/main.go (--config points elsewhere).
+                mkdir -p $out/etc/koujouo
+                cp ${agentConfig} $out/etc/koujouo/agent.yaml
                 # The official Factorio binary the agent downloads is
                 # dynamically linked, with the standard interpreter path of
                 # its architecture and no run path. The link to the Nix

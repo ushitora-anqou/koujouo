@@ -128,7 +128,7 @@ build: manifests generate fmt ## Build manager binary.
 
 .PHONY: run
 run: manifests generate fmt ## Run a controller from your host.
-	go run -ldflags "$(LDFLAGS)" ./cmd/manager
+	go run -ldflags "$(LDFLAGS)" ./cmd/manager --config examples/manager.yaml
 
 # The image is built by the Nix flake (see .#dockerImage in flake.nix) and
 # loaded into the local container runtime, then re-tagged with ${IMG}.

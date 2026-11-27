@@ -1,0 +1,24 @@
+# Configuration of the koujouo agent (cmd/agent).
+#
+# The agent reads the file named by --config, /etc/koujouo/agent.yaml by
+# default; the image holds that file. Every key below shows the built-in
+# default: a key the file leaves out keeps its default.
+
+# Address the Cap'n Proto RPC server listens on. The manager connects to the
+# port of the pod IP, so the agent has to listen on all interfaces.
+listenAddress: ":9550"
+
+# Directory on the save volume holding the save file and the agent state. It
+# must stay on the volume of the user, so that the world survives the pod.
+saveDir: /var/lib/koujouo
+
+# Directory on the ephemeral volume holding the downloaded game builds and the
+# upgrade cache. Its content is lost with the pod.
+cacheDir: /opt/koujouo
+
+# Logging.
+log:
+  # Log in the human-readable console encoding instead of JSON.
+  development: false
+  # Minimum level to log: debug, info, warn, error, dpanic, panic or fatal.
+  level: info

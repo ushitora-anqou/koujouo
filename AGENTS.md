@@ -32,6 +32,8 @@ config/crd/bases/*                Generated CRDs (DO NOT EDIT)
 config/manager/                   Manager Deployment; its image also becomes the agent image
 config/rbac/role.yaml             Generated RBAC (DO NOT EDIT)
 config/samples/*                  PVC, ConfigMap, Secret (placeholders) and a FactorioServer
+examples/manager.yaml             Manager configuration (every key with its default)
+examples/agent.yaml               Agent configuration (every key with its default)
 test/e2e/                         E2E suite (build tag `e2e`); test/utils/ holds its helpers
 docs/design.md                    Design notes (Japanese): libraries, CRD and capnp schemas, tests
 docs/factorio-server-plan*.html   The plan docs/design.md was derived from
@@ -87,6 +89,20 @@ when the spec generation or the game version changed → patch the status → re
 on its own turns the server `Failed`; the agent does not restart it by design (see the known
 limitations in README.md).
 
+**Configuration.** Both binaries are Cobra commands whose only flag is `--config <path>`, the
+YAML file they read with Viper (`cmd/manager/main.go`, `cmd/agent/main.go`). The keys are
+lowerCamelCase, and `examples/manager.yaml` and `examples/agent.yaml` list all of them with
+their defaults: a key the file leaves out keeps the default, while a file that is missing or
+does not parse stops the process with exit 1. `log.development` picks the console encoding over
+JSON and `log.level` the minimum level (debug, info, warn, error, ...). Neither binary reads
+environment variables for its configuration.
+
+- The manager reads `/etc/koujouo/manager.yaml`, which the deployment mounts from a ConfigMap.
+  Its `controllerImage` names the image the agent StatefulSets run, so it usually holds the
+  manager's own image; empty leaves the controller unable to create a StatefulSet.
+- The agent reads `/etc/koujouo/agent.yaml`, which the Nix image holds (flake.nix writes it with
+  `pkgs.writeText`). The agent Pod mounts no ConfigMap.
+
 ## Nix Development Environment
 
 All development tools come from the Nix flake dev shell. Do NOT install
@@ -110,6 +126,8 @@ nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, kustomize,
   builds the OCI image `ghcr.io/ushitora-anqou/koujouo:latest`
 - The image is built with `dockerTools.buildImage` (static binaries, nonroot user `65532`, CA certs
   and tzdata); there is no Dockerfile. `/manager` is the entrypoint and `/kojouo/agent` the agent.
+  The image also holds `/etc/koujouo/agent.yaml`, the configuration the agent reads (the manager
+  takes its own from the ConfigMap the deployment mounts, so the image holds none).
   The Factorio binary the agent downloads is dynamically linked, so the image links the glibc
   loader the binary looks for: `/lib64/ld-linux-x86-64.so.2` on x86_64,
   `/lib/ld-linux-aarch64.so.1` on aarch64
@@ -168,12 +186,13 @@ binary until the new manager replaces it. Keep these couplings intact:
 - **Image layout**: `/manager` (entrypoint) and `/kojouo/agent` are referenced in `flake.nix`,
   `config/manager/manager.yaml`, `internal/controller/resources/statefulset.go` (`AgentCommand`)
   and `internal/controller/agentupgrade.go` (`defaultAgentBinaryPath`). Rename them together.
-- **Controller image**: `config/manager/kustomization.yaml` copies the manager image into the
-  `KOUJOUO_CONTROLLER_IMAGE` environment variable, and the controller deploys that image for
-  the agent StatefulSets. The manager container must stay `containers[0]` in
-  `config/manager/manager.yaml`. `make deploy` and `make build-installer` rewrite the
-  `images:` entry of the kustomization with `IMG`, so the file shows up modified after
-  deploying another tag.
+- **Controller image**: the `controllerImage` key of the manager configuration (the ConfigMap
+  mounted at `/etc/koujouo/manager.yaml`) names the image the agent StatefulSets run; it normally
+  holds the manager's own image. Empty leaves the controller unable to create a StatefulSet
+  (`errControllerImageUnset`). The manager container must stay `containers[0]` of the manager
+  Deployment, whose image the configuration mirrors. The Kustomize deployment of `config/` still
+  passes the removed command-line flags and the removed `KOUJOUO_CONTROLLER_IMAGE` environment
+  variable: it is superseded by the Helm chart, which writes the configuration file.
 - **In-place agent upgrade**: the build stamps the same version into both binaries
   (`internal/version.Agent`). An agent that reports another version receives `/kojouo/agent` from
   the manager and `execve(2)s` it without stopping the game. Consequences:
@@ -353,9 +372,14 @@ the `ENVTEST_K8S_VERSION` is derived from `k8s.io/api` in go.mod. `make test`, `
 `make run` and `make test-e2e` regenerate the manifests and the code first
 (`manifests generate fmt`), so they can leave modified generated files behind.
 
-`make run` needs `KOUJOUO_CONTROLLER_IMAGE` exported with the agent image, otherwise the manager
-cannot build a StatefulSet. It upgrades agents like a deployed manager does, by streaming
-`/kojouo/agent` from its own filesystem — a file that only exists inside the image.
+`make run` runs the manager with `examples/manager.yaml`, so it cannot build a StatefulSet while
+`controllerImage` there is empty: set it to the published agent image first. The manager upgrades
+agents like a deployed manager does, by streaming `/kojouo/agent` from its own filesystem — a
+file that only exists inside the image.
+
+The configuration loaders of both binaries are covered by plain unit tests
+(`cmd/manager/config_test.go`, `cmd/agent/config_test.go`): they check the defaults, a full file
+and the errors of a missing or malformed one.
 
 **E2E suite** (`test/e2e/`, build tag `e2e`)
 

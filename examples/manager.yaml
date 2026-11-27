@@ -1,0 +1,47 @@
+# Configuration of the koujouo manager (cmd/manager).
+#
+# The manager reads the file named by --config, /etc/koujouo/manager.yaml by
+# default. The deployment mounts it there as a ConfigMap. Every key below shows
+# the built-in default: a key the file leaves out keeps its default.
+#
+# `make run` runs the manager with this file.
+
+# Address the metrics endpoint binds to: ":8443" for HTTPS, ":8080" for HTTP,
+# or "0" to disable the metrics server.
+metricsBindAddress: "0"
+
+# Address the health probes of the manager (GET /healthz and /readyz) bind to.
+healthProbeBindAddress: ":8081"
+
+# Elect a leader, so that only one manager of several replicas is active.
+leaderElection: false
+
+# Serve the metrics endpoint over HTTPS, authenticated and authorized by the
+# API server. Takes effect only when metricsBindAddress is not "0".
+secureMetrics: true
+
+# Directory holding the webhook certificate. Empty disables the certificate
+# watcher, which the manager needs only once the project has a webhook.
+webhookCertPath: ""
+webhookCertName: tls.crt
+webhookCertKey: tls.key
+
+# Directory holding the metrics server certificate. Empty lets
+# controller-runtime generate a self-signed certificate.
+metricsCertPath: ""
+metricsCertName: tls.crt
+metricsCertKey: tls.key
+
+# Image the agent StatefulSets run: the same image as the manager, holding
+# /kojouo/agent. The manager streams that binary from its own filesystem to the
+# agents of another build. Empty leaves the manager unable to create an agent
+# StatefulSet, so set it to the published image, for example
+# ghcr.io/ushitora-anqou/koujouo:latest.
+controllerImage: ""
+
+# Logging.
+log:
+  # Log in the human-readable console encoding instead of JSON.
+  development: true
+  # Minimum level to log: debug, info, warn, error, dpanic, panic or fatal.
+  level: info

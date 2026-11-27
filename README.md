@@ -68,6 +68,12 @@ make deploy IMG=<some-registry>/koujouo:tag
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
 privileges or be logged in as admin.
 
+The manager reads its configuration from `/etc/koujouo/manager.yaml`, which the
+deployment mounts from a ConfigMap (see [Configuration](#configuration)). The
+scaffolded Kustomize manifests in `config/` still start the manager with the
+command-line flags it no longer takes; they need to mount the configuration file
+and pass `--config` instead.
+
 **Create a server**
 
 A `FactorioServer` refers to three things that you create first:
@@ -119,6 +125,32 @@ is rolled out, the controller streams the new agent binary to the running agent,
 which replaces itself in place. The game keeps running. For this to hold the
 StatefulSet uses the `OnDelete` update strategy: its Pod is not replaced when
 the image changes.
+
+## Configuration
+
+Both binaries take their configuration from a YAML file, named by the only
+command-line flag they have:
+
+| Binary | Flag | Default path | Where the file comes from |
+| --- | --- | --- | --- |
+| manager | `--config` | `/etc/koujouo/manager.yaml` | the ConfigMap the deployment mounts |
+| agent | `--config` | `/etc/koujouo/agent.yaml` | baked into the image |
+
+[`examples/manager.yaml`](examples/manager.yaml) and
+[`examples/agent.yaml`](examples/agent.yaml) list every key with its default
+value. A key the file leaves out keeps its default; a file that is missing or
+does not parse stops the binary with an error. The keys are lowerCamelCase, and
+`log.development` and `log.level` choose the encoding (console or JSON) and the
+level of the logs. Neither binary reads its configuration from environment
+variables.
+
+The manager's `controllerImage` is the image the agent Pods run: the controller
+deploys it for the StatefulSets it creates and streams `/kojouo/agent` from its
+own filesystem to the agents of another build, so it normally holds the
+manager's own image. With an empty `controllerImage` the controller cannot
+create a StatefulSet.
+
+`make run` runs the manager on the host with `examples/manager.yaml`.
 
 ## Known limitations
 
