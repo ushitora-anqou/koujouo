@@ -1,0 +1,50 @@
+# Continuous integration: one job that runs the gate a commit has to pass
+# locally, `make all`, and then checks that regenerating the code and the chart
+# leaves nothing uncommitted, `make check-uncomitted`. The release workflow
+# (release.yml) is separate: it builds and publishes the image.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    # The job builds the image with Nix and downloads Factorio twice (e2e), so
+    # the ten minutes of go test and the default timeout of a job are not
+    # enough: give make all, and the regeneration after it, room.
+    timeout-minutes: 90
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Enter the Nix dev shell
+        uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1.2.1
+
+      # A go.mod/go.sum that tidy would rewrite is caught by check-uncomitted
+      # below, which runs after make all.
+      - name: Tidy the Go modules
+        run: go mod tidy
+
+      - name: Run the pre-commit gate
+        # DISCORD_WEBHOOK_URL is optional: without the repository secret the
+        # e2e suite creates no webhook Secret and the FactorioServer runs
+        # without Discord notifications.
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: make all
+
+      # Runs after make all: it regenerates everything once more and fails when
+      # a generated file, go.mod/go.sum or anything else is left uncommitted.
+      - name: Check that the regeneration leaves no uncommitted changes
+        run: make check-uncomitted

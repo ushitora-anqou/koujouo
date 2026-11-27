@@ -227,6 +227,15 @@ suite needs.
 
 ## After Making Changes
 
+**Before committing** (the same two commands `ci.yml` runs):
+```
+make all               # fmt generate manifests lint-config lint test test-e2e
+make check-uncomitted  # Fails unless the regeneration leaves nothing to commit
+```
+`make all` includes `test-e2e` (Docker and up to 40 minutes). `check-uncomitted` fails on any
+uncommitted change by design, so commit (or at least `git add`) your work first and run it to
+learn whether the generated files are up to date.
+
 **After editing `*_types.go` or markers:**
 ```
 make manifests  # Regenerate the CRD and the manager ClusterRole of the chart from markers
@@ -266,15 +275,29 @@ exports the dev shell environment to subsequent steps. All actions are pinned by
 commit SHA. Dependabot (`.github/dependabot.yml`) updates Go modules and the
 pinned actions weekly.
 
-- `lint.yml`: `make lint-config`, `make lint`
-- `test.yml`: `go mod tidy`, `make test`
-- `test-e2e.yml`: `go mod tidy`, `make test-e2e`, with `DISCORD_WEBHOOK_URL` from a repository
-  secret of the same name when one is configured
-- `release.yml`: `nix build .#dockerImage`, published to GHCR
+`ci.yml` runs on every push and pull request: one job on `ubuntu-latest` that does
+`go mod tidy`, then `make all`, then `make check-uncomitted` — the same two commands a
+commit has to pass locally.
 
-The first three run on every push and pull request. No workflow compares the regenerated files
-with the committed ones, so run the `make` targets under "After Making Changes" yourself and
-commit their output.
+- `make all` is the pre-commit gate:
+  `fmt generate manifests lint-config lint test test-e2e`. It regenerates the DeepCopy code, the
+  capnp code and the chart, verifies the golangci-lint configuration, runs `golangci-lint` and
+  `helm lint`, then the unit and envtest suite (`test`) and the Kind end-to-end suite (`test-e2e`,
+  which builds the image with Nix and needs Docker). It has no `build` step on purpose: `test`
+  compiles the manager and the agent, and `test-e2e` builds the image. `test-e2e` receives
+  `DISCORD_WEBHOOK_URL` from a repository secret of the same name when one is configured; without
+  it the suite runs without Discord notifications.
+- `make check-uncomitted` (one "m", as the target is spelled) runs `fmt generate manifests` and
+  then fails when `git status --porcelain` is not empty: a generated file whose change was not
+  committed, an untracked file, and an unrelated uncommitted change all fail it. In CI
+  `go mod tidy` runs before `make all`, so a `go.mod`/`go.sum` that tidy would rewrite fails here
+  too.
+- `release.yml` is separate: it builds `nix build .#dockerImage` and publishes it to GHCR (see the
+  next paragraph). It does not go through the Makefile, so a change of a `make` target cannot break
+  it.
+
+CI therefore also compares the regenerated files with the committed ones: run the `make` targets
+under "After Making Changes" yourself and commit their output.
 
 `release.yml` publishes the image on a push to `master` and on a `v*` tag: a `master` push tags
 `master` and `latest`, a `v*` tag tags `vX.Y.Z` only, so an old tag cannot move `latest`. It runs

@@ -29,8 +29,12 @@ CONTAINER_TOOL ?= docker
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
+# `all` is the gate a commit has to pass, and the default goal: it regenerates
+# the code and the chart, verifies the linter configuration, lints, and runs
+# both test layers. `build` is not part of it on purpose: `test` compiles the
+# manager and the agent, and `test-e2e` builds the image and runs it.
 .PHONY: all
-all: build
+all: fmt generate manifests lint-config lint test test-e2e ## Run everything a commit has to pass: regenerate, lint and test (e2e included).
 
 ##@ General
 
@@ -136,6 +140,21 @@ lint-fix: ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+# The target name carries a single "m" (`check-uncomitted`): keep that
+# spelling, `check-uncommitted` does not exist. `ci.yml` and the docs use it.
+#
+# It regenerates the code and the chart and then fails on any change in the
+# working tree: a generated file whose change was not committed, an untracked
+# file, and an unrelated uncommitted change all fail it. That is intended: run
+# it on a tree you are ready to commit.
+.PHONY: check-uncomitted
+check-uncomitted: fmt generate manifests ## Check that the regeneration leaves no uncommitted changes.
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Uncommitted changes after regeneration:"; \
+		git status --short; \
+		exit 1; \
+	fi
 
 ##@ Build
 

@@ -244,6 +244,8 @@ nix develop
 
 | Command | What it does |
 | --- | --- |
+| `make all` | The gate CI runs: `fmt generate manifests lint-config lint test test-e2e` |
+| `make check-uncomitted` | Regenerates and fails if the tree is not clean afterwards |
 | `make manifests generate` | Regenerates the CRD and the manager ClusterRole of the Helm chart and the DeepCopy code after editing `api/` |
 | `make generate-capnp` | Regenerates `rpc/koujouo.capnp.go` after editing `rpc/koujouo.capnp` |
 | `make lint` | Runs golangci-lint and `helm lint charts/koujouo` |
@@ -251,7 +253,16 @@ nix develop
 | `make test` | Unit tests and envtest tests |
 | `make test-e2e` | End-to-end tests on a dedicated Kind cluster with the real Factorio binary |
 
-The e2e tests post nothing to Discord unless `DISCORD_WEBHOOK_URL` is set.
+Every push and pull request runs the `CI` workflow
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), which is `go mod tidy`,
+`make all` and `make check-uncomitted`. `make all` regenerates the code and the
+chart, lints them and runs both test layers (the e2e tests included), so run it
+before you push. `make check-uncomitted` runs `fmt generate manifests` once more
+and fails when that leaves anything uncommitted — a generated file you forgot, an
+untracked file, or any other change in your working tree.
+
+The e2e tests post nothing to Discord unless `DISCORD_WEBHOOK_URL` is set; the
+workflow passes the repository secret of that name when you configure one.
 Run them only against a throwaway Kind cluster: they create and delete the
 cluster `koujouo-test-e2e`.
 
