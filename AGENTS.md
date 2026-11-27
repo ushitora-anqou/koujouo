@@ -386,16 +386,24 @@ and the errors of a missing or malformed one.
 
 The files carry `//go:build e2e`: `make test` skips the package and `make lint` does not see
 it. `BeforeSuite` builds the image (`make docker-build IMG=example.com/koujouo:v0.0.1`), loads
-it into Kind and deploys the operator into `koujouo-system`; two containers then run against
-it: the scaffolded `Manager` metrics checks and `FactorioServer` (`Ordered`), which walks one
-server through download and host → inspect the save volume → change the game version →
-suspend → resume from the same save. The scenarios assert on the `FactorioServer` status and
-on the agent log, which `utils.FollowPodLogs` keeps in memory after the Pod is deleted.
+it into Kind and installs the chart into `koujouo-system` with
+`helm upgrade --install koujouo charts/koujouo -n koujouo-system --set image.repository=...
+--set image.tag=...`; the suite creates and labels that namespace itself, since the chart
+makes none. Two containers then run against it: the scaffolded `Manager` metrics checks and
+`FactorioServer` (`Ordered`), which walks one server through download and host → inspect the
+save volume → change the game version → suspend → resume from the same save. The scenarios
+assert on the `FactorioServer` status and on the agent log, which `utils.FollowPodLogs` keeps
+in memory after the Pod is deleted.
 
 - Needs Docker, outbound access to `factorio.com` (the agent downloads Factorio 2.1.24 and
   2.1.25) and up to `E2E_TIMEOUT` (40 minutes by default); cert-manager is not installed.
 - The image comes from the Nix flake: stage or commit your changes first, otherwise the suite
   tests the last committed build against CRDs generated from the working tree.
+- `AfterSuite` uninstalls the release with `helm uninstall`, then deletes the CRD — it carries
+  `helm.sh/resource-policy: keep`, so the uninstall keeps it — and the namespace last.
+  `BeforeSuite` deletes a leftover CRD as well: one a failed run left behind makes the install
+  fail on the ownership. The namespaces and the metrics ClusterRoleBinding are created
+  idempotently, so a suite re-run on the cluster of a failed run works.
 - `DISCORD_WEBHOOK_URL`, when set, is handed to the FactorioServer as a Secret; without it the
   suite runs without Discord notifications. Never put a webhook URL into the suite.
 - A failed scenario dumps the objects, the events, the manager log and the agent log to the

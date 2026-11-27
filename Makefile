@@ -83,14 +83,17 @@ test: manifests generate fmt ## Run tests.
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
+# The suite deploys the operator by installing charts/koujouo with
+# `helm upgrade --install` and removes it with `helm uninstall`; there is no
+# `make install` / `make deploy` any more.
 # kubectl kuberc is disabled by default for test isolation; enable with:
 # - KUBECTL_KUBERC=true
 # CertManager is not needed: the project has no webhook, so test-e2e skips its installation.
 # DISCORD_WEBHOOK_URL, when set, is handed to the FactorioServer of the suite
 # (as a Secret); the suite runs without Discord notifications otherwise.
 KIND_CLUSTER ?= koujouo-test-e2e
-# The suite builds the image with Nix, deploys the operator and lets the
-# agent download the Factorio headless build, which takes longer than the
+# The suite builds the image with Nix, installs the chart with Helm and lets
+# the agent download the Factorio headless build, which takes longer than the
 # ten minutes go test allows by default.
 E2E_TIMEOUT ?= 40m
 
@@ -108,6 +111,9 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
 
+# The e2e suite installs the chart with Helm, so the target depends on
+# `manifests generate fmt`: the CRD and the manager ClusterRole of the chart
+# must match the markers of the working tree the suite tests.
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt ## Run the e2e tests. Expected an isolated environment using Kind.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) CERT_MANAGER_INSTALL_SKIP=true \

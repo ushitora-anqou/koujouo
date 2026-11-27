@@ -725,7 +725,7 @@ examples/
   README.md                新規  適用順（PVC → ConfigMap/Secret → FactorioServer）
 
 test/e2e/
-  e2e_suite_test.go        修正  （必要なら）タイムアウト延長
+  e2e_suite_test.go        修正  Helm chart でのデプロイ（`helm upgrade --install` / `helm uninstall`）と CRD の後始末
   factorio_e2e_test.go     新規  §7 の e2e シナリオ
 
 flake.nix                   修正  §2（go2nix の manager、devShell、go2nix プラグイン、image、agent の設定ファイル）
@@ -790,7 +790,16 @@ controller のロジックを実際の API server で検証。agent は動かな
 
 ### 7.3 e2e（kind、`make test-e2e`）
 
-既存の `test/e2e` 枠組み（`make docker-build IMG=...` → `utils.LoadImageToKindClusterWithName` → `helm upgrade --install koujouo charts/koujouo -n koujouo-system --set image.repository=... --set image.tag=...`）をそのまま使う。`BeforeSuite` がこの 3 ステップを 1 回だけ行い、2 つのコンテナが同じ operator を使う。Namespace `koujouo-system` は事前に作り、`restricted` の Pod Security Standards を enforce する（chart は Namespace を作らない）。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image ビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 40m）を指定する。
+既存の `test/e2e` 枠組み（Kind + `make docker-build IMG=example.com/koujouo:v0.0.1`）を使うが、デプロイは `make install` / `make deploy`（もう存在しない）ではなく Helm chart で行う。`BeforeSuite` が次の順で 1 回だけ実行し、2 つのコンテナが同じ operator を使う。
+
+1. `make docker-build IMG=<managerImage>` で image をビルドする
+2. `utils.LoadImageToKindClusterWithName` で Kind に load する
+3. Namespace `koujouo-system` を作り（既にあれば再利用する）、`restricted` の Pod Security Standards を enforce する（chart は Namespace を作らない）
+4. 前回の失敗が残した CRD を消す（`kubectl delete crd factorioservers.koujouo.anqou.net --ignore-not-found`）。CRD は `helm.sh/resource-policy: keep` を持つため `helm uninstall` では消えず、release が所有しない CRD が残っていると Helm の install が失敗する
+5. `helm upgrade --install koujouo charts/koujouo --namespace koujouo-system --set image.repository=<repo> --set image.tag=<tag>` でデプロイする。`managerImage` は `<repo>:<tag>` なので、registry のポートを repository 側に残すため最後の `/` より後ろの `:` で repository と tag に分ける
+6. `kubectl wait deployment/koujouo-controller-manager -n koujouo-system --for=condition=Available --timeout=5m` で待つ（Deployment 名・ServiceAccount 名・metrics Service 名・`koujouo-metrics-reader` ClusterRole 名は chart が `fullnameOverride: koujouo` で作る名前と一致する）
+
+`AfterSuite` は `helm uninstall koujouo --namespace koujouo-system`（失敗しても続行）→ CRD の削除（keep annotation のため uninstall では消えない）→ manager Namespace の削除 → cert-manager の teardown の順で行う。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image ビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 40m）を指定する。
 
 | コンテナ | ファイル | 内容 |
 |---|---|---|
@@ -813,6 +822,7 @@ controller のロジックを実際の API server で検証。agent は動かな
 - `agent-state.json` には webhook URL と RCON パスワードが入るため、一時 Pod はファイル名の一覧と map.zip の fingerprint だけを出力し、ファイル内容は出力しない
 - 失敗時は `AfterEach` が FactorioServer の YAML、StatefulSet と Pod の describe と logs（previous を含む）、PVC、PV、events、controller-manager のログ、追跡した agent ログ、status の phase 遷移を出力する
 - RCON の証拠: `status.onlinePlayers` は 0 のとき省略される（`omitempty`）ため、単独では RCON 成功を証明しない。drain 時（シナリオ 3・4）の `No players are online` で `/players online count` が `(0)` を返したことを確認する（RCON 失敗時は `Could not query the online players` になる）
+- 再実行性: 2 つの Namespace（`koujouo-system` と `koujouo-e2e-factorio`）は存在を確認してから作る。`Manager` コンテナの `koujouo-metrics-binding` ClusterRoleBinding は cluster-scope で Namespace の削除に巻き込まれないため、`kubectl delete clusterrolebinding ... --ignore-not-found` してから create する（SA に metrics-reader を付ける意図は変えない）
 
 環境変数の扱い:
 
@@ -842,5 +852,5 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 9. **過去バージョンのゲームバイナリ**: ephemeral volume に残る（約 313 MB / 版）。Pod 再作成で消える。既定 2Gi では数回のバージョン変更で埋まる。
 10. **GitHub Actions 上での e2e**: ローカルの kind（docker 29.9.3 / kind v0.33.0）でのみ確認済み。runner 上では未実行。Docker Hub と factorio.com への外向き通信が必要。
 11. **`agent-state.json`**: save volume に最終 Config を保存するため、Discord の webhook URL と S3 の鍵が平文で入る（パーミッション 0600）。
-12. **`config/` の Kustomize マニフェストと e2e の追従**: → 解消。Kustomize のツリー（`config/`）は削除し、Helm chart `charts/koujouo` が manager の設定を ConfigMap（`koujouo-config`）として書き、Deployment の `args` を `--config /etc/koujouo/manager.yaml` だけにした。`controllerImage` は chart が自身の `image` values から書くので、`KOUJOUO_CONTROLLER_IMAGE` も `config/default/manager_metrics_patch.yaml` も不要になった。`make manifests` は CRD と manager の ClusterRole を `charts/koujouo/templates/` に直接生成し、`make lint` が `helm lint charts/koujouo` を回す。サンプルは `examples/` に移した（適用順は `examples/README.md`）。e2e（`test/e2e`）の Helm 化は次の段で行う。
+12. **`config/` の Kustomize マニフェストと e2e の追従**: → 解消。Kustomize のツリー（`config/`）は削除し、Helm chart `charts/koujouo` が manager の設定を ConfigMap（`koujouo-config`）として書き、Deployment の `args` を `--config /etc/koujouo/manager.yaml` だけにした。`controllerImage` は chart が自身の `image` values から書くので、`KOUJOUO_CONTROLLER_IMAGE` も `config/default/manager_metrics_patch.yaml` も不要になった。`make manifests` は CRD と manager の ClusterRole を `charts/koujouo/templates/` に直接生成し、`make lint` が `helm lint charts/koujouo` を回す。サンプルは `examples/` に移した（適用順は `examples/README.md`）。e2e（`test/e2e`）も `helm upgrade --install` で chart をデプロイし、`helm uninstall` と CRD の明示削除で後始末する（§7.3）。
 13. **reconcile のタイムアウトと configure / stop の待機**: 待機と進捗の status パッチは `context.WithoutCancel` で reconcile の期限から切り離してある。controller の停止時のみ中断され、次の reconcile が続きを行う。

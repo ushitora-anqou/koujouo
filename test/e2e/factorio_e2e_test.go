@@ -408,7 +408,15 @@ var _ = Describe("FactorioServer", Ordered, func() {
 				},
 			},
 		}
-		Expect(k8sClient.Create(ctx, namespaceObject)).To(Succeed(), "Failed to create the namespace")
+		// Tolerate a namespace a failed run left behind, like the manager
+		// namespace of the suite.
+		err = k8sClient.Get(ctx, client.ObjectKey{Name: factorioNamespace}, &corev1.Namespace{})
+		if apierrors.IsNotFound(err) {
+			Expect(k8sClient.Create(ctx, namespaceObject)).To(Succeed(), "Failed to create the namespace")
+		} else {
+			Expect(err).NotTo(HaveOccurred(), "Failed to look up the namespace")
+			_, _ = fmt.Fprintf(GinkgoWriter, "Namespace %q already exists, reusing it\n", factorioNamespace)
+		}
 
 		By("creating the save PersistentVolumeClaim")
 		claim := &corev1.PersistentVolumeClaim{

@@ -135,11 +135,19 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+			// The binding is a cluster-scoped object, so it outlives the
+			// namespace a failed run leaves behind: recreate it to keep the
+			// suite runnable on such a cluster.
+			cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName,
+				"--ignore-not-found")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete a stale ClusterRoleBinding")
+
+			cmd = exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
 				"--clusterrole=koujouo-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
-			_, err := utils.Run(cmd)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
 
 			By("validating that the metrics service is available")

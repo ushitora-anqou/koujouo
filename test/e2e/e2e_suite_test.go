@@ -20,9 +20,12 @@ limitations under the License.
 package e2e
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -36,6 +39,19 @@ var (
 	managerImage = "example.com/koujouo:v0.0.1"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
+)
+
+// The suite deploys the operator with the chart in charts/koujouo, the only
+// supported way of deploying it: `make install` and `make deploy` no longer
+// exist.
+const (
+	// helmReleaseName is the name of the Helm release the suite installs.
+	helmReleaseName = "koujouo"
+	// chartPath is the chart holding the CRD, the RBAC and the manager Deployment.
+	chartPath = "charts/koujouo"
+	// crdName is the CRD of the chart. It carries `helm.sh/resource-policy: keep`,
+	// so `helm uninstall` leaves it behind and the suite deletes it itself.
+	crdName = "factorioservers.koujouo.anqou.net"
 )
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
@@ -68,10 +84,11 @@ var _ = BeforeSuite(func() {
 	configureKubectlKubeRC()
 	setupCertManager()
 
+	// The chart creates no Namespace, so the suite creates the one of the
+	// release and enforces the restricted Pod Security Standards in it. Both
+	// steps tolerate a namespace a failed run left behind.
 	By("creating manager namespace")
-	cmd = exec.Command("kubectl", "create", "ns", namespace)
-	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to create namespace")
+	ExpectWithOffset(1, createNamespace(namespace)).To(Succeed(), "Failed to create namespace")
 
 	By("labeling the namespace to enforce the restricted security policy")
 	cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
@@ -79,15 +96,25 @@ var _ = BeforeSuite(func() {
 	_, err = utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 
-	By("installing CRDs")
-	cmd = exec.Command("make", "install")
+	// The CRD carries `helm.sh/resource-policy: keep`, so the uninstall of a
+	// failed run leaves it behind. Helm refuses to install the chart over a
+	// CRD it does not own, so delete the leftover before the install.
+	By("deleting the CRD a previous run left behind")
+	cmd = exec.Command("kubectl", "delete", "crd", crdName, "--ignore-not-found")
 	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to install CRDs")
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to delete the leftover CRD")
 
-	By("deploying the controller-manager")
-	cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
+	By("deploying the controller-manager with Helm")
+	repository, tag, err := splitManagerImage(managerImage)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to split the manager image")
+
+	cmd = exec.Command("helm", "upgrade", "--install", helmReleaseName, chartPath,
+		"--namespace", namespace,
+		"--set", "image.repository="+repository,
+		"--set", "image.tag="+tag,
+	)
 	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager with Helm")
 
 	By("waiting for the controller-manager deployment to be available")
 	cmd = exec.Command("kubectl", "wait", "deployment/"+managerDeploymentName,
@@ -97,12 +124,17 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	By("undeploying the controller-manager")
-	cmd := exec.Command("make", "undeploy")
-	_, _ = utils.Run(cmd)
+	By("uninstalling the Helm release")
+	cmd := exec.Command("helm", "uninstall", helmReleaseName, "--namespace", namespace)
+	output, err := utils.Run(cmd)
+	if err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Failed to uninstall the Helm release: %v: %s\n", err, output)
+	}
 
-	By("uninstalling CRDs")
-	cmd = exec.Command("make", "uninstall")
+	// `helm uninstall` keeps the CRD: it carries helm.sh/resource-policy: keep,
+	// so that a user does not lose the FactorioServers with the release.
+	By("deleting the CRD")
+	cmd = exec.Command("kubectl", "delete", "crd", crdName, "--ignore-not-found")
 	_, _ = utils.Run(cmd)
 
 	By("removing manager namespace")
@@ -111,6 +143,42 @@ var _ = AfterSuite(func() {
 
 	teardownCertManager()
 })
+
+// createNamespace creates the namespace name unless it exists, so that a
+// suite that runs again on the cluster of a failed run does not stop here.
+func createNamespace(name string) error {
+	_, err := utils.Kubectl(context.Background(), "get", "namespace", name)
+	if err == nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Namespace %q already exists, reusing it\n", name)
+
+		return nil
+	}
+
+	_, err = utils.Kubectl(context.Background(), "create", "namespace", name)
+
+	return err
+}
+
+// errNoImageTag reports an image reference of the form <repository> without
+// the tag the chart needs.
+var errNoImageTag = errors.New("the image reference has no tag")
+
+// splitManagerImage splits an image reference of the form <repository>:<tag>
+// into its parts. The colon of a registry port belongs to the repository, so
+// only a colon after the last slash starts the tag.
+func splitManagerImage(image string) (string, string, error) {
+	colon := strings.LastIndex(image, ":")
+	if colon < 0 || colon < strings.LastIndex(image, "/") {
+		return "", "", fmt.Errorf("%w: %q", errNoImageTag, image)
+	}
+
+	repository, tag := image[:colon], image[colon+1:]
+	if repository == "" || tag == "" {
+		return "", "", fmt.Errorf("%w: %q", errNoImageTag, image)
+	}
+
+	return repository, tag, nil
+}
 
 // Disable kubectl kuberc by default for test isolation.
 // This prevents local kubectl configurations from affecting test behavior.
