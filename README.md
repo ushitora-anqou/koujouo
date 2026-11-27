@@ -219,9 +219,12 @@ Run them only against a throwaway Kind cluster: they create and delete the
 cluster `koujouo-test-e2e`.
 
 The Nix flake only sees git-tracked files. Run `git add` on your changes
-before `nix build .#manager` or `make docker-build`. When `go.mod` or
-`go.sum` changes, update the `vendorHash` of the `manager` package in
-`flake.nix` as described in [AGENTS.md](AGENTS.md).
+before `nix build .#manager` or `make docker-build`. The Go binaries are
+built with [go2nix](https://github.com/numtide/go2nix) without a lockfile:
+the module hashes come from `go.sum`, so a change of `go.mod`/`go.sum`
+needs no hash update. Its Nix plugin is loaded by the dev shell, so
+`nix build .#manager` works there; outside of it pass `--option plugin-files`
+as described in [AGENTS.md](AGENTS.md) (`make docker-build` does it for you).
 
 The design notes live in [docs/design.md](docs/design.md).
 

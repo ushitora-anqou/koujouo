@@ -43,7 +43,7 @@ $Go.import("github.com/ushitora-anqou/koujouo/rpc");
 capnp compile -I"$(go list -m -f '{{.Dir}}' capnproto.org/go/capnp/v3)/std" -ogo rpc/koujouo.capnp
 ```
 
-`capnp` コンパイラは `-ogo` で PATH 上の `capnpc-go` プラグインを呼び出す（§2 で Nix 化する）。
+`capnp` コンパイラは `-ogo` で `capnpc-go` プラグインを呼び出す。実装では CodeGeneratorRequest を `-o-` で標準出力に流し、go.mod の `tool` ディレクティブが指す `go tool capnpc-go` に渡す（§2.1）。
 
 **RPC サーバー（agent 側、TCP 9550）**:
 
@@ -180,24 +180,9 @@ Discord の Execute Webhook API は `POST {webhook URL}` に `{"content": "...",
 
 ### 2.1 devShell へのツール追加
 
-`capnp` コンパイラは nixpkgs に存在する（`pkgs/by-name/ca/capnproto/package.nix` → `capnproto`）。一方 `capnpc-go` プラグインは nixpkgs に無いため、flake 内で `buildGoModule` として定義し、両方を devShell に追加する:
+`capnp` コンパイラは nixpkgs に存在する（`pkgs/by-name/ca/capnproto/package.nix` → `capnproto`）ので、そのまま devShell に追加する。Go プラグイン `capnpc-go` は flake ではビルドしない: `go.mod` の `tool` ディレクティブ（`capnproto.org/go/capnp/v3/capnpc-go`、`capnproto.org/go/capnp/v3` と同じバージョン）で管理し、`rpc/generate.go` の `go:generate` が `go tool capnpc-go` として実行する。バージョンは `go get -tool capnproto.org/go/capnp/v3/capnpc-go@<version>` で上げる。
 
-```nix
-capnpc-go = pkgs.buildGoModule {
-  pname = "capnpc-go";
-  version = "3.1.0-alpha.2";
-  src = pkgs.fetchFromGitHub {
-    owner = "capnproto";
-    repo = "go-capnp";
-    rev = "v3.1.0-alpha.2";
-    hash = "sha256-..."; # ビル時に算出
-  };
-  subPackages = [ "capnpc-go" ];
-  vendorHash = "sha256-..."; # ビル時に算出
-};
-```
-
-AGENTS.md の規約（ツールは `go install` せず Nix から）に従うため、CI を含め全員が同じ `capnpc-go` を使う。`go.mod` に `capnproto.org/go/capnp/v3` が入った時点で `vendorHash` を確定させる手順は既存の manager と同じ。
+当初は `capnpc-go` を flake 内の `buildGoModule` として定義する計画だったが、`tool` ディレクティブで版を 1 か所（go.mod）に寄せられるため取りやめた。`go tool` は go.mod が固定した版をモジュールキャッシュから実行するだけでインストールはしないため、AGENTS.md の「ツールは `go install` せず Nix から」という規約とも両立する。
 
 ### 2.2 Makefile ターゲットと go:generate
 
@@ -228,33 +213,61 @@ generate: generate-capnp ## Generate code containing DeepCopy, ...
 
 ### 2.3 flake のサブパッケージ化（cmd/manager と cmd/agent）
 
-`cmd/main.go` を `cmd/manager/main.go` へ移動し、`cmd/agent/main.go` を新設する。flake の `manager` パッケージ:
+`cmd/main.go` を `cmd/manager/main.go` へ移動し、`cmd/agent/main.go` を新設する。flake の `manager` パッケージは [go2nix](https://github.com/numtide/go2nix) の `buildGoApplication` でビルドする:
 
 ```nix
-manager = pkgs.buildGoModule {
+goEnv = go2nix.lib.mkGoEnv {
+  inherit (pkgs) go callPackage;
+  go2nix = go2nix.packages.${system}.go2nix;
+  # scope の標準ライブラリも cgo 無しでビルドする（下記）
+  goEnv = { CGO_ENABLED = "0"; };
+};
+
+manager = goEnv.buildGoApplication {
   pname = "koujouo";
   version = "0.0.1";
   src = inputs.self;
-  vendorHash = "sha256-...";
-  subPackages = [ "cmd/manager" "cmd/agent" ]; # 両バイナリを 1 モジュールビルドで
-  env.CGO_ENABLED = 0;
-  ldflags = [ "-s" "-w" ];
-}; # postInstall のリネームは不要: バイナリ名がディレクトリ名 (manager, agent) になる
+  subPackages = [ "cmd/manager" "cmd/agent" ]; # 両バイナリを 1 呼び出しで
+  CGO_ENABLED = 0;                             # 静的バイナリを維持
+  doCheck = false;                             # envtest は sandbox で動かない（make test が担当）
+  ldflags = [ "-s" "-w" "-X github.com/ushitora-anqou/koujouo/internal/version.Agent=${buildVersion}" ];
+}; # バイナリ名がディレクトリ名 (manager, agent) になる
 ```
 
-buildGoModule の `subPackages` は複数エントリに対応しておおり、`$out/bin/manager` と `$out/bin/agent` の両方が生成される。
+`subPackages` の各エントリは `$out/bin/<ディレクトリ名>` になるため、`$out/bin/manager` と `$out/bin/agent` の両方が生成される。`src` が flake のソース（git-tracked のみ）である点は `buildGoModule` のときと同じ。
+
+`CGO_ENABLED` は 2 か所に要る。ビルド側だけ `0` にすると、scope が既定（cgo 有効）でビルドした標準ライブラリが `runtime/cgo` を同梱し、リンカが外部リンカを選んでバイナリが Nix の glibc に動的リンクされる。agent のバイナリは別 image の agent Pod に流し込まれる（in-place upgrade）ため、image 間で glibc の store path が変わると `execve` が失敗する。scope 側も `0` にして静的リンクを保つ。
+
+**lockfile を持たない**: `goLock` を渡さないので、モジュールのハッシュは評価時に `go.sum` から導出される（結果は `$XDG_CACHE_HOME/go2nix/nar/` にキャッシュされる）。`go.mod` / `go.sum` だけを更新する PR（Dependabot）がそのままビルドでき、`vendorHash` のような手動更新は不要になる。`go2nix.toml` を置くと `go get` のたびに再生成が必要で、忘れるとビルドが落ちるため採用しない。
+
+**Nix プラグインが必要**: lockfile 無しのビルドは、評価時に `builtins.resolveGoPackages`（go2nix の Nix プラグインが提供）を呼んで `go list` を回す。プラグインは Nix 2.34 でビルドされ、読み込む Nix と ABI が一致している必要がある。
+
+- flake は `packages.<system>.go2nix-nix-plugin` として公開する（Makefile と CI がパスを取得する）
+- devShell の `shellHook` は `NIX_CONFIG` に `plugin-files = <plugin>` を追記する（既存の `NIX_CONFIG` は保持）。`nix develop` 内の `nix build .#manager` / `.#dockerImage` はそのまま動く
+- devShell 外では `nix build --option plugin-files "$(nix build --no-link --print-out-paths .#go2nix-nix-plugin)/lib/nix/plugins/libgo2nix_plugin.so" .#manager`。`make docker-build` はこのオプションを自前で渡すので外でも動く
+- プラグインが無いと評価は `error: attribute 'resolveGoPackages' missing` で止まる
+
+評価は `go list` を実行するため、モジュールが `GOMODCACHE` に無ければ `GOPROXY` に到達する（`go mod download` を先に流しておけば良い）。
 
 ### 2.4 dockerImage に両バイナリを同梱
 
 ```nix
+glibcLoader =
+  if pkgs.stdenv.hostPlatform.isAarch64
+  then "/lib/ld-linux-aarch64.so.1"
+  else "/lib64/ld-linux-x86-64.so.2"; # x86_64
+
 dockerImage = pkgs.dockerTools.buildImage {
-  name = "controller";
+  name = "ghcr.io/ushitora-anqou/koujouo"; # リリース workflow が公開する名前
   tag = "latest";
   copyToRoot = [
     (pkgs.runCommand "koujouo-root" {} ''
       mkdir -p $out/kojouo
       ln -s ${manager}/bin/manager $out/manager
       ln -s ${manager}/bin/agent $out/kojouo/agent
+      # Factorio のバイナリは動的リンクで標準のローダーパスを探す
+      mkdir -p "$out$(dirname "${glibcLoader}")"
+      ln -s ${pkgs.glibc}${glibcLoader} "$out${glibcLoader}"
     '')
     pkgs.cacert
     pkgs.tzdata
@@ -268,6 +281,8 @@ dockerImage = pkgs.dockerTools.buildImage {
 ```
 
 StatefulSet 側は `command: ["/kojouo/agent"]` を明示するため、image の Entrypoint は manager 用のままでよい。CA 証明書は agent の factorio.com / S3 ダウンロードと、controller の AWS API 呼び出しに必要（両バイナリとも同一 rootfs を使う）。
+
+image のローダーはアーキテクチャで切り替える: agent がダウンロードする Factorio のバイナリは動的リンクで、x86_64 は `/lib64/ld-linux-x86-64.so.2`、aarch64 は `/lib/ld-linux-aarch64.so.1` を探す。`make docker-build` は Nix が作った image をローカルランタイムに load し、`${IMG}` に `docker tag` し直す。
 
 flake 変更後は `nix fmt .` と `nix build .#dockerImage` を必ず回す（AGENTS.md）。
 
@@ -658,7 +673,7 @@ test/e2e/
   e2e_suite_test.go        修正  （必要なら）タイムアウト延長
   factorio_e2e_test.go     新規  §7 の e2e シナリオ
 
-flake.nix                   修正  §2（capnpc-go パッケージ、devShell、subPackages、image）
+flake.nix                   修正  §2（go2nix の manager、devShell、go2nix プラグイン、image）
 Makefile                    修正  §2.2（generate-capnp、build/run のパス）
 .github/workflows/test-e2e.yml 修正 DISCORD_WEBHOOK_URL の env 透過
 docs/design.md              本書
@@ -753,7 +768,7 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 
 ### 7.4 CI
 
-既存 3 workflow（`lint.yml` / `test.yml` / `test-e2e.yml`）をそのまま使う。追加変更は test-e2e.yml の `Running Test e2e` ステップに `env: DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}` を渡すことのみ。リポジトリ secret に実値を設定する（factorio.yaml の値を使い回さない、新規に発行する）。リポジトリ secret が無ければ値は空になり、suite は Secret を作らずに通知なしで動く。runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`nix build .#dockerImage` → `docker load` → tag）と `kind load docker-image`、kind 内での `curlimages/curl` と `busybox` の pull がそのまま動く。`go mod tidy` は各 workflow の既存 step が行うため、新依存はそこで解決される。e2e のテストファイルは `//go:build e2e` のため `make lint` の対象外（`test/utils` は対象内）。flake の `vendorHash` 更新を忘れないこと（§2）。
+既存 3 workflow（`lint.yml` / `test.yml` / `test-e2e.yml`）をそのまま使う。追加変更は test-e2e.yml の `Running Test e2e` ステップに `env: DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}` を渡すことのみ。リポジトリ secret に実値を設定する（factorio.yaml の値を使い回さない、新規に発行する）。リポジトリ secret が無ければ値は空になり、suite は Secret を作らずに通知なしで動く。runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`nix build .#dockerImage` → `docker load` → tag）と `kind load docker-image`、kind 内での `curlimages/curl` と `busybox` の pull がそのまま動く。`go mod tidy` は各 workflow の既存 step が行うため、新依存はそこで解決される。e2e のテストファイルは `//go:build e2e` のため `make lint` の対象外（`test/utils` は対象内）。flake は go2nix を lockfile 無しで使うため（§2.3）`vendorHash` の更新は無く、`go.mod` / `go.sum` を更新する PR もそのままビルドできる。CI は dev shell の中で `make` を回すので、go2nix の Nix プラグインは shellHook が設定する `NIX_CONFIG` 経由で読み込まれる。
 
 ---
 
@@ -762,7 +777,7 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 実装時に解決したものは「→」のあとに結果を記す。
 
 1. **capnp v3 が alpha タグ**: `v3.1.0-alpha.2` に依存する。破壊的変更の可能性は残る。生成コードと RPC API への依存は `rpc/`・`internal/controller/agentclient.go`・`internal/agent/agent.go` に局所化してある。
-2. **`capnpc-go` の Nix 化**: → flake 内に `buildGoModule` として定義済み（`doCheck = false`。上流テストが vendor レイアウトと非互換のため）。`make generate-capnp` で再生成できる。
+2. **`capnpc-go` の Nix 化**: → 取りやめ。`capnpc-go` は go.mod の `tool` ディレクティブで管理し、`go tool capnpc-go` として実行する（flake はビルドしない）。`make generate-capnp` で再生成できる。
 3. **controller イメージ名の伝達**: → manager Deployment の env `KOUJOUO_CONTROLLER_IMAGE` に、Kustomize が `image:` と同じ値を注入する。
 4. **`players` の集計**: → agent が 10 秒ごとに rcon `/players online count` をポーリングし、失敗時は前回値を維持する。実測の応答は `Online players (0):\n`。
 5. **phase の二重管理**: → conditions を正とし、phase は conditions から合成する（`internal/controller/status.go`）。

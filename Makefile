@@ -132,13 +132,17 @@ run: manifests generate fmt ## Run a controller from your host.
 
 # The image is built by the Nix flake (see .#dockerImage in flake.nix) and
 # loaded into the local container runtime, then re-tagged with ${IMG}.
+# go2nix resolves the module hashes from go.sum with a Nix plugin, which
+# `--option plugin-files` loads here: inside the dev shell the shellHook
+# already puts the plugin into NIX_CONFIG, and this option makes the target
+# work outside of it too.
 # Note: the flake source only contains git-tracked files, so commit (or at
 # least `git add`) your changes before building the image.
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager via Nix.
-	nix build -o result .#dockerImage
+	nix build --option plugin-files "$$(nix build --no-link --print-out-paths .#go2nix-nix-plugin)/lib/nix/plugins/libgo2nix_plugin.so" -o result .#dockerImage
 	$(CONTAINER_TOOL) load --input ./result
-	$(CONTAINER_TOOL) tag controller:latest ${IMG}
+	$(CONTAINER_TOOL) tag ghcr.io/ushitora-anqou/koujouo:latest ${IMG}
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

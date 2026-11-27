@@ -105,21 +105,33 @@ nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, kustomize,
   `make generate-capnp` runs it as `go tool capnpc-go` from `rpc/generate.go`. Bump the version
   with `go get -tool capnproto.org/go/capnp/v3/capnpc-go@<version>`
 - `nix fmt` formats Nix files with alejandra
-- `nix build .#manager` builds the `manager` and the `agent` binaries (`cmd/manager`, `cmd/agent`);
-  `nix build .#dockerImage` (the default package) builds the OCI image `controller:latest`
+- `nix build .#manager` builds the `manager` and the `agent` binaries (`cmd/manager`, `cmd/agent`)
+  with [go2nix](https://github.com/numtide/go2nix); `nix build .#dockerImage` (the default package)
+  builds the OCI image `ghcr.io/ushitora-anqou/koujouo:latest`
 - The image is built with `dockerTools.buildImage` (static binaries, nonroot user `65532`, CA certs
-  and tzdata); there is no Dockerfile. `/manager` is the entrypoint and `/kojouo/agent` the agent;
-  `/lib64/ld-linux-x86-64.so.2` links to the Nix glibc loader because the Factorio binary the agent
-  downloads is dynamically linked
+  and tzdata); there is no Dockerfile. `/manager` is the entrypoint and `/kojouo/agent` the agent.
+  The Factorio binary the agent downloads is dynamically linked, so the image links the glibc
+  loader the binary looks for: `/lib64/ld-linux-x86-64.so.2` on x86_64,
+  `/lib/ld-linux-aarch64.so.1` on aarch64
 - Both binaries get the build stamped into `internal/version.Agent` (`-X`): the short git revision,
   also over uncommitted changes. The Makefile bakes the same value into locally built binaries
   (`VERSION`)
 
-**When go.mod or go.sum changes**, update the `vendorHash` of the `manager`
-package in flake.nix:
-1. Run `nix build .#manager`
-2. Copy the `got: sha256-...` hash from the error message into `vendorHash`
-3. Re-run `nix build .#manager` and confirm it succeeds
+**The Go build is go2nix without a lockfile.** flake.nix defines `goEnv` with `go2nix.lib.mkGoEnv`
+and builds `manager` with `goEnv.buildGoApplication`: there is no `vendorHash`, and the module
+hashes are derived from `go.sum` while Nix evaluates. A change of `go.mod`/`go.sum` alone (a
+Dependabot pull request) therefore builds as it is; do not add a `go2nix.toml` lockfile (it would
+have to be regenerated on every bump and would fail the build until someone does).
+
+**go2nix's builder needs its Nix plugin.** The evaluator must provide
+`builtins.resolveGoPackages`, which `libgo2nix_plugin.so` registers:
+- inside the dev shell nothing to do: the `shellHook` appends `plugin-files = <plugin>` to
+  `NIX_CONFIG`, so `nix build .#manager`, `nix build .#dockerImage` and `make docker-build` just
+  work there
+- outside of it, load the plugin per command:
+  `nix build --option plugin-files "$(nix build --no-link --print-out-paths .#go2nix-nix-plugin)/lib/nix/plugins/libgo2nix_plugin.so" .#manager`
+  (`make docker-build` passes the option itself, so it works outside the dev shell too). Without
+  the plugin evaluation stops at `error: attribute 'resolveGoPackages' missing`
 
 **The flake source only contains git-tracked files.** Commit (or at least
 `git add`) your changes before building the manager or the docker image,
@@ -216,12 +228,13 @@ make test       # Run unit tests
 ```
 
 **After editing `go.mod`/`go.sum`:**
-Update the `manager` `vendorHash` in flake.nix (see "Nix Development Environment").
+Nothing to update in flake.nix: go2nix derives the module hashes from `go.sum`
+(see "Nix Development Environment"). Run `go mod tidy` and build to confirm.
 
 **After editing `flake.nix`:**
 ```
 nix fmt .       # Format the flake
-nix build .#dockerImage   # Verify it still builds
+nix build .#dockerImage   # Verify it still builds (load the go2nix plugin as described above)
 ```
 
 ## CI
