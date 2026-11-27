@@ -18,7 +18,6 @@ limitations under the License.
 package main
 
 import (
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
@@ -50,7 +49,6 @@ type managerConfig struct {
 	probeAddr            string
 	enableLeaderElection bool
 	secureMetrics        bool
-	enableHTTP2          bool
 	webhookCertPath      string
 	webhookCertName      string
 	webhookCertKey       string
@@ -84,8 +82,6 @@ func main() {
 	flag.StringVar(&cfg.metricsCertName, "metrics-cert-name", "tls.crt",
 		"The name of the metrics server certificate file.")
 	flag.StringVar(&cfg.metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
-	flag.BoolVar(&cfg.enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 
 	opts := zap.Options{
 		Development: true,
@@ -112,17 +108,9 @@ func main() {
 
 // run builds the manager and its servers, then blocks until the manager stops.
 func run(cfg managerConfig, scheme *runtime.Scheme, setupLog logr.Logger) error {
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	tlsOpts := mustTLSOpts(cfg, setupLog)
+	webhookServer := newWebhookServer(cfg, setupLog)
 
-	webhookServer := newWebhookServer(cfg, setupLog, tlsOpts)
-
-	metricsServerOptions := newMetricsServerOptions(cfg, setupLog, tlsOpts)
+	metricsServerOptions := newMetricsServerOptions(cfg, setupLog)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{ //nolint:exhaustruct_v5
 		Scheme:                 scheme,
@@ -190,24 +178,6 @@ func run(cfg managerConfig, scheme *runtime.Scheme, setupLog logr.Logger) error 
 	return nil
 }
 
-// mustTLSOpts returns the TLS options to apply to the servers,
-// disabling HTTP/2 when it is not enabled.
-func mustTLSOpts(cfg managerConfig, setupLog logr.Logger) []func(*tls.Config) {
-	var tlsOpts []func(*tls.Config)
-
-	if !cfg.enableHTTP2 {
-		disableHTTP2 := func(c *tls.Config) {
-			setupLog.Info("Disabling HTTP/2")
-
-			c.NextProtos = []string{"http/1.1"}
-		}
-
-		tlsOpts = append(tlsOpts, disableHTTP2)
-	}
-
-	return tlsOpts
-}
-
 // newWebhookServer builds the webhook server, optionally watching the
 // certificate provided via flags.
 //
@@ -215,11 +185,8 @@ func mustTLSOpts(cfg managerConfig, setupLog logr.Logger) []func(*tls.Config) {
 func newWebhookServer(
 	cfg managerConfig,
 	setupLog logr.Logger,
-	tlsOpts []func(*tls.Config),
 ) webhook.Server {
-	webhookServerOptions := webhook.Options{
-		TLSOpts: tlsOpts,
-	}
+	webhookServerOptions := webhook.Options{}
 
 	if len(cfg.webhookCertPath) > 0 {
 		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
@@ -240,7 +207,6 @@ func newWebhookServer(
 func newMetricsServerOptions(
 	cfg managerConfig,
 	setupLog logr.Logger,
-	tlsOpts []func(*tls.Config),
 ) metricsserver.Options {
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'.
 	// The Metrics options configure the server. More info:
@@ -249,7 +215,6 @@ func newMetricsServerOptions(
 	metricsServerOptions := metricsserver.Options{
 		BindAddress:   cfg.metricsAddr,
 		SecureServing: cfg.secureMetrics,
-		TLSOpts:       tlsOpts,
 	}
 
 	if cfg.secureMetrics {
