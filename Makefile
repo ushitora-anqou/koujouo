@@ -9,7 +9,7 @@ YEAR ?= $(shell date +%Y)
 # manager recognizes the agents of an image built from the same tree as
 # agents of its own version.
 VERSION ?= $(shell git describe --always --dirty --exclude='*' 2>/dev/null || echo dev)
-LDFLAGS ?= -X koujouo.anqou.net/project/internal/version.Agent=$(VERSION)
+LDFLAGS ?= -X github.com/ushitora-anqou/koujouo/internal/version.Agent=$(VERSION)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))

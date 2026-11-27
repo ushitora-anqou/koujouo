@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
 )
 
 const (

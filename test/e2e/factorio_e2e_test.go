@@ -41,9 +41,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
-	"koujouo.anqou.net/project/internal/controller/resources"
-	"koujouo.anqou.net/project/test/utils"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
+	"github.com/ushitora-anqou/koujouo/internal/controller/resources"
+	"github.com/ushitora-anqou/koujouo/test/utils"
 )
 
 // The FactorioServer scenarios create one FactorioServer in their own

@@ -12,7 +12,7 @@
 - ゲームバイナリは agent が `https://factorio.com/get-download/{version}/headless/linux64` から generic ephemeral volume へダウンロードする。
 - セーブは既存 PVC、Service はユーザー側 Helm chart が用意する。
 - API group は `koujouo.anqou.net` に修正する（現状 `koujouo.anqou.net.koujouo.anqou.net`）。
-- モジュールパスは `koujouo.anqou.net/project`（go.mod 変更なし）、Go 1.26.0。
+- モジュールパスは `github.com/ushitora-anqou/koujouo`、Go 1.26.0。
 
 ---
 
@@ -34,7 +34,7 @@
 using Go = import "/go.capnp";
 @0x...;
 $Go.package("rpc");
-$Go.import("koujouo.anqou.net/project/rpc");
+$Go.import("github.com/ushitora-anqou/koujouo/rpc");
 ```
 
 コンパイルコマンド（`-I` にモジュール内 `std/` を指定するのがポイント）:
@@ -524,7 +524,7 @@ StatefulSet の要点（`internal/controller/resources/statefulset.go`）:
 # koujouo controller <-> agent protocol.
 using Go = import "/go.capnp";
 $Go.package("rpc");
-$Go.import("koujouo.anqou.net/project/rpc");
+$Go.import("github.com/ushitora-anqou/koujouo/rpc");
 
 using Stream = import "/capnp/stream.capnp";
 

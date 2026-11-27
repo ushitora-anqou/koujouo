@@ -37,11 +37,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
-	"koujouo.anqou.net/project/internal/controller"
-	"koujouo.anqou.net/project/internal/controller/resources"
-	"koujouo.anqou.net/project/internal/version"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
+	"github.com/ushitora-anqou/koujouo/internal/controller"
+	"github.com/ushitora-anqou/koujouo/internal/controller/resources"
+	"github.com/ushitora-anqou/koujouo/internal/version"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 const (

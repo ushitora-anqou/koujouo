@@ -32,9 +32,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 
-	"koujouo.anqou.net/project/internal/controller"
-	"koujouo.anqou.net/project/internal/version"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	"github.com/ushitora-anqou/koujouo/internal/controller"
+	"github.com/ushitora-anqou/koujouo/internal/version"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 var (

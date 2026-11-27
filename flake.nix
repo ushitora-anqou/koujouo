@@ -65,7 +65,7 @@
           ldflags = [
             "-s"
             "-w"
-            "-X koujouo.anqou.net/project/internal/version.Agent=${buildVersion}"
+            "-X github.com/ushitora-anqou/koujouo/internal/version.Agent=${buildVersion}"
           ];
         };
 

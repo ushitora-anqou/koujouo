@@ -33,8 +33,8 @@ import (
 	capnprpc "capnproto.org/go/capnp/v3/rpc"
 	"github.com/go-logr/logr"
 
-	"koujouo.anqou.net/project/internal/version"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	"github.com/ushitora-anqou/koujouo/internal/version"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 // Fixtures of the agent round trips over a real Cap'n Proto connection.

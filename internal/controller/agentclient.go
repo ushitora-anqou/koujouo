@@ -28,7 +28,7 @@ import (
 	capnprpc "capnproto.org/go/capnp/v3/rpc"
 	corev1 "k8s.io/api/core/v1"
 
-	rpcapi "koujouo.anqou.net/project/rpc"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 var errPodHasNoIP = errors.New("pod has no IP assigned yet")

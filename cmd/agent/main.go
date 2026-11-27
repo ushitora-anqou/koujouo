@@ -36,9 +36,9 @@ import (
 	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"koujouo.anqou.net/project/internal/agent"
-	"koujouo.anqou.net/project/internal/version"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	"github.com/ushitora-anqou/koujouo/internal/agent"
+	"github.com/ushitora-anqou/koujouo/internal/version"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 // Agent defaults. The shutdown deadline stays below the 600 seconds

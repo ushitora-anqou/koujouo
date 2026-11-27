@@ -7,7 +7,7 @@ domain: koujouo.anqou.net
 layout:
 - go.kubebuilder.io/v4
 projectName: koujouo
-repo: koujouo.anqou.net/project
+repo: github.com/ushitora-anqou/koujouo
 resources:
 - api:
     crdVersion: v1
@@ -16,6 +16,6 @@ resources:
   domain: koujouo.anqou.net
   group: koujouo.anqou.net
   kind: FactorioServer
-  path: koujouo.anqou.net/project/api/v1
+  path: github.com/ushitora-anqou/koujouo/api/v1
   version: v1
 version: "3"

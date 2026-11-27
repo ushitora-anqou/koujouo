@@ -29,9 +29,9 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
-	"koujouo.anqou.net/project/internal/version"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
+	"github.com/ushitora-anqou/koujouo/internal/version"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 const (

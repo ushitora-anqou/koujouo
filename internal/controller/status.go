@@ -22,8 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 // Types of the conditions on the FactorioServer status.

@@ -26,7 +26,7 @@ import (
 
 	"github.com/go-logr/logr"
 
-	rpcapi "koujouo.anqou.net/project/rpc"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 // Graceful stop parameters. The drain warns the online players in

@@ -26,8 +26,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 var errKeyMissing = errors.New("key is missing")

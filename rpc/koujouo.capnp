@@ -2,7 +2,7 @@
 # koujouo controller <-> agent protocol.
 using Go = import "/go.capnp";
 $Go.package("rpc");
-$Go.import("koujouo.anqou.net/project/rpc");
+$Go.import("github.com/ushitora-anqou/koujouo/rpc");
 
 using Stream = import "/capnp/stream.capnp";
 

@@ -30,7 +30,7 @@ import (
 	"strconv"
 	"sync"
 
-	rpcapi "koujouo.anqou.net/project/rpc"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 // Environment variables carrying the running game across the execve(2) of

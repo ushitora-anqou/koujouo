@@ -35,7 +35,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
 	// +kubebuilder:scaffold:imports
 )
 

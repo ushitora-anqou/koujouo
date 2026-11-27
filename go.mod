@@ -1,4 +1,4 @@
-module koujouo.anqou.net/project
+module github.com/ushitora-anqou/koujouo
 
 go 1.26.0
 

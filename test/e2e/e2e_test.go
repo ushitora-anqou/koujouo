@@ -30,7 +30,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"koujouo.anqou.net/project/test/utils"
+	"github.com/ushitora-anqou/koujouo/test/utils"
 )
 
 // namespace where the project is deployed in

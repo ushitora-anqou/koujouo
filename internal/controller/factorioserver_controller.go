@@ -39,9 +39,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
-	"koujouo.anqou.net/project/internal/controller/resources"
-	rpcapi "koujouo.anqou.net/project/rpc"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
+	"github.com/ushitora-anqou/koujouo/internal/controller/resources"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 var errControllerImageUnset = errors.New("controller image is not set (KOUJOUO_CONTROLLER_IMAGE)")

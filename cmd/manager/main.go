@@ -37,9 +37,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	koujouoanqounetv1 "koujouo.anqou.net/project/api/v1"
-	"koujouo.anqou.net/project/internal/controller"
-	"koujouo.anqou.net/project/internal/version"
+	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
+	"github.com/ushitora-anqou/koujouo/internal/controller"
+	"github.com/ushitora-anqou/koujouo/internal/version"
 	// +kubebuilder:scaffold:imports
 )
 

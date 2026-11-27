@@ -29,7 +29,7 @@ import (
 
 	"github.com/go-logr/logr"
 
-	rpcapi "koujouo.anqou.net/project/rpc"
+	rpcapi "github.com/ushitora-anqou/koujouo/rpc"
 )
 
 // Test helpers shared by the agent unit tests.
