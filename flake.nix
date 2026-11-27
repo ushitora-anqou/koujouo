@@ -13,30 +13,6 @@
 
     packages = forAllSystems (
       system: pkgs: rec {
-        # The capnp Go code generator plugin (not packaged in nixpkgs).
-        # The `capnp` compiler itself comes from the nixpkgs `capnproto`
-        # package and invokes this plugin via -ogo.
-        capnpc-go = pkgs.buildGoModule {
-          pname = "capnpc-go";
-          version = "3.1.0-alpha.2";
-          src = pkgs.fetchFromGitHub {
-            owner = "capnproto";
-            repo = "go-capnp";
-            rev = "v3.1.0-alpha.2";
-            hash = "sha256-BIrqiaF9rXcn6S+p/+Y6iq9g66oqH9F8qPTBOpC+Gc4=";
-          };
-          subPackages = ["capnpc-go"];
-          vendorHash = "sha256-yk2+rFNRrMH2iWnuatPyvPLvo9p1bDAihmda6i2zNV4=";
-          # Upstream tests shell out to `go build` inside a vendored tree,
-          # which fails under buildGoModule's vendor layout.
-          doCheck = false;
-          env.CGO_ENABLED = 0;
-          ldflags = [
-            "-s"
-            "-w"
-          ];
-        };
-
         # The version baked into the manager and the agent binaries: the
         # short git revision of the source tree, of the last commit also
         # when the tree has uncommitted changes. The controller compares
@@ -59,7 +35,7 @@
           pname = "koujouo";
           version = "0.0.1";
           src = inputs.self;
-          vendorHash = "sha256-AJ0AJDtLnsyy8tFZysxL48F2m2PZJ7E7axOlYV5DRnA=";
+          vendorHash = "sha256-2Pt3Kl6J726s8QFjm1zVf3BCooXwrUSPY76GRXX0WE0=";
           subPackages = ["cmd/manager" "cmd/agent"];
           env.CGO_ENABLED = 0;
           ldflags = [
@@ -112,19 +88,20 @@
     devShells = forAllSystems (
       system: pkgs: {
         default = pkgs.mkShell {
-          packages =
-            (with pkgs; [
-              go
-              golangci-lint
-              kubebuilder
-              kind
-              kubectl
-              kustomize
-              setup-envtest
-              kubernetes-controller-tools
-              capnproto
-            ])
-            ++ [inputs.self.packages.${system}.capnpc-go];
+          # The capnp Go code generator plugin (capnpc-go) is not listed here:
+          # it is the tool of go.mod and runs as `go tool capnpc-go` from the
+          # `go:generate` directive of rpc/generate.go.
+          packages = with pkgs; [
+            go
+            golangci-lint
+            kubebuilder
+            kind
+            kubectl
+            kustomize
+            setup-envtest
+            kubernetes-controller-tools
+            capnproto
+          ];
         };
       }
     );

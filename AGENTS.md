@@ -36,7 +36,7 @@ test/e2e/                         E2E suite (build tag `e2e`); test/utils/ holds
 docs/design.md                    Design notes (Japanese): libraries, CRD and capnp schemas, tests
 docs/factorio-server-plan*.html   The plan docs/design.md was derived from
 hack/boilerplate.go.txt           License header of the Go files
-flake.nix                         Nix flake: dev shell, capnpc-go, binaries and docker image
+flake.nix                         Nix flake: dev shell, binaries and docker image
 flake.lock                        Pinned Nix inputs (update with `nix flake update`, DO NOT hand-edit)
 .devcontainer/                    Scaffolded dev container (kind, kubebuilder, kubectl; no Nix)
 .golangci.yml                     golangci-lint config (all linters enabled)
@@ -90,7 +90,8 @@ limitations in README.md).
 ## Nix Development Environment
 
 All development tools come from the Nix flake dev shell. Do NOT install
-them with `go install` or download them manually:
+them with `go install` or download them manually (the Go tools of go.mod are
+the exception: they run as `go tool <name>`, never installed):
 
 ```bash
 nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, kustomize,
@@ -98,9 +99,11 @@ nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, kustomize,
 ```
 
 - `controller-gen` is provided by the nixpkgs `kubernetes-controller-tools` package
-- `capnp`, the Cap'n Proto compiler, comes from the nixpkgs `capnproto` package. It calls the Go
-  plugin `capnpc-go`, which nixpkgs does not package: the flake builds it as the `capnpc-go`
-  package, pinned to `v3.1.0-alpha.2`, the version of `capnproto.org/go/capnp/v3` in go.mod
+- `capnp`, the Cap'n Proto compiler, comes from the nixpkgs `capnproto` package. Its Go plugin
+  `capnpc-go` is a tool of go.mod instead (the `tool` directive, at the version of
+  `capnproto.org/go/capnp/v3` in the same file): the flake neither builds nor installs it, and
+  `make generate-capnp` runs it as `go tool capnpc-go` from `rpc/generate.go`. Bump the version
+  with `go get -tool capnproto.org/go/capnp/v3/capnpc-go@<version>`
 - `nix fmt` formats Nix files with alejandra
 - `nix build .#manager` builds the `manager` and the `agent` binaries (`cmd/manager`, `cmd/agent`);
   `nix build .#dockerImage` (the default package) builds the OCI image `controller:latest`
