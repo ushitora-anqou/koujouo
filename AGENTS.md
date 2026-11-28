@@ -42,7 +42,9 @@ flake.nix                         Nix flake: dev shell, binaries and docker imag
 flake.lock                        Pinned Nix inputs (update with `nix flake update`, DO NOT hand-edit)
 .devcontainer/                    Scaffolded dev container (kind, kubebuilder, kubectl; no Nix)
 .golangci.yml                     golangci-lint config (all linters enabled)
-Makefile                          Build/test/deploy commands
+Makefile                          Build, test and image commands
+.github/workflows/ci.yml          CI: make all and check-uncomitted
+.github/workflows/release.yml     Release: multi-arch image to GHCR
 PROJECT                           Kubebuilder metadata Auto-generated (DO NOT EDIT)
 ```
 
@@ -173,6 +175,12 @@ Do NOT delete `// +kubebuilder:scaffold:*` comments. CLI injects code at these m
 ### Keep Project Structure
 Do not move files around. The CLI expects files in specific locations.
 
+### Never Commit a Secret
+`make test` begins with `make secrets`, which scans the whole git history with gitleaks and fails
+on a finding. Keep the full history in any checkout (`fetch-depth: 0`, as `ci.yml` does). Track
+placeholders only, as `examples/secret.yaml` does; put real credentials in what you apply, never
+in a tracked file.
+
 ### Always Use CLI Commands
 Always use `kubebuilder create api` and `kubebuilder create webhook` to scaffold APIs, controllers
 and webhooks. Do NOT create those files manually. The agent and the RPC schema are hand-written;
@@ -232,9 +240,10 @@ suite needs.
 make all               # fmt generate manifests lint-config lint test test-e2e
 make check-uncomitted  # Fails unless the regeneration leaves nothing to commit
 ```
-`make all` includes `test-e2e` (Docker and up to 60 minutes). `check-uncomitted` fails on any
-uncommitted change by design, so commit (or at least `git add`) your work first and run it to
-learn whether the generated files are up to date.
+`make all` includes `test-e2e` (Docker and up to 60 minutes) and, inside `test`, the gitleaks
+scan of the git history. `check-uncomitted` fails on any uncommitted change by design, so commit
+(or at least `git add`) your work first and run it to learn whether the generated files are up to
+date.
 
 **After editing `*_types.go` or markers:**
 ```
@@ -253,7 +262,7 @@ wire-compatibility rule under "Manager and Agent Invariants".
 **After editing `*.go` files:**
 ```
 make lint-fix   # Auto-fix code style
-make test       # Run unit tests
+make test       # Run the secret scan and the tests
 ```
 
 **After editing `go.mod`/`go.sum`:**
@@ -278,12 +287,13 @@ pinned actions weekly.
 The action pins upstream Nix 2.34.9 with `install_url` (the installer of that
 release) and `install_sha256` (the published hash of the installer), because the
 go2nix Nix plugin is built against nixpkgs' Nix 2.34.9 and needs that exact
-ABI. Keep the pinned version in step with `nixVersions.nix_2_34` in
-`flake.lock`.
+ABI. Keep the pinned version in step with `nixVersions.nix_2_34` of the nixpkgs
+input in `flake.lock`.
 
 `ci.yml` runs on every push and pull request: one job on `ubuntu-latest` that does
 `go mod tidy`, then `make all`, then `make check-uncomitted` — the same two commands a
-commit has to pass locally.
+commit has to pass locally. The checkout fetches the full history (`fetch-depth: 0`): `make test`
+scans it for secrets with gitleaks, and a shallow clone would hide every commit but the latest.
 
 - `make all` is the pre-commit gate:
   `fmt generate manifests lint-config lint test test-e2e`. It regenerates the DeepCopy code, the
@@ -315,9 +325,9 @@ the runner's own system there, so each architecture is built natively (no cross-
 emulation); each run pushes `<version>-linux-<arch>` and uploads its digest. `merge` assembles the
 per-arch digests into the final multi-arch tags with `docker buildx imagetools create`, which
 needs buildx pinned to v0.31.0 (`imagetools create` is broken on GHCR since v0.31.1,
-docker/buildx#3708). The workflow runs `nix build` rather than a `make` target, but every job still
-enters the dev shell: evaluating the flake needs go2nix's Nix plugin, which the `shellHook` exports
-through `NIX_CONFIG`.
+docker/buildx#3708). The workflow runs `nix build` rather than a `make` target; `meta` and `build`
+enter the dev shell because evaluating the flake needs go2nix's Nix plugin, which the `shellHook`
+exports through `NIX_CONFIG`. `merge` only assembles the digests with Docker and needs neither.
 
 ## CLI Commands Cheat Sheet
 
