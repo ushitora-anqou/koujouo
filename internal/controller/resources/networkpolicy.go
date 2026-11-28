@@ -27,9 +27,6 @@ import (
 )
 
 const (
-	// agentRPCPortNumber is the TCP port the agent serves Cap'n Proto RPC on.
-	agentRPCPortNumber = 9550
-
 	// namespaceNameLabelKey is the label the API server puts on every
 	// namespace with the namespace name as the value.
 	namespaceNameLabelKey = "kubernetes.io/metadata.name"

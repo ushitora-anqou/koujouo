@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
@@ -64,11 +65,33 @@ const (
 	// GamePortName is the name of the Factorio game UDP port.
 	GamePortName = "game"
 
+	// AgentRPCPortName is the name of the TCP port the agent serves the
+	// Cap'n Proto RPC on. The liveness probe and the NetworkPolicy refer
+	// to the port by this name.
+	AgentRPCPortName = "rpc"
+
 	// AgentCommand is the PID 1 command of the agent container.
 	AgentCommand = "/kojouo/agent"
 
 	// gamePortNumber is the UDP port Factorio serves game traffic on.
 	gamePortNumber = 34197
+
+	// agentRPCPortNumber is the TCP port the agent serves Cap'n Proto RPC
+	// on.
+	agentRPCPortNumber = 9550
+
+	// livenessProbeInitialDelay, livenessProbePeriod and
+	// livenessProbeTimeout bound the agent liveness probe. The delay
+	// leaves the first RPC calls to the controller, which retries a
+	// connection the agent is not ready for.
+	livenessProbeInitialDelay = 10
+	livenessProbePeriod       = 20
+	livenessProbeTimeout      = 5
+
+	// livenessProbeFailureThreshold is how many probes in a row must
+	// fail before the kubelet restarts the container. The agent answers
+	// the RPC even during a drain, so a restart means a stuck agent.
+	livenessProbeFailureThreshold = 3
 
 	// replicaCount is the fixed replica count of the agent StatefulSet.
 	replicaCount = 1
@@ -195,11 +218,32 @@ func agentContainer(server *koujouoanqounetv1.FactorioServer, controllerImage st
 		Name:    AgentContainerName,
 		Image:   controllerImage,
 		Command: []string{AgentCommand},
-		Ports: []corev1.ContainerPort{{
-			Name:          GamePortName,
-			ContainerPort: gamePortNumber,
-			Protocol:      corev1.ProtocolUDP,
-		}},
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          GamePortName,
+				ContainerPort: gamePortNumber,
+				Protocol:      corev1.ProtocolUDP,
+			},
+			{
+				Name:          AgentRPCPortName,
+				ContainerPort: agentRPCPortNumber,
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
+		// The agent serves its RPC from the moment it listens, which
+		// happens before the game starts and stays up during a drain, so
+		// a refused connection means a stuck agent.
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromString(AgentRPCPortName),
+				},
+			},
+			InitialDelaySeconds: livenessProbeInitialDelay,
+			PeriodSeconds:       livenessProbePeriod,
+			TimeoutSeconds:      livenessProbeTimeout,
+			FailureThreshold:    livenessProbeFailureThreshold,
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: SavesVolumeName, MountPath: SavesMountPath},
 			{Name: GameVolumeName, MountPath: GameMountPath},

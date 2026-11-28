@@ -734,6 +734,7 @@ func syncContainer(existing, desired *corev1.Container) {
 	existing.Command = desired.Command
 	existing.Args = desired.Args
 	existing.Ports = desired.Ports
+	existing.LivenessProbe = desired.LivenessProbe
 	existing.VolumeMounts = desired.VolumeMounts
 	existing.Resources = desired.Resources
 	existing.SecurityContext = desired.SecurityContext
@@ -756,6 +757,7 @@ func containerDrifted(existing, desired *corev1.Container) bool {
 		!equality.Semantic.DeepEqual(existing.Command, desired.Command) ||
 		!equality.Semantic.DeepEqual(existing.Args, desired.Args) ||
 		!equality.Semantic.DeepEqual(existing.Ports, desired.Ports) ||
+		!equality.Semantic.DeepEqual(existing.LivenessProbe, desired.LivenessProbe) ||
 		!equality.Semantic.DeepEqual(existing.VolumeMounts, desired.VolumeMounts) ||
 		!equality.Semantic.DeepEqual(existing.Resources, desired.Resources) ||
 		!equality.Semantic.DeepEqual(existing.SecurityContext, desired.SecurityContext)

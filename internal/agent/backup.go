@@ -42,7 +42,11 @@ const (
 	backupRegionFallback = "us-west-00"
 	saveFileSuffix       = ".zip"
 	tempSaveSuffix       = ".tmp.zip"
-	backupTimeout        = time.Minute
+
+	// backupTimeout bounds one upload. A save is tens of megabytes and
+	// can exceed 100 MB, which a minute does not cover on a slow S3
+	// compatible store; a failed upload waits for the next period.
+	backupTimeout = 5 * time.Minute
 )
 
 // errNoSave marks a saves directory without a finished save file.

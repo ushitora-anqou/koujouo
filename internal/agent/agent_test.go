@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -65,6 +67,10 @@ const (
 
 	// liveWebhookURL is the webhook of the live configuration change.
 	liveWebhookURL = "https://discord.example.com/api/webhooks/1/test"
+
+	// shutdownDeadline bounds the shutdown of the lock contention test,
+	// so a shutdown that ignores its deadline fails fast.
+	shutdownDeadline = 100 * time.Millisecond
 
 	// deliveredConfigIni is the config.ini content sent over the wire.
 	deliveredConfigIni = "[path]\nwrite-data=/tmp/old\n"
@@ -896,5 +902,133 @@ func TestAgentShutdownRefusesAConfigure(t *testing.T) {
 
 	if pid := gamePid(gameAgent); pid != 0 {
 		t.Errorf("a game was started after the shutdown (pid %d)", pid)
+	}
+}
+
+// TestShutdownReturnsWhenTheConfigureHoldsTheLock verifies that the
+// shutdown deadline bounds the wait for the lifecycle lock. A configure
+// holds the lock through the whole download; without the deadline the
+// pod grace period would expire before the save runs.
+func TestShutdownReturnsWhenTheConfigureHoldsTheLock(t *testing.T) {
+	t.Parallel()
+
+	gameAgent, _ := newStopTestAgent(t, newFakeRcon(0))
+
+	// Stand in for a configure that drains and downloads with the lock
+	// held.
+	gameAgent.mu.Lock()
+	t.Cleanup(gameAgent.mu.Unlock)
+
+	ctx, cancel := context.WithTimeout(t.Context(), shutdownDeadline)
+	defer cancel()
+
+	err := gameAgent.Shutdown(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Shutdown() error = %v, want a deadline error", err)
+	}
+
+	if !gameAgent.terminating.Load() {
+		t.Error("the agent is not marked terminating before the lock is taken")
+	}
+}
+
+// TestResumeRetriesATransientFailure verifies that a resume comes back
+// from a transient download failure. The controller never repeats the
+// configure call a resume replaces, so a single failure must not leave
+// the agent failed.
+func TestResumeRetriesATransientFailure(t *testing.T) {
+	t.Parallel()
+
+	saveDir := t.TempDir()
+
+	err := saveState(saveDir, &persistedState{
+		Config: &Config{
+			GameVersion:         testGameVersion,
+			Files:               []ConfigFile{{Name: configFileIniName, Content: deliveredConfigIni}},
+			LeaveTimeoutSeconds: 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("could not write the cached state: %v", err)
+	}
+
+	client, downloads := newFlakyDownloadClient(t, testGameVersion)
+
+	gameAgent, err := New(logr.Discard(), Options{
+		SaveDir:           saveDir,
+		CacheDir:          t.TempDir(),
+		HTTPClient:        client,
+		DrainPollInterval: roundTripDrainPoll,
+		SaveWaitTimeout:   roundTripSaveWait,
+	})
+	if err != nil {
+		t.Fatalf("could not create the agent: %v", err)
+	}
+
+	t.Cleanup(func() { killGame(gameAgent) })
+
+	state, err := loadState(saveDir)
+	if err != nil || state == nil || state.Config == nil {
+		t.Fatalf("could not load the cached state: %v", err)
+	}
+
+	gameAgent.resumeConfiguration(t.Context(), state.Config)
+
+	if phase := gameAgent.snapshot().phase; phase != rpcapi.Phase_running {
+		t.Errorf("phase after the resume = %s, want running", phase)
+	}
+
+	if pid := gamePid(gameAgent); pid <= 0 {
+		t.Error("the resumed agent runs no game")
+	}
+
+	if got := downloads(); got != 2 {
+		t.Errorf("downloads = %d, want 2 (the failed attempt and the retry)", got)
+	}
+}
+
+// newFlakyDownloadClient returns a client whose game downloads fail with
+// a 500 the first time and succeed afterwards, and an accessor of the
+// number of download requests it served.
+func newFlakyDownloadClient(t *testing.T, version string) (*http.Client, func() int) {
+	t.Helper()
+
+	archive := buildGameArchive(t, fakeFactorioScript(version), nil)
+
+	var (
+		mutex    sync.Mutex
+		requests int
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		mutex.Lock()
+
+		requests++
+		first := requests == 1
+
+		mutex.Unlock()
+
+		if first {
+			http.Error(writer, "the download endpoint is busy", http.StatusInternalServerError)
+
+			return
+		}
+
+		writer.Header().Set("Content-Type", "application/x-xz")
+		_, _ = writer.Write(archive)
+	}))
+
+	t.Cleanup(server.Close)
+
+	client := &http.Client{
+		Timeout:   testHTTPClient().Timeout,
+		Transport: newRewriteTransport(t, server.URL),
+	}
+
+	return client, func() int {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		return requests
 	}
 }

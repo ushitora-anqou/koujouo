@@ -29,6 +29,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -46,6 +47,15 @@ const (
 	privateFileMode     = 0o600
 	directoryFileMode   = 0o750
 	downloadTimeout     = 30 * time.Minute
+)
+
+// Resume retry parameters. A resume applies the cached configuration
+// without a configure call from the controller, which the controller
+// never repeats: a transient download or start failure would leave the
+// agent failed until the user changes the spec, so the resume retries.
+const (
+	resumeRetryAttempts = 3
+	resumeRetryBackoff  = 2 * time.Second
 )
 
 // Agent errors.
@@ -128,7 +138,12 @@ type Agent struct {
 	rconPort     int
 	rconPassword string
 	loopsCancel  context.CancelFunc
-	terminating  bool
+
+	// terminating is set before Shutdown waits for the lifecycle lock,
+	// so a configure that is still in flight stops before it starts the
+	// game again. It is atomic because Shutdown sets it while the
+	// lifecycle lock is still held elsewhere.
+	terminating atomic.Bool
 
 	// statusMu guards the status snapshot, so a status call never
 	// waits for a lifecycle operation and can report a drain in
@@ -330,11 +345,34 @@ func (a *Agent) Stop(ctx context.Context, call rpcapi.Agent_stop) error {
 // Shutdown gracefully stops the game for good: it backs the SIGTERM
 // handler, and a configure call that arrives afterwards does not start
 // the game again.
+//
+// The terminating flag is raised before the lifecycle lock is taken, so a
+// configure that is still downloading the game stops before it starts
+// the game again. The wait for the lock is bounded by ctx: the pod grace
+// period would otherwise expire while a configure holds the lock.
 func (a *Agent) Shutdown(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.terminating.Store(true)
 
-	a.terminating = true
+	locked := make(chan struct{})
+
+	go func() {
+		a.mu.Lock()
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+		defer a.mu.Unlock()
+	case <-ctx.Done():
+		// The lock may still be taken after the deadline passed: release
+		// that abandoned acquisition, so it does not keep the lock for good.
+		go func() {
+			<-locked
+			a.mu.Unlock()
+		}()
+
+		return fmt.Errorf("could not acquire the lifecycle lock before the deadline: %w", ctx.Err())
+	}
 
 	return a.stopLocked(ctx)
 }
@@ -423,16 +461,48 @@ func (a *Agent) resumeConfiguration(ctx context.Context, config *Config) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.terminating {
+	if a.terminating.Load() {
 		return
 	}
 
 	a.log.Info("Resuming the game from the cached configuration", "gameVersion", config.GameVersion)
 
-	err := a.applyConfigLocked(ctx, config)
+	err := a.applyConfigWithRetryLocked(ctx, config)
 	if err != nil {
 		a.log.Error(err, "Could not resume the game from the cached configuration")
 	}
+}
+
+// applyConfigWithRetryLocked applies a configuration, retrying a
+// transient failure with an exponential backoff. Only the resume uses it:
+// a configure call comes back from the controller, which retries on its
+// own. It must be called with the lifecycle lock held.
+func (a *Agent) applyConfigWithRetryLocked(ctx context.Context, config *Config) error {
+	var err error
+
+	for attempt := range resumeRetryAttempts {
+		if a.terminating.Load() {
+			return fmt.Errorf("could not start the game: %w", errTerminating)
+		}
+
+		err = a.applyConfigLocked(ctx, config)
+		if err == nil {
+			return nil
+		}
+
+		a.log.Error(err, "Could not apply the cached configuration", "attempt", attempt+1)
+
+		if attempt == resumeRetryAttempts-1 {
+			break
+		}
+
+		sleepErr := sleepContext(ctx, resumeRetryBackoff*time.Duration(1<<attempt))
+		if sleepErr != nil {
+			return sleepErr
+		}
+	}
+
+	return err
 }
 
 // applyRuntimeSettingsLocked adopts the configuration and the RCON
@@ -521,7 +591,7 @@ func (a *Agent) applyLiveConfigurationLocked(ctx context.Context, config *Config
 // binary, starts the game and restarts the background loops. It must be
 // called with the lifecycle lock held.
 func (a *Agent) applyConfigLocked(ctx context.Context, config *Config) error {
-	if a.terminating {
+	if a.terminating.Load() {
 		return fmt.Errorf("could not start the game: %w", errTerminating)
 	}
 

@@ -19,6 +19,7 @@ package agent //nolint:testpackage // White-box tests exercise the agent interna
 import (
 	"archive/tar"
 	"bytes"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -279,18 +280,31 @@ func (e *downloadEndpoint) queries() string {
 	return strings.Join(rendered, ", ")
 }
 
+// buildGameArchive builds the tar.xz archive of a fake game whose binary
+// holds content. The extra entries are added next to the game layout.
+func buildGameArchive(t *testing.T, content string, extra map[string]tarEntry) []byte {
+	t.Helper()
+
+	entries := map[string]tarEntry{
+		"factorio/":                 dirEntry(),
+		"factorio/bin/":             dirEntry(),
+		"factorio/bin/x64/":         dirEntry(),
+		"factorio/bin/x64/factorio": fileEntry(0o755, content),
+	}
+
+	maps.Copy(entries, extra)
+
+	return buildTarXz(t, entries)
+}
+
 // serveArchive starts the fake download endpoint behind a client that
 // maps factorio.com URLs to it.
 func serveArchive(t *testing.T) *downloadEndpoint {
 	t.Helper()
 
-	archive := buildTarXz(t, map[string]tarEntry{
-		"factorio/":                 dirEntry(),
-		"factorio/bin/":             dirEntry(),
-		"factorio/bin/x64/":         dirEntry(),
-		"factorio/bin/x64/factorio": fileEntry(0o755, archiveBinaryContent),
-		"factorio/data/":            dirEntry(),
-		"factorio/data/core":        fileEntry(0o644, "core\n"),
+	archive := buildGameArchive(t, archiveBinaryContent, map[string]tarEntry{
+		"factorio/data/":     dirEntry(),
+		"factorio/data/core": fileEntry(0o644, "core\n"),
 	})
 
 	endpoint := &downloadEndpoint{}
@@ -397,9 +411,7 @@ func TestExtractTarXzRejectsTraversal(t *testing.T) {
 func TestExtractTarXzSymlink(t *testing.T) {
 	t.Parallel()
 
-	archive := buildTarXz(t, map[string]tarEntry{
-		"factorio/bin/":        dirEntry(),
-		"factorio/bin/x64/":    dirEntry(),
+	archive := buildGameArchive(t, archiveBinaryContent, map[string]tarEntry{
 		"factorio/bin/current": linkEntry("x64"),
 	})
 

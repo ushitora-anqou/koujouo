@@ -69,6 +69,11 @@ const (
 	expectedAgentRPCPort       = 9550
 	expectedEphemeralStorage   = "2Gi"
 
+	expectedAgentLivenessDelay    = 10
+	expectedAgentLivenessPeriod   = 20
+	expectedAgentLivenessTimeout  = 5
+	expectedAgentLivenessFailures = 3
+
 	testGameVersion     = "2.0.0"
 	testNextGameVersion = "2.1.0"
 	configINIKey        = "config.ini"
@@ -205,6 +210,7 @@ var _ = Describe("FactorioServer Controller", func() {
 			existing.Spec.Template.Spec.SecurityContext = nil
 			existing.Spec.Template.Spec.AutomountServiceAccountToken = nil
 			existing.Spec.Template.Spec.Containers[0].SecurityContext = nil
+			existing.Spec.Template.Spec.Containers[0].LivenessProbe = nil
 
 			err = k8sClient.Update(ctx, existing)
 			Expect(err).NotTo(HaveOccurred())
@@ -224,6 +230,10 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(containerSecurityContext).NotTo(BeNil())
 			Expect(containerSecurityContext.ReadOnlyRootFilesystem).NotTo(BeNil())
 			Expect(*containerSecurityContext.ReadOnlyRootFilesystem).To(BeTrue())
+
+			// The liveness probe of a StatefulSet written before it was
+			// owned comes back as well.
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].LivenessProbe).NotTo(BeNil())
 
 			// The agent never talks to the API server, so the ServiceAccount
 			// token must not come back either.
@@ -1283,10 +1293,13 @@ func expectAgentStatefulSet(ctx context.Context, serverName, pvcName string) *ap
 	Expect(container.Name).To(Equal(resources.AgentContainerName))
 	Expect(container.Image).To(Equal(testControllerImage))
 	Expect(container.Command).To(ConsistOf(resources.AgentCommand))
-	Expect(container.Ports).To(HaveLen(1))
-	Expect(container.Ports[0].Name).To(Equal(resources.GamePortName))
-	Expect(container.Ports[0].ContainerPort).To(Equal(int32(expectedGameUDPPort)))
-	Expect(container.Ports[0].Protocol).To(Equal(corev1.ProtocolUDP))
+	Expect(container.Ports).To(HaveLen(2))
+	expectAgentContainerPort(container.Ports[0], resources.GamePortName, expectedGameUDPPort, corev1.ProtocolUDP)
+	expectAgentContainerPort(container.Ports[1], resources.AgentRPCPortName, expectedAgentRPCPort, corev1.ProtocolTCP)
+
+	// The liveness probe proves the agent still serves its RPC: the
+	// server answers while the game downloads and during a drain.
+	expectAgentLivenessProbe(container.LivenessProbe)
 
 	mountPaths := make([]string, 0, len(container.VolumeMounts))
 	for _, mount := range container.VolumeMounts {
@@ -1311,6 +1324,26 @@ func expectAgentStatefulSet(ctx context.Context, serverName, pvcName string) *ap
 	Expect(owner.Name).To(Equal(serverName))
 
 	return statefulSet
+}
+
+// expectAgentContainerPort asserts the name, the number and the protocol
+// of one container port.
+func expectAgentContainerPort(port corev1.ContainerPort, name string, number int, protocol corev1.Protocol) {
+	ExpectWithOffset(1, port.Name).To(Equal(name))
+	ExpectWithOffset(1, port.ContainerPort).To(Equal(int32(number)))
+	ExpectWithOffset(1, port.Protocol).To(Equal(protocol))
+}
+
+// expectAgentLivenessProbe asserts the TCP liveness probe of the agent
+// RPC port.
+func expectAgentLivenessProbe(probe *corev1.Probe) {
+	ExpectWithOffset(1, probe).NotTo(BeNil())
+	ExpectWithOffset(1, probe.TCPSocket).NotTo(BeNil())
+	ExpectWithOffset(1, probe.TCPSocket.Port.String()).To(Equal(resources.AgentRPCPortName))
+	ExpectWithOffset(1, probe.InitialDelaySeconds).To(Equal(int32(expectedAgentLivenessDelay)))
+	ExpectWithOffset(1, probe.PeriodSeconds).To(Equal(int32(expectedAgentLivenessPeriod)))
+	ExpectWithOffset(1, probe.TimeoutSeconds).To(Equal(int32(expectedAgentLivenessTimeout)))
+	ExpectWithOffset(1, probe.FailureThreshold).To(Equal(int32(expectedAgentLivenessFailures)))
 }
 
 // expectAgentNetworkPolicy asserts the presence and the ownership of the
