@@ -1,5 +1,9 @@
 # config.ini and the server whitelist, referenced by
 # spec.gameConfig of the FactorioServer sample.
+#
+# The agent rewrites write-data in the delivered config.ini to its save
+# directory (config.saveDir, /var/lib/koujouo by default), so the value
+# below is replaced before the game starts.
 apiVersion: v1
 kind: ConfigMap
 metadata:

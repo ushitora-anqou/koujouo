@@ -17,8 +17,11 @@ limitations under the License.
 package agent //nolint:testpackage // White-box tests exercise the agent internals.
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/go-logr/logr"
 )
 
 // TestRewriteWriteData verifies the write-data rewrite of the delivered
@@ -81,6 +84,69 @@ func TestRewriteWriteDataOtherSections(t *testing.T) {
 
 	if !strings.Contains(got, "write-data=/new\n") {
 		t.Errorf("rewriteWriteData() = %q, want the path write-data replaced", got)
+	}
+}
+
+// TestWriteConfigFilesWritesADefaultConfigIni verifies that a
+// configuration without a delivered config.ini still points the game
+// write-data at the save directory, so the autosaves land on the save
+// volume.
+func TestWriteConfigFilesWritesADefaultConfigIni(t *testing.T) {
+	t.Parallel()
+
+	saveDir := t.TempDir()
+
+	gameAgent, err := New(logr.Discard(), Options{SaveDir: saveDir, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("could not create the agent: %v", err)
+	}
+
+	err = gameAgent.writeConfigFilesLocked(&Config{GameVersion: testGameVersion})
+	if err != nil {
+		t.Fatalf("writeConfigFilesLocked() error = %v", err)
+	}
+
+	written := readFile(t, filepath.Join(saveDir, configFileIniName))
+
+	want := "write-data=" + saveDir + "\n"
+	if !strings.Contains(written, want) {
+		t.Errorf("written config.ini = %q, want it to hold %q", written, want)
+	}
+}
+
+// TestWriteConfigFilesKeepsADeliveredConfigIni verifies that the
+// default config.ini never replaces the one the controller delivered.
+func TestWriteConfigFilesKeepsADeliveredConfigIni(t *testing.T) {
+	t.Parallel()
+
+	saveDir := t.TempDir()
+
+	gameAgent, err := New(logr.Discard(), Options{SaveDir: saveDir, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("could not create the agent: %v", err)
+	}
+
+	delivered := "[path]\nwrite-data=/old\n[other]\nautosave-interval=5\n"
+
+	config := &Config{
+		GameVersion: testGameVersion,
+		Files:       []ConfigFile{{Name: configFileIniName, Content: delivered}},
+	}
+
+	err = gameAgent.writeConfigFilesLocked(config)
+	if err != nil {
+		t.Fatalf("writeConfigFilesLocked() error = %v", err)
+	}
+
+	written := readFile(t, filepath.Join(saveDir, configFileIniName))
+
+	if !strings.Contains(written, "autosave-interval=5\n") {
+		t.Errorf("written config.ini = %q, want the delivered settings kept", written)
+	}
+
+	want := "write-data=" + saveDir + "\n"
+	if !strings.Contains(written, want) {
+		t.Errorf("written config.ini = %q, want it to hold %q", written, want)
 	}
 }
 

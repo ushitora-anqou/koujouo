@@ -590,9 +590,23 @@ func (a *Agent) failLocked(err error) error {
 
 // writeConfigFilesLocked writes the delivered files into the save
 // directory. The config.ini write-data path is rewritten to the save
-// directory; unknown file names are ignored. It must be called with the
-// lifecycle lock held.
+// directory; unknown file names are ignored. A configuration that
+// delivers no config.ini gets a minimal one, because the game is always
+// started with -c <saveDir>/config.ini: without it the game writes its
+// data outside the save volume and loses the autosaves. It must be
+// called with the lifecycle lock held.
 func (a *Agent) writeConfigFilesLocked(config *Config) error {
+	deliversConfigIni := slices.ContainsFunc(config.Files, func(file ConfigFile) bool {
+		return file.Name == configFileIniName
+	})
+
+	if !deliversConfigIni {
+		err := a.writeConfigFileLocked(ConfigFile{Name: configFileIniName, Content: writeDataSectionHeader + "\n"})
+		if err != nil {
+			return fmt.Errorf("could not write the default config.ini: %w", err)
+		}
+	}
+
 	for _, file := range config.Files {
 		err := a.writeConfigFileLocked(file)
 		if err != nil {

@@ -18,10 +18,19 @@ package agent //nolint:testpackage // White-box tests exercise the agent interna
 
 import (
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 )
+
+// Timeout of the output reader tests, which must never hang on a game
+// or a webhook that stopped responding.
+const gameOutputTestTimeout = 5 * time.Second
 
 // TestParsePlayerEvent verifies the game output parser against real
 // Factorio log lines.
@@ -155,5 +164,203 @@ func TestCopyGameOutputUsesTheCurrentNotifier(t *testing.T) {
 	case extra := <-firstRequests:
 		t.Errorf("the first webhook received an event of the switched notifier: %q", extra)
 	default:
+	}
+}
+
+// longGameOutputLineLength is the length of the single line the long
+// line test streams. It is well above the 64 KiB default limit of
+// bufio.Scanner that stopped the reader before.
+const longGameOutputLineLength = 128 * 1024
+
+// TestCopyGameOutputHandlesLongLines verifies that one line beyond the
+// default scanner limit neither stops the reader nor blocks the game
+// writing its output.
+func TestCopyGameOutputHandlesLongLines(t *testing.T) {
+	t.Parallel()
+
+	reader, writer := io.Pipe()
+
+	streamDone := make(chan struct{})
+
+	go func() {
+		defer close(streamDone)
+
+		copyGameOutput(t.Context(), logr.Discard(), reader, streamStdout, func() *notifier { return nil })
+	}()
+
+	writeErr := make(chan error, 1)
+
+	go func() {
+		_, err := io.WriteString(writer, strings.Repeat("x", longGameOutputLineLength)+"\n")
+		if err != nil {
+			writeErr <- err
+
+			return
+		}
+
+		writeErr <- writer.Close()
+	}()
+
+	select {
+	case <-streamDone:
+	case <-time.After(gameOutputTestTimeout):
+		t.Fatal("copyGameOutput did not drain the long line")
+	}
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("could not write the long line: %v", err)
+		}
+	case <-time.After(gameOutputTestTimeout):
+		t.Fatal("the write of the long line blocked, the reader stopped reading")
+	}
+}
+
+// newStalledWebhook serves a webhook that answers only once the test
+// releases it, so a notification sender blocks on it. The returned
+// release function is idempotent.
+func newStalledWebhook(t *testing.T) (*httptest.Server, func()) {
+	t.Helper()
+
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	releaseWebhook := func() {
+		once.Do(func() { close(release) })
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		<-release
+
+		writer.WriteHeader(httpStatusNoContent)
+	}))
+
+	// The webhook is released before the server closes (cleanups run
+	// last in, first out), so the pending request does not hold the
+	// shutdown up.
+	t.Cleanup(server.Close)
+	t.Cleanup(releaseWebhook)
+
+	return server, releaseWebhook
+}
+
+// stalledWebhookLines is how many lines the slow webhook test writes
+// after the first player event. Every other line carries a player
+// event, so the notification queue overflows and the reader has to drop
+// notifications instead of waiting for the webhook.
+const stalledWebhookLines = 4 * gameOutputQueueLength
+
+// TestCopyGameOutputDoesNotBlockOnASlowWebhook verifies that a webhook
+// that does not answer never stops the reader: the game keeps writing
+// its output and the dropped notifications are acceptable.
+func TestCopyGameOutputDoesNotBlockOnASlowWebhook(t *testing.T) {
+	t.Parallel()
+
+	server, release := newStalledWebhook(t)
+
+	notify := newNotifier(server.URL, testHTTPClient())
+	notify.backoff = testBackoff
+
+	reader, writer := io.Pipe()
+
+	streamDone := make(chan struct{})
+
+	go func() {
+		defer close(streamDone)
+
+		copyGameOutput(t.Context(), logr.Discard(), reader, streamStdout, func() *notifier { return notify })
+	}()
+
+	writeErr := make(chan error, 1)
+
+	go func() {
+		_, err := io.WriteString(writer, "  2.222 [JOIN] anqou joined the game\n")
+		for index := range stalledWebhookLines {
+			if err != nil {
+				break
+			}
+
+			line := "  3.000 Info ServerMultiplayerManager.cpp: 0\n"
+			if index%2 == 0 {
+				line = "  3.500 [JOIN] kofuk joined the game\n"
+			}
+
+			_, err = io.WriteString(writer, line)
+		}
+
+		if err == nil {
+			err = writer.Close()
+		}
+
+		writeErr <- err
+	}()
+
+	// Every write of the game completes only once the reader consumed
+	// it; a reader waiting for the webhook would stall here.
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("could not write the game output: %v", err)
+		}
+	case <-time.After(gameOutputTestTimeout):
+		t.Fatal("copyGameOutput stopped reading while the webhook did not answer")
+	}
+
+	// Let the sender finish, so no goroutine outlives the test.
+	release()
+
+	select {
+	case <-streamDone:
+	case <-time.After(gameOutputTestTimeout):
+		t.Fatal("copyGameOutput did not return once the webhook answered")
+	}
+}
+
+// overlongGameOutputLineLength is the length of a line the scanner
+// refuses: it is above the 1 MiB limit of the output reader.
+const overlongGameOutputLineLength = 2 * gameOutputMaxLineLength
+
+// TestCopyGameOutputDiscardsTheRestOfAnOverlongStream verifies that a
+// line the scanner refuses leaves neither the rest of the line nor the
+// rest of the stream unread, which would block the game writing it.
+func TestCopyGameOutputDiscardsTheRestOfAnOverlongStream(t *testing.T) {
+	t.Parallel()
+
+	reader, writer := io.Pipe()
+
+	streamDone := make(chan struct{})
+
+	go func() {
+		defer close(streamDone)
+
+		copyGameOutput(t.Context(), logr.Discard(), reader, streamStdout, func() *notifier { return nil })
+	}()
+
+	writeErr := make(chan error, 1)
+
+	go func() {
+		_, err := io.WriteString(writer, strings.Repeat("x", overlongGameOutputLineLength)+"\n")
+		if err == nil {
+			err = writer.Close()
+		}
+
+		writeErr <- err
+	}()
+
+	select {
+	case <-streamDone:
+	case <-time.After(gameOutputTestTimeout):
+		t.Fatal("copyGameOutput left the rest of the overlong line unread")
+	}
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("could not write the overlong line: %v", err)
+		}
+	case <-time.After(gameOutputTestTimeout):
+		t.Fatal("the write of the overlong line blocked, the reader stopped reading")
 	}
 }
