@@ -47,6 +47,7 @@ flake.lock                        Pinned Nix inputs (update with `nix flake upda
 .golangci.yml                     golangci-lint config (all linters enabled)
 Makefile                          Build, test and image commands
 .github/workflows/ci.yml          CI: make all and check-uncomitted
+.github/workflows/e2e.yml         CI: make test-e2e (Kind, Docker)
 .github/workflows/release.yml     Release: multi-arch image to GHCR
 PROJECT                           Kubebuilder metadata Auto-generated (DO NOT EDIT)
 ```
@@ -332,13 +333,15 @@ suite needs.
 
 **Before committing** (the same two commands `ci.yml` runs):
 ```
-make all               # fmt generate manifests lint-config lint test test-e2e
+make all               # fmt generate manifests lint-config lint test
 make check-uncomitted  # Fails unless the regeneration leaves nothing to commit
 ```
-`make all` includes `test-e2e` (Docker and up to 60 minutes) and, inside `test`, the gitleaks
-scan of the git history. `check-uncomitted` fails on any uncommitted change by design, so commit
-(or at least `git add`) your work first and run it to learn whether the generated files are up to
-date.
+`make all` does not run the e2e suite: it regenerates the code and the chart, lints and runs the
+unit and envtest tests, and, inside `test`, the gitleaks scan of the git history. Run the e2e
+suite with `make test-e2e` locally or let the E2E workflow (`.github/workflows/e2e.yml`) run it —
+it needs Docker, a Kind cluster and up to 60 minutes. `check-uncomitted` fails on any uncommitted
+change by design, so commit (or at least `git add`) your work first and run it to learn whether
+the generated files are up to date.
 
 **After editing `*_types.go` or markers:**
 ```
@@ -385,28 +388,39 @@ go2nix Nix plugin is built against nixpkgs' Nix 2.34.9 and needs that exact
 ABI. Keep the pinned version in step with `nixVersions.nix_2_34` of the nixpkgs
 input in `flake.lock`.
 
+There are two CI workflows. `ci.yml` runs the gate a commit has to pass, `make all` plus
+`make check-uncomitted`; `e2e.yml` runs the Kind end-to-end suite, `make test-e2e`, on its own,
+because the suite needs Docker and up to 60 minutes.
+
 `ci.yml` runs on every push to `master` and on every pull request: one job on
 `ubuntu-latest` that does `go mod tidy`, then `make all`, then `make check-uncomitted` —
 the same two commands a commit has to pass locally. The push trigger names `master` only:
 a branch of this repository with an open pull request would otherwise run the job twice,
 once for the push and once for the pull request. The checkout fetches the full history
 (`fetch-depth: 0`): `make test` scans it for secrets with gitleaks, and a shallow clone would
-hide every commit but the latest.
+hide every commit but the latest. The job has `timeout-minutes: 30`: `make all` lints and runs
+the unit and envtest suites, which take minutes.
 
 - `make all` is the pre-commit gate:
-  `fmt generate manifests lint-config lint test test-e2e`. It regenerates the DeepCopy code, the
+  `fmt generate manifests lint-config lint test`. It regenerates the DeepCopy code, the
   capnp code and the chart, verifies the golangci-lint configuration, runs `golangci-lint` and
   `helm lint`, then the unit and envtest suite (`test`, which scans the git history for secrets
-  first) and the Kind end-to-end suite (`test-e2e`,
-  which builds the image with Nix and needs Docker). It has no `build` step on purpose: `test`
-  compiles the manager and the agent, and `test-e2e` builds the image. `test-e2e` receives
-  `DISCORD_WEBHOOK_URL` from a repository secret of the same name when one is configured; without
-  it the suite runs without Discord notifications.
+  first). It has no `build` step on purpose: `test` compiles the manager and the agent. It has no
+  e2e step either: the Kind end-to-end suite (`test-e2e`) needs Docker, builds the image with Nix
+  and takes up to 60 minutes, so `e2e.yml` runs it instead.
 - `make check-uncomitted` (one "m", as the target is spelled) runs `fmt generate manifests` and
   then fails when `git status --porcelain` is not empty: a generated file whose change was not
   committed, an untracked file, and an unrelated uncommitted change all fail it. In CI
   `go mod tidy` runs before `make all`, so a `go.mod`/`go.sum` that tidy would rewrite fails here
   too.
+- `e2e.yml` runs `go mod tidy`, then `make test-e2e`, on every pull request, on every push to
+  `master`, nightly at 18:00 UTC (03:00 JST) and on a manual dispatch. It keeps the log of the
+  suite as an artifact when it fails (`tee e2e.log`, `actions/upload-artifact`), dumps the state of
+  the cluster (`kubectl get all -A`, the events, the manager log, the Pods), and always deletes the
+  Kind cluster `koujouo-test-e2e`: a runner is thrown away, so a failed run leaves no cluster to
+  debug. The job has `timeout-minutes: 90`: `E2E_TIMEOUT` is 60m, and the image builds and the
+  cluster need the rest. `make test-e2e` receives `DISCORD_WEBHOOK_URL` from a repository secret of
+  the same name when one is configured; without it the suite runs without Discord notifications.
 - `release.yml` is separate: it builds `nix build .#dockerImage` and publishes it to GHCR (see the
   next paragraph). It does not go through the Makefile, so a change of a `make` target cannot break
   it.

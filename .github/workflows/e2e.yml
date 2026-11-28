@@ -1,0 +1,124 @@
+# End-to-end workflow: the Kind suite of test/e2e, `make test-e2e`.
+#
+# Separate from ci.yml (which runs `make all` and `make check-uncomitted`, the
+# gate a commit has to pass) because the suite needs Docker, a Kind cluster and
+# outbound access to factorio.com, and takes up to 60 minutes: a pull request
+# waits on the minutes of a gate it repeats locally in a few, so only this
+# workflow runs it.
+#
+# Kind runs on the Docker of the runner, not inside a container: `make
+# test-e2e` creates the cluster `koujouo-test-e2e` (`KIND_CLUSTER`) and loads
+# the Nix-built image into it, and `kind` and `kubectl` both come from the dev
+# shell (the flake). The suite deletes the cluster after a successful run; the
+# teardown step below deletes it after any other outcome.
+
+name: E2E
+
+on:
+  pull_request:
+  # A pull request from a branch of this repository triggers both the push and
+  # the pull_request event; the push run would repeat the pull_request run, so
+  # push is limited to the default branch, which no pull request covers.
+  push:
+    branches: [master]
+  # A nightly run catches what a pull request cannot: a daily-drift of the
+  # dependencies, the runners or factorio.com, with no code change behind it.
+  # 18:00 UTC is 03:00 JST.
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One suite per ref: a new commit of a pull request cancels the run of the
+# previous one, whose cluster the next run would replace anyway.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    # `E2E_TIMEOUT` is 60m (the budget of the suite itself); the image builds,
+    # the cluster and the teardown around it need the remaining half hour.
+    timeout-minutes: 90
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The flake stamps the image with the full revision (`git describe`)
+          # and only builds git-tracked files: keep the history like ci.yml
+          # does.
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
+        with:
+          # go2nix builds its Nix plugin against the upstream Nix of nixpkgs
+          # (2.34.9). Install that exact release so the plugin's ABI matches;
+          # the hash is the published sha256 of the installer script.
+          install_url: https://releases.nixos.org/nix/nix-2.34.9/install
+          install_sha256: a03ce2e9eaf4ea1560260b9a93e311dbaf589d28fb5c9318f8d9e768ee6339d8
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Enter the Nix dev shell
+        uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1.2.1
+
+      # A go.mod/go.sum that tidy would rewrite makes the suite build another
+      # tree than the one it tests.
+      - name: Tidy the Go modules
+        run: go mod tidy
+
+      # `make test-e2e` creates the Kind cluster when missing, builds and loads
+      # both images with Nix, runs the suite and deletes the cluster after a
+      # successful run. `tee` keeps the log for the artifact below; pipefail
+      # keeps the exit code of make, which the pipe would otherwise hide.
+      - name: Run the e2e suite
+        # DISCORD_WEBHOOK_URL is optional: without the repository secret the
+        # e2e suite creates no webhook Secret and the FactorioServer runs
+        # without Discord notifications.
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make test-e2e 2>&1 | tee e2e.log
+
+      # What a failed scenario cannot show: the suite dumps its own objects,
+      # events and logs into the Ginkgo output, but not the state of the
+      # cluster around them. Every command tolerates a missing binary (a failure
+      # before the dev shell) and a dead cluster; none of them prints a Secret
+      # value (a Secret lists its keys only) nor agent-state.json, which holds
+      # the delivered secrets and the RCON password in clear text.
+      - name: Collect the state of the cluster
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl get all -A || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+          kubectl logs -n koujouo-system deployment/koujouo-controller-manager --all-containers --tail=200 || true
+          kubectl get pods -A -o wide || true
+
+      - name: Upload the e2e log
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-log
+          path: e2e.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      # A failed suite leaves the cluster behind for debugging locally; a runner
+      # is thrown away, so delete it here. A successful run already deleted it
+      # (`test-e2e` ends with `make cleanup-test-e2e`), hence the `|| true`.
+      - name: Delete the Kind cluster
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          kind delete cluster --name koujouo-test-e2e || true

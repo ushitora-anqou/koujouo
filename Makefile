@@ -41,10 +41,13 @@ SHELL = /usr/bin/env bash -o pipefail
 
 # `all` is the gate a commit has to pass, and the default goal: it regenerates
 # the code and the chart, verifies the linter configuration, lints, and runs
-# both test layers. `build` is not part of it on purpose: `test` compiles the
-# manager and the agent, and `test-e2e` builds the image and runs it.
+# the unit and envtest suite. It does not run the e2e suite, which needs
+# Docker, a Kind cluster and up to 60 minutes: `ci.yml` does not run it either,
+# the dedicated E2E workflow (.github/workflows/e2e.yml) does, and a local run
+# uses `make test-e2e`. `build` is not part of it on purpose: `test` compiles
+# the manager and the agent.
 .PHONY: all
-all: fmt generate manifests lint-config lint test test-e2e ## Run everything a commit has to pass: regenerate, lint and test (e2e included).
+all: fmt generate manifests lint-config lint test ## Run everything a commit has to pass: regenerate, lint and test (no e2e: run `make test-e2e` or the E2E workflow).
 
 ##@ General
 
@@ -118,8 +121,9 @@ KIND_CLUSTER ?= koujouo-test-e2e
 # the agent download the Factorio headless build, which takes longer than the
 # ten minutes go test allows by default. The agent upgrade scenario adds the
 # build and load of the image of a previous build, the rollout of the manager
-# Deployment and the upgrade itself, so the budget is 60 minutes (the CI job
-# has timeout-minutes: 90).
+# Deployment and the upgrade itself, so the budget is 60 minutes. The E2E
+# workflow (.github/workflows/e2e.yml) runs with this 60m and gives the job
+# `timeout-minutes: 90` for the image builds around it; raise both together.
 E2E_TIMEOUT ?= 60m
 
 .PHONY: setup-test-e2e
@@ -138,9 +142,11 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 
 # The e2e suite installs the chart with Helm, so the target depends on
 # `manifests generate fmt`: the CRD and the manager ClusterRole of the chart
-# must match the markers of the working tree the suite tests.
+# must match the markers of the working tree the suite tests. It is not part of
+# `all`: run it locally, or let the E2E workflow (.github/workflows/e2e.yml)
+# run it. Needs Docker, Kind and outbound access to factorio.com.
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: setup-test-e2e manifests generate fmt ## Run the e2e tests. Expected an isolated environment using Kind (Docker and Kind required; not part of `all`).
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) CERT_MANAGER_INSTALL_SKIP=true \
 		go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
 	$(MAKE) cleanup-test-e2e

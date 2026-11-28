@@ -1,7 +1,8 @@
 # Continuous integration: one job that runs the gate a commit has to pass
 # locally, `make all`, and then checks that regenerating the code and the chart
-# leaves nothing uncommitted, `make check-uncomitted`. The release workflow
-# (release.yml) is separate: it builds and publishes the image.
+# leaves nothing uncommitted, `make check-uncomitted`. `make all` holds no e2e
+# suite: the Kind suite has a workflow of its own (e2e.yml). The release
+# workflow (release.yml) is separate too: it builds and publishes the image.
 name: CI
 
 on:
@@ -19,10 +20,10 @@ jobs:
   ci:
     name: Run on Ubuntu
     runs-on: ubuntu-latest
-    # The job builds the image with Nix and downloads Factorio twice (e2e), so
-    # the ten minutes of go test and the default timeout of a job are not
-    # enough: give make all, and the regeneration after it, room.
-    timeout-minutes: 90
+    # `make all` regenerates the code and the chart, lints and runs the unit and
+    # envtest suites; the envtest binaries download on demand. Minutes, not the
+    # tens of an e2e run: 30 is generous.
+    timeout-minutes: 30
     steps:
       - name: Clone the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,11 +53,8 @@ jobs:
         run: go mod tidy
 
       - name: Run the pre-commit gate
-        # DISCORD_WEBHOOK_URL is optional: without the repository secret the
-        # e2e suite creates no webhook Secret and the FactorioServer runs
-        # without Discord notifications.
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        # No e2e here: `make all` regenerates, lints and runs the unit and
+        # envtest suites, and the Kind suite has its own workflow (e2e.yml).
         run: make all
 
       # Runs after make all: it regenerates everything once more and fails when
