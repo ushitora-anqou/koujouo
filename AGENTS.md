@@ -20,7 +20,10 @@ internal/controller/              Reconciliation
   agentconfig.go                    Reads the referenced ConfigMaps/Secrets; configure/status/stop
   agentupgrade.go                   Streams the agent binary to an outdated agent
   status.go                         Conditions; derives status.phase
-  resources/statefulset.go          Builds the agent StatefulSet
+  resources/statefulset.go          Builds the agent StatefulSet (pod template hash,
+                                    liveness probe on the RPC port, ephemeral volume)
+  resources/networkpolicy.go        Builds the agent NetworkPolicy (UDP 34197 from
+                                    anywhere, TCP 9550 from the manager namespace only)
   suite_test.go                     envtest setup (fakeagent_test.go: the in-process fake agent)
 internal/agent/                   The agent: game lifecycle, game download, graceful stop, RCON,
                                   Discord notifications, S3 backup, self-upgrade
@@ -85,12 +88,71 @@ The manager and the agent are two binaries of one image. They talk
   backups and the graceful stop on SIGTERM. The save data and the agent state live on the
   user's PVC (`/var/lib/koujouo`), so the world survives suspension and Pod replacement.
 
-A running server is reconciled in this order: ensure the StatefulSet → wait for a ready agent
-Pod → `status` → `upgrade` when the agent reports another build than the manager → `configure`
-when the spec generation or the game version changed → patch the status → requeue after 30s.
-`spec.suspend: true` calls `stop`, deletes the StatefulSet and keeps the PVC. A game that exits
-on its own turns the server `Failed`; the agent does not restart it by design (see the known
-limitations in README.md).
+A running server is reconciled in this order: ensure the StatefulSet and the NetworkPolicy →
+wait for a ready agent Pod → `status` → `upgrade` when the agent reports another build than
+the manager → `configure` when the spec generation or the game version changed → patch the
+status → requeue after 30s. `spec.suspend: true` calls `stop`, deletes the StatefulSet and
+keeps the PVC. A game that exits on its own turns the server `Failed`; the agent does not
+restart it by design (see the known limitations in README.md).
+
+- **The agent Pod is protected by a NetworkPolicy** (`internal/controller/resources/networkpolicy.go`).
+  Ingress admits UDP 34197 from any source, because the players connect from anywhere, and
+  TCP 9550 — the unauthenticated, plain-text Cap'n Proto RPC — from the manager namespace
+  only. Egress stays open: the agent downloads the game, uploads the saves and posts to
+  Discord. The manager namespace comes from `POD_NAMESPACE` of the manager Deployment
+  (downward API, `charts/koujouo/templates/deployment.yaml`); `cmd/manager/main.go` falls
+  back to the namespace file of the mounted ServiceAccount. An empty `ManagerNamespace`
+  (the manager runs outside a cluster) means **no NetworkPolicy is created** and the RPC
+  stays reachable from the whole Pod network; the reconcile logs that once.
+- **The controller reads the referenced Secrets and ConfigMaps through `APIReader`**, not
+  through the cache: they are few and need no cluster-wide watch, and this keeps the
+  Secrets out of the manager's memory cache.
+- **The pod template hash decides when a Pod is replaced.** The StatefulSet keeps
+  `updateStrategy: OnDelete`, so a template change alone reaches no running Pod. The
+  controller therefore stamps the hash of the owned pod template fields (labels and spec,
+  with the agent container image blanked out) into the annotation
+  `koujouo.anqou.net/template-hash`, the StatefulSet controller copies it into each Pod, and
+  a Pod of another hash is deleted so that the StatefulSet recreates it. **Every owned
+  template field except the image** — the save PVC name, `spec.agent.resources`, the
+  ephemeral volume, the `imagePullSecrets`, the security contexts, the probe — therefore
+  restarts the game once. An **image-only** change is left out of the hash and reaches the
+  agent only through the in-place upgrade path, so it never restarts the game.
+- **The agent Pod carries no ServiceAccount token** (`automountServiceAccountToken: false`):
+  it never talks to the API server.
+- **The reconciler runs 8 reconciles at a time** (`defaultMaxConcurrentReconciles`): a
+  configure of one server takes minutes, and a single worker would hold back every other
+  server that long. Each status call is bounded by 30 seconds
+  (`defaultAgentStatusTimeout`), so an agent that stops answering costs one poll, not the
+  whole wait.
+- **The agent bounds its own shutdown.** `Shutdown` raises the `terminating` flag before it
+  waits for the lifecycle lock and waits with a deadline, so a configure that is still
+  downloading cannot start the game again and cannot hold the shutdown past the grace
+  period. A resume — which applies the cached configuration without a configure call from
+  the controller — retries a transient failure 3 times with an exponential backoff.
+- **A configuration that delivers no `config.ini` gets a default one.** The game always
+  starts with `-c <saveDir>/config.ini`, so `spec.gameConfig` may be omitted entirely: the
+  agent writes a minimal `config.ini` whose `write-data` points at the save directory,
+  which keeps the autosaves on the save volume.
+- **The agent serves a TCP liveness probe on the RPC port 9550**: it listens before the game
+  starts and stays up during a drain, so a refused connection means a stuck agent. Three
+  failures in a row make the kubelet restart the container.
+- **The chart's defaults are installable**: `image.tag: latest` (the release pushes
+  `master`, `latest` and the `v*` tags), `config.leaderElection: true` together with
+  `deploymentStrategy: RollingUpdate`, so exactly one of the two manager Pods of a rollout
+  reconciles. `imagePullSecrets` holds the Secrets of the manager Pod and
+  `spec.agent.imagePullSecrets` the ones of the agent Pods: an image in a private registry
+  needs **both**.
+- **`leaveTimeoutSeconds: 0` waits for nobody** and sends SIGINT at once. Only a
+  `FactorioServer` without the field gets the default of 60 seconds; the CRD default keeps
+  the minimum at 0.
+- **A dirty tree gets a timestamped `VERSION`.** The Makefile appends the build time when
+  `git describe` reports `-dirty`, so two builds of the same commit with different
+  uncommitted changes carry different versions; without it the manager would take the new
+  agent for a build of its own version and skip the in-place upgrade.
+- **The manager RBAC holds no `create`/`delete` on `FactorioServer`s** — the user owns the
+  CR — but it holds `delete` on Pods, which recreates the agent Pod of a changed pod
+  template, plus the whole NetworkPolicy rule set.
+
 
 **Configuration.** Both binaries are Cobra commands whose only flag is `--config <path>`, the
 YAML file they read with Viper (`cmd/manager/main.go`, `cmd/agent/main.go`). The keys are
@@ -136,7 +198,10 @@ nix develop   # go, golangci-lint, gitleaks, kubebuilder, kind, kubectl, helm,
   `/lib/ld-linux-aarch64.so.1` on aarch64
 - Both binaries get the build stamped into `internal/version.Agent` (`-X`): the short git revision,
   also over uncommitted changes. The Makefile bakes the same value into locally built binaries
-  (`VERSION`)
+  (`VERSION`); a dirty tree gets the build time appended (`<rev>-dirty-<unixtime>`), so two builds
+  of the same commit with different changes differ. Without it the manager would take the new
+  agent for a build of its own version and skip the in-place upgrade. Releases are built from a
+  clean commit, so only development builds carry the suffix.
 
 **The Go build is go2nix without a lockfile.** flake.nix defines `goEnv` with `go2nix.lib.mkGoEnv`
 and builds `manager` with `goEnv.buildGoApplication`: there is no `vendorHash`, and the module
@@ -211,19 +276,42 @@ binary until the new manager replaces it. Keep these couplings intact:
     build. Changes to `rpc/koujouo.capnp` must stay wire-compatible: add fields, enumerants and
     methods with numbers higher than every existing one, and never change a number, a type or a
     default value (Cap'n Proto, "Evolving Your Protocol").
+  - Because the strategy is `OnDelete`, a template change alone reaches no running Pod. The
+    controller compares the `koujouo.anqou.net/template-hash` annotation of the Pod with the
+    hash of the desired template (`resources/podTemplateHash`) and deletes a Pod of another
+    hash, so the StatefulSet recreates it. The hash covers the owned pod template fields with
+    the container image blanked out: an image change must not recreate the Pod, and it does
+    not (see "How It Works"). A field the controller owns that is left out of the hash is
+    never repaired on a running Pod.
 - **Restricted Pod Security**: the agent Pod satisfies the `restricted` profile, which the e2e
   namespaces enforce: non-root (the image runs as uid `65532`, `fsGroup` 65532), read-only root
   filesystem, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp. Writes
-  go to the two volumes only.
+  go to the two volumes only. The Pod also carries `automountServiceAccountToken: false`: the
+  agent never talks to the API server, so it gets no token.
 - **Stop budgets**: `terminationGracePeriodSeconds` is 900 (`resources/statefulset.go`). A drain
   waits up to `leaveTimeoutSeconds` (at most 300) and the save up to 5 more minutes before the
   kubelet may kill the Pod; `cmd/agent/main.go` bounds the agent shutdown with a 9-minute
-  deadline. Re-check the others when you change one of them.
+  deadline. Re-check the others when you change one of them. `leaveTimeoutSeconds: 0` waits for
+  nobody: the drain sends SIGINT at once, and only a `FactorioServer` without the field is
+  defaulted.
+- **The agent bounds its own shutdown and resume**: `Shutdown` raises the `terminating` flag
+  before it waits for the lifecycle lock, and that wait carries a deadline, so a configure that
+  is still downloading never starts the game again and never holds the shutdown past the grace
+  period. A resume (the cached configuration applied without a `configure` call) retries a
+  transient failure 3 times with an exponential backoff, because the controller never repeats
+  the call a resume replaces.
 - **Configuration over RPC only**: the controller reads the referenced ConfigMaps and Secrets and
-  passes their values in the `Config` struct; the agent Pod mounts neither. The agent caches the
+  passes their values in the `Config` struct; the agent Pod mounts neither. The controller reads
+  them through `APIReader` (the API server directly, no cache): they are few, need no
+  cluster-wide watch, and the manager then caches no Secret. The agent caches the
   last configuration in `agent-state.json` (mode 0600) on the save volume to resume after a Pod
   restart. Never mount these objects into the Pod, and never print that file into logs, docs or
   test output: it holds the delivered secrets and the RCON password in clear text.
+- **Reconciler concurrency**: `defaultMaxConcurrentReconciles` is 8. A configure call takes
+  minutes (drain plus download) and the reconcile waits for it, so a single worker would hold
+  back every other `FactorioServer` that long. A status call is bounded by 30 seconds
+  (`defaultAgentStatusTimeout`), so an agent that keeps the connection open without answering
+  costs one poll instead of the whole wait.
 
 ### E2E Tests Require an Isolated Kind Cluster
 `make test-e2e` works on the dedicated [Kind](https://kind.sigs.k8s.io/) cluster
@@ -442,6 +530,22 @@ The configuration loaders of both binaries are covered by plain unit tests
 (`cmd/manager/config_test.go`, `cmd/agent/config_test.go`): they check the defaults, a full file
 and the errors of a missing or malformed one.
 
+Beyond the loaders, the following behaviour has a test of its own; keep them in step with the
+code:
+
+| Area | Test |
+| --- | --- |
+| `shutdown` absorbs the closed listener and joins the serve error; `waitForSignal` returns a server error and no error on a signal | `cmd/agent/main_test.go` |
+| `Suspended` is cleared when a resumed server reports again (`derivePhase` and the `sync*Status` helpers) | `internal/controller/status_internal_test.go` |
+| `callAgentStop` runs under `context.WithoutCancel`: the reconcile deadline does not end it | `internal/controller/agentstop_internal_test.go` |
+| The NetworkPolicy ports, its manager-namespace source, its survival of a suspension and its absence without `ManagerNamespace` | `factorioserver_controller_test.go`, "When reconciling the agent NetworkPolicy" |
+| A changed pod template (save PVC, `spec.agent.resources`) recreates the Pod, an image-only change does not, and the annotations the controller does not own survive | `factorioserver_controller_test.go`, "When the agent Pod runs an outdated pod template" |
+| Suspension: the stop call, the StatefulSet and PVC end state, the unreachable agent (the StatefulSet stays), the unready Pod (no stop) and the stop that outlives the reconcile deadline | `factorioserver_controller_test.go`, "When suspending the server" |
+| Long game output lines, a webhook that does not answer, an overlong stream that must still be drained | `internal/agent/logs_test.go` |
+| The default `config.ini` of a configuration without `spec.gameConfig`, and the delivered one winning | `internal/agent/config_test.go` |
+| `Shutdown` returning at its deadline while a configure holds the lock, and the resume retry of a transient failure | `internal/agent/agent_test.go` |
+| A failing S3 endpoint and an empty saves directory: the backup is logged and skipped, the loop still ends with its context | `internal/agent/backup_test.go` |
+
 **E2E suite** (`test/e2e/`, build tag `e2e`)
 
 The files carry `//go:build e2e`: `make test` skips the package and `make lint` does not see
@@ -583,7 +687,13 @@ holds placeholders: substitute real values in what you apply, never in the track
   run under `context.WithoutCancel`; only a controller shutdown interrupts them
 - `syncStatefulSet` copies only the fields the controller owns into an existing StatefulSet. A
   new owned field needs handling there and in `containerDrifted` / `syncContainer`, or its drift
-  is never repaired
+  is never repaired. A new owned **pod template** field also enters `podTemplateHash`
+  (`resources/statefulset.go`), or a running Pod never picks it up
+- The manager ClusterRole (`charts/koujouo/templates/manager-role.yaml`, generated from the
+  markers) grants `get;list;watch;update;patch` on `factorioservers` but **no `create` or
+  `delete`**: the `FactorioServer`s belong to the user. It grants `delete;get;list;watch` on
+  `pods`, which recreates the agent Pod of a changed pod template, `get;list;watch` on
+  `configmaps;secrets` and the whole NetworkPolicy rule set
 - Events go through `k8s.io/client-go/tools/events` (`Recorder.Eventf`)
 
 ### Logging

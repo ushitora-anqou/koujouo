@@ -40,6 +40,9 @@ import (
 var (
 	errNoFakeAgent = errors.New("no fake agent is configured")
 
+	// errFakeUnreachable is what a dial that finds no agent reports.
+	errFakeUnreachable = errors.New("the agent is unreachable")
+
 	// errFakeChecksum is the answer of an upgrade whose sha256 does not
 	// match, like the real agent returns without execve(2)ing.
 	errFakeChecksum = errors.New("the received agent binary is invalid")
@@ -99,6 +102,11 @@ type fakeAgentServer struct {
 	// question first (call.Go()), so Status keeps answering while the
 	// hook walks the agent through draining and saving.
 	onConfigure func(f *fakeAgentServer, recorded *recordedConfig)
+
+	// holdStop, when set, keeps a stop call waiting until the channel is
+	// closed, like an agent that does not answer. The tests use it to
+	// check how the controller behaves while a stop is in flight.
+	holdStop chan struct{}
 }
 
 // newFakeAgentServer returns a fake agent in the pending phase that
@@ -299,6 +307,16 @@ func (f *fakeAgentServer) Status(_ context.Context, call rpcapi.Agent_status) er
 // Stop records the stop and reports the suspended phase.
 func (f *fakeAgentServer) Stop(_ context.Context, call rpcapi.Agent_stop) error {
 	f.mutex.Lock()
+	hold := f.holdStop
+	f.mutex.Unlock()
+
+	// An agent that hangs on the stop never answers the question; the
+	// controller has to bound the wait on its own.
+	if hold != nil {
+		<-hold
+	}
+
+	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
 	f.stopped++
@@ -336,6 +354,14 @@ func (f *fakeAgentServer) setOnConfigure(hook func(f *fakeAgentServer, recorded 
 	defer f.mutex.Unlock()
 
 	f.onConfigure = hook
+}
+
+// setHoldStop makes the following stop calls wait until hold is closed.
+func (f *fakeAgentServer) setHoldStop(hold chan struct{}) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	f.holdStop = hold
 }
 
 // setPhase records the phase that Status reports next.
@@ -575,6 +601,15 @@ func (d *fakeAgentDialer) close() {
 	for _, server := range d.servers {
 		_ = server.Close()
 	}
+}
+
+// failingDialer stands in for an agent that cannot be reached: every Dial
+// fails the way a refused TCP connection does.
+type failingDialer struct{}
+
+// Dial fails without handing out a capability.
+func (d *failingDialer) Dial(_ context.Context, pod *corev1.Pod) (*controller.AgentClient, error) {
+	return nil, fmt.Errorf("could not dial the agent of Pod %s: %w", pod.Name, errFakeUnreachable)
 }
 
 // fakeEventRecorder implements events.EventRecorder in memory.

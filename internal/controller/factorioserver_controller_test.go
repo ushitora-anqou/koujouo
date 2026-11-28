@@ -64,6 +64,13 @@ const (
 	// flight without waiting for the production poll interval.
 	testProgressInterval = 10 * time.Millisecond
 
+	// testStopHoldWindow is how long the stop test keeps the agent silent
+	// and asserts that the reconcile waits, and testStopDeadline bounds
+	// the waits around it. Both stay far below the leave timeout of the
+	// spec, so the test finishes in seconds.
+	testStopHoldWindow = 100 * time.Millisecond
+	testStopDeadline   = 5 * time.Second
+
 	expectedGracePeriodSeconds = 900
 	expectedGameUDPPort        = 34197
 	expectedAgentRPCPort       = 9550
@@ -735,6 +742,119 @@ var _ = Describe("FactorioServer Controller", func() {
 			expectCondition(server, "Progressing", metav1.ConditionTrue, "AgentUnavailable")
 			expectCondition(server, "Suspended", metav1.ConditionFalse, "AgentUnavailable")
 		})
+
+		It("should keep the StatefulSet when the agent cannot be dialed", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The StatefulSet stays until the agent answered the stop call:
+			// deleting it would signal the agent before it saved the world.
+			reconciler.Dialer = &failingDialer{}
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.Suspend = true
+			})
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).To(MatchError(ContainSubstring("could not dial agent to stop the game")))
+
+			Expect(fakeAgent.stopCount()).To(Equal(0))
+			expectAgentStatefulSet(ctx, serverName, serverName+"-saves")
+
+			server := fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).NotTo(Equal(koujouoanqounetv1.PhaseSuspended))
+		})
+
+		It("should delete the StatefulSet without a stop when the agent Pod is not ready", func() {
+			// envtest runs no StatefulSet controller, so the ready Pod of
+			// the setup is replaced by an unready one here.
+			Expect(k8sClient.Delete(ctx, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: serverName + "-0"},
+			})).To(Succeed())
+
+			createUnreadyAgentPod(ctx, serverName)
+
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.Suspend = true
+			})
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			// The Pod termination signals the agent, which saves on SIGTERM;
+			// a stop call would wait for an RPC the Pod cannot answer yet.
+			Expect(fakeAgent.stopCount()).To(Equal(0))
+
+			stsKey := types.NamespacedName{Namespace: testNamespace, Name: serverName}
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, stsKey, &appsv1.StatefulSet{}))).To(BeTrue())
+
+			server := fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseSuspended))
+		})
+
+		It("should wait for a stop that outlives the reconcile deadline", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The agent answers the stop only once the test releases it,
+			// like an agent that drains for a long leave timeout first.
+			hold := make(chan struct{})
+
+			released := false
+
+			releaseStop := func() {
+				if !released {
+					released = true
+
+					close(hold)
+				}
+			}
+
+			DeferCleanup(releaseStop)
+
+			fakeAgent.setHoldStop(hold)
+			DeferCleanup(func() { fakeAgent.setHoldStop(nil) })
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.Suspend = true
+			})
+
+			finished := make(chan struct{})
+			done := make(chan error, 1)
+
+			go func() {
+				defer GinkgoRecover()
+				defer close(finished)
+
+				_, err := reconcileOnce(ctx, reconciler, serverName)
+				done <- err
+			}()
+
+			// The stop call and the wait for it run under
+			// context.WithoutCancel on purpose: a drain waits for the leave
+			// timeout, which the user may set past the reconcile deadline of
+			// controller-runtime. A reconcile that returned here would delete
+			// the StatefulSet while the game still runs.
+			Consistently(finished, testStopHoldWindow).ShouldNot(BeClosed())
+
+			Expect(fakeAgent.stopCount()).To(Equal(0))
+
+			releaseStop()
+
+			Eventually(done, testStopDeadline).Should(Receive(BeNil()))
+
+			Expect(fakeAgent.stopCount()).To(Equal(1))
+
+			stsKey := types.NamespacedName{Namespace: testNamespace, Name: serverName}
+
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, stsKey, &appsv1.StatefulSet{}))
+			}, testStopDeadline, testProgressInterval).Should(BeTrue())
+		})
 	})
 
 	Context("When the agent runs another version", func() {
@@ -1181,6 +1301,19 @@ func fullServerSpec(name string) koujouoanqounetv1.FactorioServerSpec {
 // template hash of the desired StatefulSet, as the StatefulSet controller
 // copies the annotations of the pod template into the Pod.
 func createReadyAgentPod(ctx context.Context, serverName string) {
+	createAgentPod(ctx, serverName, true)
+}
+
+// createUnreadyAgentPod creates the agent Pod of server that has an IP
+// but does not report the Ready condition yet, like a Pod the StatefulSet
+// controller just started.
+func createUnreadyAgentPod(ctx context.Context, serverName string) {
+	createAgentPod(ctx, serverName, false)
+}
+
+// createAgentPod creates the agent Pod of server and reports whether it is
+// ready.
+func createAgentPod(ctx context.Context, serverName string, ready bool) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: testNamespace,
@@ -1197,9 +1330,14 @@ func createReadyAgentPod(ctx context.Context, serverName string) {
 
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
+	readiness := corev1.ConditionFalse
+	if ready {
+		readiness = corev1.ConditionTrue
+	}
+
 	pod.Status.PodIP = "10.42.0.10"
 	pod.Status.Conditions = []corev1.PodCondition{
-		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodReady, Status: readiness},
 	}
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package agent //nolint:testpackage // White-box tests exercise the agent internals.
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -50,6 +51,10 @@ const (
 
 	// backupWaitDeadline bounds the wait for the background uploads.
 	backupWaitDeadline = 5 * time.Second
+
+	// backupTestPeriod keeps the hourly ticker of the backup loop fast,
+	// so the loop test does not wait for the production period.
+	backupTestPeriod = 10 * time.Millisecond
 
 	// uploadCountAtStart and uploadCountAfterStop are the uploads of a
 	// game life cycle.
@@ -118,6 +123,14 @@ func (c *uploadCapture) record(request capturedUpload) {
 	defer c.mutex.Unlock()
 
 	c.requests = append(c.requests, request)
+}
+
+// count returns how many requests arrived so far.
+func (c *uploadCapture) count() int {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	return len(c.requests)
 }
 
 // waitForCount returns the captured requests once count arrived.
@@ -236,6 +249,170 @@ func TestUploaderUpload(t *testing.T) {
 	if captured.body != testSaveContent {
 		t.Errorf("upload body = %q, want %q", captured.body, testSaveContent)
 	}
+}
+
+// newFailingUploadServer serves an S3 endpoint that answers every request
+// with a 500, like an object store that is down or misconfigured. It
+// counts the attempts the AWS SDK made.
+func newFailingUploadServer(t *testing.T) (*httptest.Server, func() int) {
+	t.Helper()
+
+	var (
+		mutex    sync.Mutex
+		attempts int
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		mutex.Lock()
+		attempts++
+		mutex.Unlock()
+
+		http.Error(writer, "the object store is unavailable", http.StatusInternalServerError)
+	}))
+
+	t.Cleanup(server.Close)
+
+	return server, func() int {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		return attempts
+	}
+}
+
+// backupTestDeadline bounds the calls the failure tests wait for, so a
+// backup that never returns fails fast.
+const backupTestDeadline = 5 * time.Second
+
+// withinDeadline fails the test when call does not return within
+// backupTestDeadline.
+func withinDeadline(t *testing.T, what string, call func()) {
+	t.Helper()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		call()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(backupTestDeadline):
+		t.Fatalf("%s did not return within %s", what, backupTestDeadline)
+	}
+}
+
+// TestAgentBackupOnceSurvivesAFailingUpload verifies the failure path of
+// an upload: a save file the S3 endpoint rejects is logged and dropped
+// instead of panicking or ending the game lifecycle.
+func TestAgentBackupOnceSurvivesAFailingUpload(t *testing.T) {
+	t.Parallel()
+
+	server, attempts := newFailingUploadServer(t)
+
+	gameAgent := newBackupTestAgent(t, server.URL)
+
+	writeSaveFile(t, gameAgent.savesDir(), saveFileName, testSaveContent, time.Now())
+
+	withinDeadline(t, "backupOnce", func() { gameAgent.backupOnce(t.Context()) })
+
+	if got := attempts(); got == 0 {
+		t.Error("the failing endpoint received no upload attempt")
+	}
+}
+
+// TestAgentBackupLoopStopsDespiteAFailingUpload verifies that the hourly
+// backup loop keeps running through failing uploads and still ends with
+// its context, so a broken object store never blocks the shutdown.
+func TestAgentBackupLoopStopsDespiteAFailingUpload(t *testing.T) {
+	t.Parallel()
+
+	server, attempts := newFailingUploadServer(t)
+
+	gameAgent := newBackupTestAgent(t, server.URL)
+
+	writeSaveFile(t, gameAgent.savesDir(), saveFileName, testSaveContent, time.Now())
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	loopDone := make(chan struct{})
+
+	go func() {
+		defer close(loopDone)
+
+		gameAgent.backupLoop(ctx)
+	}()
+
+	// The loop uploads once at the start and then on every tick.
+	deadline := time.Now().Add(backupTestDeadline)
+
+	for attempts() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the backup loop made no upload attempt")
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+
+	select {
+	case <-loopDone:
+	case <-time.After(backupTestDeadline):
+		t.Fatal("backupLoop did not return after its context ended")
+	}
+}
+
+// TestAgentBackupOnceWithoutASave verifies that a saves directory without
+// a finished save file is logged and skipped: nothing is uploaded and the
+// call returns.
+func TestAgentBackupOnceWithoutASave(t *testing.T) {
+	t.Parallel()
+
+	server, capture := newUploadCaptureServer(t)
+
+	gameAgent := newBackupTestAgent(t, server.URL)
+
+	withinDeadline(t, "backupOnce", func() { gameAgent.backupOnce(t.Context()) })
+
+	path, err := latestSave(gameAgent.savesDir())
+	if !errors.Is(err, errNoSave) {
+		t.Errorf("latestSave() error = %v, want %v", err, errNoSave)
+	}
+
+	if path != "" {
+		t.Errorf("latestSave() = %q, want no path without a save file", path)
+	}
+
+	if uploads := capture.count(); uploads != 0 {
+		t.Errorf("uploads = %d, want none without a save file", uploads)
+	}
+}
+
+// newBackupTestAgent returns an agent on temporary volumes whose backups
+// go to endpointURL.
+func newBackupTestAgent(t *testing.T, endpointURL string) *Agent {
+	t.Helper()
+
+	gameAgent, err := New(logr.Discard(), Options{
+		SaveDir:      t.TempDir(),
+		CacheDir:     t.TempDir(),
+		BackupPeriod: backupTestPeriod,
+	})
+	if err != nil {
+		t.Fatalf("could not create the agent: %v", err)
+	}
+
+	upload, err := newUploader(t.Context(), backupSettings(endpointURL))
+	if err != nil {
+		t.Fatalf("newUploader() error = %v", err)
+	}
+
+	gameAgent.setUploader(upload)
+
+	return gameAgent
 }
 
 // writeSaveFile writes a file below dir with the given modification

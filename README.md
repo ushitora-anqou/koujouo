@@ -97,6 +97,12 @@ kubectl apply -n <namespace> -f examples/configmap.yaml -f examples/secret.yaml
 kubectl apply -n <namespace> -f examples/factorioserver.yaml
 ```
 
+`.spec.gameConfig` is optional: leave it out and the agent writes a minimal
+`config.ini` of its own, so a `FactorioServer` with only the required fields
+starts a default server. The `write-data` path of the delivered `config.ini` is
+rewritten to the save directory either way (config key `saveDir`,
+`/var/lib/koujouo` by default), so the autosaves land on the save volume.
+
 The controller creates the StatefulSet, the agent downloads Factorio
 `2.1.24`, creates a save and starts the server:
 
@@ -156,6 +162,22 @@ create a StatefulSet. The Helm chart always sets it to its own image, so the
 `image` values of the chart are the single place to change it; the
 `controllerImage` key of `examples/manager.yaml` is for `make run` only.
 
+### Image pull secrets
+
+An image in a private registry needs a Secret on both Pods, and the chart covers
+only one of them:
+
+- `imagePullSecrets` of the chart, for the manager Deployment, which the chart
+  passes to its Pod: `--set imagePullSecrets[0].name=<secret>`
+- `.spec.agent.imagePullSecrets` of each `FactorioServer`, for its agent Pod:
+  `imagePullSecrets: [{name: <secret>}]` under `spec.agent`
+
+The chart cannot set the second: the agent Pods are created from the
+`FactorioServer` spec, not from the chart. The Secret has to exist in the
+namespace of the release (`koujouo-system` above) for the manager and in the
+namespace of the `FactorioServer` for the agent; without it, the Pod of that
+namespace stays in `ImagePullBackOff`.
+
 `make run` runs the manager on the host with `examples/manager.yaml`.
 
 ## Known limitations
@@ -163,6 +185,14 @@ create a StatefulSet. The Helm chart always sets it to its own image, so the
 - If the game process exits on its own, for example after a crash, the status
   turns `Failed` and the agent does not restart it. Set `.spec.suspend: true`
   and back to `false`, or change `.spec.gameVersion`, to start it again.
+- The StatefulSet uses the `OnDelete` update strategy, so a controller image
+  update does not replace the agent Pod: the manager streams the new agent
+  binary into the running one and the game keeps running. Every other owned pod
+  setting — `.spec.savePersistentVolumeClaimName`, `.spec.agent.resources`,
+  `.spec.ephemeralVolume`, `.spec.agent.imagePullSecrets` — reaches a running
+  Pod only through a new Pod. The controller deletes the agent Pod when one of
+  them changes, so **the game restarts once** while the new Pod starts and
+  downloads the game again. An image change alone does not restart it.
 - The agent keeps the game binary of every version it ran on the ephemeral
   volume (about 313 MB each). The default volume is 2Gi; raise
   `.spec.ephemeralVolume` after several version changes within the life of one
