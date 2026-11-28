@@ -517,10 +517,35 @@ var _ = Describe("FactorioServer", Ordered, func() {
 			g.Expect(agent.VolumeMounts).To(ConsistOf(
 				HaveField("Name", resources.SavesVolumeName),
 				HaveField("Name", resources.GameVolumeName),
+				// The agent reads its RPC token from the file the
+				// controller mounts read-only.
+				SatisfyAll(
+					HaveField("Name", resources.AgentTokenVolumeName),
+					HaveField("MountPath", resources.AgentTokenMountPath),
+					HaveField("ReadOnly", BeTrue()),
+				),
 			))
 			g.Expect(podSpec.Volumes).To(ContainElement(HaveField(
 				"PersistentVolumeClaim.ClaimName", claimName)))
+			// The token volume mounts the Secret the controller created
+			// for the server.
+			g.Expect(podSpec.Volumes).To(ContainElement(SatisfyAll(
+				HaveField("Name", resources.AgentTokenVolumeName),
+				HaveField("Secret.SecretName",
+					resources.AgentTokenSecretName(getServer(g))),
+			)))
 		}, resourceTimeout, pollInterval).Should(Succeed())
+
+		By("checking that the controller created the RPC token Secret")
+		server := &koujouoanqounetv1.FactorioServer{}
+		Expect(k8sClient.Get(ctx, serverKey, server)).To(Succeed(), "Failed to get the FactorioServer")
+
+		tokenSecret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: factorioNamespace, Name: resources.AgentTokenSecretName(server),
+		}, tokenSecret)).To(Succeed(), "Failed to get the agent token Secret")
+		Expect(tokenSecret.Data[resources.AgentTokenKey]).NotTo(BeEmpty(),
+			"the agent token Secret holds no token")
 
 		By("waiting for the agent Pod to run")
 		expectAgentPodRunning(resourceTimeout)

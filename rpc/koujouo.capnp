@@ -51,24 +51,38 @@ struct AgentStatus {
 }
 
 interface Agent {
+  # The state-changing methods carry the RPC token in a parameter of their
+  # own instead of authenticating the connection once: the agent serves
+  # several connections at a time, so a flag of the agent would let a
+  # client that authenticated once open the way for every other client.
+  # The token is the value of the Secret the controller creates for the
+  # server (`<FactorioServer name>-agent-token`), which the agent Pod
+  # mounts as a file; the agent compares the received token with the file
+  # on every call.
+  #
+  # status takes no token, on purpose: it carries no secret (only the
+  # version and the player count) and the controller polls it before it
+  # knows whether the agent predates the token, so an old agent must keep
+  # answering it.
+
   # configure applies the desired state. It is idempotent. On a game
   # version change it drains the players, stops the game, downloads the
   # new binary and starts it before returning.
-  configure @0 (cfg :Config) -> ();
+  configure @0 (cfg :Config, token :Text) -> ();
 
   # status reports the current agent/game state. The controller polls it.
   status @1 () -> (st :AgentStatus);
 
   # stop gracefully stops the game (drain + save). Returns after the
   # save file has been written and the game process has exited.
-  stop @2 () -> ();
+  stop @2 (token :Text) -> ();
 
   # upgrade replaces the agent binary: the agent returns a ByteStream
   # capability, the controller pushes the new binary through it and ends
   # the stream with done(sha256). The agent verifies the sha256, then
   # execve(2)s the new binary. The Factorio child process keeps running;
   # its pid travels in the environment.
-  upgrade @3 () -> (bin :ByteStream);
+  upgrade @3 (token :Text) -> (bin :ByteStream);
 }
 
 interface ByteStream {

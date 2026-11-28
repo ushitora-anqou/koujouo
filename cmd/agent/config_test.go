@@ -57,6 +57,10 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Errorf("loadConfig returned cacheDir %q, want %q", cfg.CacheDir, "/opt/koujouo")
 	}
 
+	if cfg.TokenFile != "/var/run/koujouo/token" {
+		t.Errorf("loadConfig returned tokenFile %q, want %q", cfg.TokenFile, "/var/run/koujouo/token")
+	}
+
 	if cfg.Log.Development || cfg.Log.Level != "info" {
 		t.Errorf("loadConfig returned the log section %+v, want development=false level=info", cfg.Log)
 	}
@@ -68,6 +72,7 @@ func TestLoadConfigFile(t *testing.T) {
 	cfg, err := loadConfig(writeConfig(t, "agent.yaml", `listenAddress: "127.0.0.1:19550"
 saveDir: /tmp/save
 cacheDir: /tmp/cache
+tokenFile: /tmp/token
 log:
   development: false
   level: debug
@@ -83,6 +88,10 @@ log:
 	if cfg.SaveDir != "/tmp/save" || cfg.CacheDir != "/tmp/cache" {
 		t.Errorf("loadConfig returned saveDir %q and cacheDir %q, want /tmp/save and /tmp/cache",
 			cfg.SaveDir, cfg.CacheDir)
+	}
+
+	if cfg.TokenFile != "/tmp/token" {
+		t.Errorf("loadConfig returned tokenFile %q, want %q", cfg.TokenFile, "/tmp/token")
 	}
 
 	if cfg.Log.Development || cfg.Log.Level != "debug" {

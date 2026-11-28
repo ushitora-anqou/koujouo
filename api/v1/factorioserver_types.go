@@ -196,6 +196,13 @@ type FactorioServerStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// observedConfigHash is the hash of the configuration that was
+	// successfully delivered to the agent. A change of a referenced
+	// ConfigMap or Secret changes the hash, so the controller configures
+	// the agent again without a spec change.
+	// +optional
+	ObservedConfigHash string `json:"observedConfigHash,omitempty"`
+
 	// conditions represent the current state of the FactorioServer.
 	// +listType=map
 	// +listMapKey=type

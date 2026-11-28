@@ -78,7 +78,11 @@ Multi-group layout organizes APIs by group name (e.g., `batch`, `apps`). Check t
 ## How It Works
 
 The manager and the agent are two binaries of one image. They talk
-[Cap'n Proto RPC](rpc/koujouo.capnp) over plain TCP (pod IP, port 9550):
+[Cap'n Proto RPC](rpc/koujouo.capnp) over plain TCP (pod IP, port 9550). The
+transport is **unencrypted**: the NetworkPolicy stays the outer boundary, and
+on top of it every state-changing call (`configure`, `stop`, `upgrade`) carries
+the RPC token of the server, which the agent verifies against the token file it
+mounts. `status` takes no token, on purpose (see the token bullet below).
 
 - **Manager** (`/manager`, the image entrypoint) reconciles each `FactorioServer` into a
   single-replica StatefulSet of agent Pods. It reads the ConfigMaps and Secrets the spec
@@ -92,11 +96,13 @@ The manager and the agent are two binaries of one image. They talk
 
 A running server is reconciled in this order: ensure the StatefulSet and the NetworkPolicy →
 wait for a ready agent Pod → `status` → `upgrade` when the agent reports another build than
-the manager → `configure` when the spec generation or the game version changed → patch the
-status → requeue after 30s. `spec.suspend: true` calls `stop`, deletes the StatefulSet and
-keeps the PVC. A game that exits on its own ends the whole agent rather than only the game:
-the Pod restarts and the new agent resumes the game from the cache it left on the save
-volume (see the next bullet and the known limitations in README.md).
+the manager → resolve the referenced ConfigMaps and Secrets and hash the configuration →
+`configure` when the spec generation, the game version or the configuration hash changed →
+patch the status (also with the hash just delivered) → requeue after 30s. `spec.suspend: true`
+calls `stop`, deletes the StatefulSet and keeps the PVC. A game that exits on its own ends the
+whole agent rather than only the game: the Pod restarts and the new agent resumes the game from
+the cache it left on the save volume (see the next bullet and the known limitations in
+README.md).
 
 - **A game that exits on its own ends the agent, so the kubelet restarts the Pod**
   (`internal/agent/agent.go`, `cmd/agent/main.go`). `watchGame` reports the exit of a game the
@@ -112,16 +118,30 @@ volume (see the next bullet and the known limitations in README.md).
   crash.
 - **The agent Pod is protected by a NetworkPolicy** (`internal/controller/resources/networkpolicy.go`).
   Ingress admits UDP 34197 from any source, because the players connect from anywhere, and
-  TCP 9550 — the unauthenticated, plain-text Cap'n Proto RPC — from the manager namespace
+  TCP 9550 — the token-authenticated but plain-text Cap'n Proto RPC — from the manager namespace
   only. Egress stays open: the agent downloads the game, uploads the saves and posts to
   Discord. The manager namespace comes from `POD_NAMESPACE` of the manager Deployment
   (downward API, `charts/koujouo/templates/deployment.yaml`); `cmd/manager/main.go` falls
   back to the namespace file of the mounted ServiceAccount. An empty `ManagerNamespace`
   (the manager runs outside a cluster) means **no NetworkPolicy is created** and the RPC
-  stays reachable from the whole Pod network; the reconcile logs that once.
+  stays reachable from the whole Pod network; the reconcile logs that once. The token still
+  authenticates the clients there: the policy is the outer boundary, not the only one.
 - **The controller reads the referenced Secrets and ConfigMaps through `APIReader`**, not
   through the cache: they are few and need no cluster-wide watch, and this keeps the
   Secrets out of the manager's memory cache.
+- **A change of a referenced ConfigMap or Secret reaches the agent without a spec change**
+  (`agentConfig.configHash` in `internal/controller/agentconfig.go`). Once the agent is
+  reachable, every reconcile resolves the references and hashes the whole configuration: game
+  version, the file names and contents, the Discord webhook URL, the leave timeout, the backup
+  endpoint/bucket/keys and the download credentials. The hash goes into
+  `status.observedConfigHash` only after a successful configure (never from the progress
+  polls, never after a failure, so the next reconcile retries), and `needsConfigure` compares
+  it as well, so editing `config.ini` or rotating a Secret reconfigures the agent on the next
+  poll without touching the spec. Only the hash reaches the status, never a secret value. A
+  reference that cannot be resolved yet (a ConfigMap, a Secret or a selected key that does
+  not exist) is reported in the `ReferencedResourceMissing` condition and retried after
+  `RetryInterval` (5s) with a clean return instead of a failed reconcile, whose exponential
+  backoff would delay the retry by up to about 16 minutes.
 - **Creating a `FactorioServer` grants reading the Secrets it names.** The spec selectors
   (`notification.discordWebhookURL`, `backup.credentials`, `downloadCredentials`) name any
   Secret of the namespace; the controller delivers the values to the agent, which writes
@@ -129,6 +149,28 @@ volume (see the next bullet and the known limitations in README.md).
   the agent RPC, can read them. This is the intended model — the user of a server owns its
   credentials — so do not add a cross-namespace reference or a webhook that reads Secrets
   on behalf of a user without an authorization check.
+- **The controller creates one RPC token Secret per server and mounts it into the agent Pod**
+  (`ensureAgentToken` in `internal/controller/factorioserver_controller.go`,
+  `resources.AgentTokenSecretName`). `<FactorioServer name>-agent-token` holds a 32-byte random
+  hex token under the key `token`: the controller reads it through `APIReader`, creates it when
+  it is missing with the `FactorioServer` as its owner and **never rotates** it, so only
+  deleting the Secret produces a new token. The agent Pod mounts it read-only at
+  `/var/run/koujouo` with mode 0440, which the `fsGroup` 65532 makes readable for the non-root
+  agent, and the agent reads `<mount>/token` — the `tokenFile` of its configuration.
+- **`configure`, `stop` and `upgrade` carry the token in their call parameters; the agent
+  verifies each call on its own** (`Agent.requireToken`, `internal/agent/agent.go`). A
+  connection-wide `authenticate` call or an `authenticated` flag of the agent would let a
+  client that authenticated once open the way for every other client, because one agent
+  serves several connections at a time. The agent reads the token file on every call, so a
+  recreated Secret reaches it without a restart, and compares with
+  `crypto/subtle.ConstantTimeCompare`. The token never appears in a log, an error or the
+  status. **`status` takes no token**: it carries no secret (only the agent version, the game
+  version and the player count), and the controller polls it before it knows whether the
+  agent verifies a token at all, so an old agent must keep answering. An old agent ignores
+  the new parameter fields and keeps working; a new agent refuses a call whose token is
+  missing or wrong. A missing token file or an empty one is an error, never a way to run
+  without authentication; only an agent started without `tokenFile` and `Token` (the unit
+  tests, a development run) accepts every call.
 - **The pod template hash decides when a Pod is replaced.** The StatefulSet keeps
   `updateStrategy: OnDelete`, so a template change alone reaches no running Pod. The
   controller therefore stamps the hash of the owned pod template fields (labels and spec,
@@ -136,9 +178,10 @@ volume (see the next bullet and the known limitations in README.md).
   `koujouo.anqou.net/template-hash`, the StatefulSet controller copies it into each Pod, and
   a Pod of another hash is deleted so that the StatefulSet recreates it. **Every owned
   template field except the image** — the save PVC name, `spec.agent.resources`, the
-  ephemeral volume, the `imagePullSecrets`, the security contexts, the probe — therefore
-  restarts the game once. An **image-only** change is left out of the hash and reaches the
-  agent only through the in-place upgrade path, so it never restarts the game.
+  ephemeral volume, the `imagePullSecrets`, the security contexts, the probe, the token
+  Secret volume and its mount — therefore restarts the game once. An **image-only** change
+  is left out of the hash and reaches the agent only through the in-place upgrade path, so it
+  never restarts the game.
 - **The agent Pod carries no ServiceAccount token** (`automountServiceAccountToken: false`):
   it never talks to the API server.
 - **The reconciler runs 8 reconciles at a time** (`defaultMaxConcurrentReconciles`): a
@@ -173,7 +216,8 @@ volume (see the next bullet and the known limitations in README.md).
   agent for a build of its own version and skip the in-place upgrade.
 - **The manager RBAC holds no `create`/`delete` on `FactorioServer`s** — the user owns the
   CR — but it holds `delete` on Pods, which recreates the agent Pod of a changed pod
-  template, plus the whole NetworkPolicy rule set.
+  template, the whole NetworkPolicy rule set, and `create` on Secrets for the RPC token
+  Secret of each server; `configmaps` stays at `get;list;watch`.
 
 
 **Configuration.** Both binaries are Cobra commands whose only flag is `--config <path>`, the
@@ -188,7 +232,10 @@ environment variables for its configuration.
   Its `controllerImage` names the image the agent StatefulSets run, so it usually holds the
   manager's own image; empty leaves the controller unable to create a StatefulSet.
 - The agent reads `/etc/koujouo/agent.yaml`, which the Nix image holds (flake.nix writes it with
-  `pkgs.writeText`). The agent Pod mounts no ConfigMap.
+  `pkgs.writeText`). The agent Pod mounts no ConfigMap. `tokenFile` names the mounted RPC token
+  file (default `/var/run/koujouo/token`), the one input the controller writes as a volume
+  instead of sending it over the RPC. The agent reads it on every `configure`, `stop` and
+  `upgrade` call; the file wins over `Options.Token`, which only the tests set.
 
 ## Nix Development Environment
 
@@ -328,7 +375,9 @@ binary until the new manager replaces it. Keep these couplings intact:
   cluster-wide watch, and the manager then caches no Secret. The agent caches the
   last configuration in `agent-state.json` (mode 0600) on the save volume to resume after a Pod
   restart. Never mount these objects into the Pod, and never print that file into logs, docs or
-  test output: it holds the delivered secrets and the RCON password in clear text.
+  test output: it holds the delivered secrets and the RCON password in clear text. The RPC token
+  Secret is the exception: the controller creates it itself, it carries no user credential, and
+  it reaches the agent as the `tokenFile` mount.
 - **Reconciler concurrency**: `defaultMaxConcurrentReconciles` is 8. A configure call takes
   minutes (drain plus download) and the reconcile waits for it, so a single worker would hold
   back every other `FactorioServer` that long. A status call is bounded by 30 seconds
@@ -597,8 +646,11 @@ code:
 | `callAgentStop` runs under `context.WithoutCancel`: the reconcile deadline does not end it | `internal/controller/agentstop_internal_test.go` |
 | The NetworkPolicy ports, its manager-namespace source, its survival of a suspension and its absence without `ManagerNamespace` | `factorioserver_controller_test.go`, "When reconciling the agent NetworkPolicy" |
 | A changed pod template (save PVC, `spec.agent.resources`) recreates the Pod, an image-only change does not, and the annotations the controller does not own survive | `factorioserver_controller_test.go`, "When the agent Pod runs an outdated pod template" |
+| The RPC token Secret of a server: its creation with an owner reference, the unchanged token on the next reconcile, a new token only after a deletion, and the volume and read-only mount of the pod template (also repaired on an existing StatefulSet) | `factorioserver_controller_test.go`, "When reconciling the agent token Secret" and "When the agent is reachable" |
+| The RPC token in the calls: configure, stop and upgrade carry the token of the Secret, while `status` answers without one; a wrong token is refused by configure, stop and upgrade, and the agent re-reads the token file on every call | `factorioserver_controller_test.go` ("When the agent is reachable", "When suspending the server", "When the agent runs another version"), `internal/agent/agent_test.go` (`TestAgentRejectsAWrongToken`, `TestAgentReadsTheTokenFile`) |
 | Suspension: the stop call, the StatefulSet and PVC end state, the unreachable agent (the StatefulSet stays), the unready Pod (no stop) and the stop that outlives the reconcile deadline | `factorioserver_controller_test.go`, "When suspending the server" |
 | A restarted Pod: the server turns `Pending` while the crashed agent is gone and continues with the agent that resumed the cached configuration, which needs no `configure` | `factorioserver_controller_test.go`, "When the agent crashed and the Pod restarted" |
+| A referenced ConfigMap or Secret that changes reconfigures the agent on the next reconcile (and only then), and a reference that cannot be resolved yet is retried after `RetryInterval` instead of failing the reconcile | `factorioserver_controller_test.go`, "When a referenced ConfigMap or Secret changes" and "When a spec reference cannot be resolved" |
 | Long game output lines, a webhook that does not answer, an overlong stream that must still be drained | `internal/agent/logs_test.go` |
 | The default `config.ini` of a configuration without `spec.gameConfig`, and the delivered one winning | `internal/agent/config_test.go` |
 | `Shutdown` returning at its deadline while a configure holds the lock, the resume retry of a transient failure, a game that exits on its own reaching `Fatal()` and a graceful stop staying out of it | `internal/agent/agent_test.go` |

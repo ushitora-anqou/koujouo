@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive // Ginkgo DSL imports are the framework convention.
@@ -154,6 +155,104 @@ var _ = Describe("FactorioServer Controller", func() {
 		})
 	})
 
+	Context("When reconciling the agent token Secret", func() {
+		const serverName = "fsrv-token"
+
+		BeforeEach(func() {
+			createTestPVC(ctx, serverName+"-saves")
+			createMinimalServer(ctx, serverName, serverName+"-saves")
+		})
+
+		AfterEach(func() {
+			deleteTestObjects(ctx, serverName)
+		})
+
+		It("should create the token Secret with an owner reference", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := fetchAgentTokenSecret(ctx, serverName)
+
+			Expect(secret.Data).To(HaveKey(resources.AgentTokenKey))
+			// 32 random bytes, hex encoded.
+			Expect(string(secret.Data[resources.AgentTokenKey])).To(MatchRegexp("^[0-9a-f]{64}$"))
+
+			owner := metav1.GetControllerOf(secret)
+			Expect(owner).NotTo(BeNil())
+			Expect(owner.Kind).To(Equal("FactorioServer"))
+			Expect(owner.Name).To(Equal(serverName))
+		})
+
+		It("should keep the token of an existing Secret", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			created := fetchAgentTokenSecret(ctx, serverName)
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			kept := fetchAgentTokenSecret(ctx, serverName)
+
+			// The token is not rotated: the agent of the running Pod keeps
+			// the file it mounted.
+			Expect(kept.Data[resources.AgentTokenKey]).To(Equal(created.Data[resources.AgentTokenKey]))
+			Expect(kept.ResourceVersion).To(Equal(created.ResourceVersion))
+		})
+
+		It("should create a new token when the Secret is deleted", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			removed := fetchAgentTokenSecret(ctx, serverName)
+			Expect(k8sClient.Delete(ctx, removed)).To(Succeed())
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			recreated := fetchAgentTokenSecret(ctx, serverName)
+			Expect(recreated.Data[resources.AgentTokenKey]).NotTo(BeEmpty())
+			Expect(recreated.Data[resources.AgentTokenKey]).NotTo(Equal(removed.Data[resources.AgentTokenKey]))
+		})
+
+		It("should mount the token Secret on a StatefulSet written before it", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Simulate a StatefulSet created by a controller that did not
+			// mount the token Secret yet: the volume and the mount of an
+			// owned field have to come back, or the Pod of the new template
+			// would start without the token.
+			existing := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: testNamespace, Name: serverName,
+			}, existing)).To(Succeed())
+
+			existing.Spec.Template.Spec.Volumes = slices.DeleteFunc(existing.Spec.Template.Spec.Volumes,
+				func(volume corev1.Volume) bool { return volume.Name == resources.AgentTokenVolumeName })
+			existing.Spec.Template.Spec.Containers[0].VolumeMounts = slices.DeleteFunc(
+				existing.Spec.Template.Spec.Containers[0].VolumeMounts,
+				func(mount corev1.VolumeMount) bool { return mount.Name == resources.AgentTokenVolumeName })
+
+			Expect(k8sClient.Update(ctx, existing)).To(Succeed())
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			repaired := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: testNamespace, Name: serverName,
+			}, repaired)).To(Succeed())
+
+			Expect(volumeByName(repaired.Spec.Template.Spec.Volumes, resources.AgentTokenVolumeName).
+				Secret.SecretName).To(Equal(resources.AgentTokenSecretName(fetchServer(ctx, serverName))))
+
+			mounts := repaired.Spec.Template.Spec.Containers[0].VolumeMounts
+			Expect(volumeMountByName(mounts, resources.AgentTokenVolumeName).MountPath).
+				To(Equal(resources.AgentTokenMountPath))
+		})
+	})
+
 	Context("When the agent is reachable", func() {
 		const serverName = "fsrv-run"
 
@@ -184,6 +283,29 @@ var _ = Describe("FactorioServer Controller", func() {
 			// A private registry needs the Secret on the agent Pod.
 			Expect(statefulSet.Spec.Template.Spec.ImagePullSecrets).To(ConsistOf(
 				corev1.LocalObjectReference{Name: serverName + "-registry"}))
+		})
+
+		It("should mount the agent token Secret read-only", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			statefulSet := expectAgentStatefulSet(ctx, serverName, serverName+"-saves")
+			podSpec := statefulSet.Spec.Template.Spec
+
+			// The volume mounts the Secret the controller created.
+			Expect(fetchAgentTokenSecret(ctx, serverName).Data).To(HaveKey(resources.AgentTokenKey))
+
+			tokenVolume := volumeByName(podSpec.Volumes, resources.AgentTokenVolumeName)
+			Expect(tokenVolume.Secret).NotTo(BeNil())
+			Expect(tokenVolume.Secret.SecretName).To(Equal(resources.AgentTokenSecretName(fetchServer(ctx, serverName))))
+			// fsGroup 65532 reads the file as its group, so 0440 is enough
+			// and the agent needs no ownership of the Secret.
+			Expect(tokenVolume.Secret.DefaultMode).NotTo(BeNil())
+			Expect(*tokenVolume.Secret.DefaultMode).To(Equal(int32(0o440)))
+
+			mount := volumeMountByName(podSpec.Containers[0].VolumeMounts, resources.AgentTokenVolumeName)
+			Expect(mount.MountPath).To(Equal(resources.AgentTokenMountPath))
+			Expect(mount.ReadOnly).To(BeTrue())
 		})
 
 		It("should keep the game running across controller image upgrades", func() {
@@ -276,6 +398,11 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(sent.downloadUsername).To(Equal("test-username"))
 			Expect(sent.downloadToken).To(Equal("test-token"))
 
+			// The call carries the token of the Secret the controller
+			// created, which the agent compares with its mounted file.
+			Expect(sent.token).To(Equal(
+				string(fetchAgentTokenSecret(ctx, serverName).Data[resources.AgentTokenKey])))
+
 			server := fetchServer(ctx, serverName)
 			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseRunning))
 			Expect(server.Status.CurrentGameVersion).To(Equal(testGameVersion))
@@ -328,6 +455,40 @@ var _ = Describe("FactorioServer Controller", func() {
 			configurations := fakeAgent.configurations()
 			Expect(configurations).To(HaveLen(2))
 			Expect(configurations[1].gameVersion).To(Equal(testGameVersion))
+		})
+
+		It("should retry a configure after the agent reported a failure", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeAgent.configurations()).To(HaveLen(1))
+
+			server := fetchServer(ctx, serverName)
+			Expect(server.Status.ObservedGeneration).To(Equal(server.Generation))
+
+			// The agent applies the configuration before it downloads and
+			// starts the game, so a failed configure still reports the game
+			// version of the spec: only the phase tells the failure apart.
+			fakeAgent.setPhase(rpcapi.Phase_failed)
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testPollInterval))
+
+			configurations := fakeAgent.configurations()
+			Expect(configurations).To(HaveLen(2))
+			Expect(configurations[1].gameVersion).To(Equal(testGameVersion))
+
+			server = fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseRunning))
+			Expect(server.Status.ObservedGeneration).To(Equal(server.Generation))
+
+			By("not configuring again once the agent runs")
+
+			fakeAgent.setPhase(rpcapi.Phase_running)
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeAgent.configurations()).To(HaveLen(2))
 		})
 
 		It("should report draining and saving while the agent applies a version change", func() {
@@ -479,6 +640,67 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(server.Status.CurrentGameVersion).To(Equal(testGameVersion))
 			Expect(server.Status.ObservedGeneration).To(Equal(server.Generation))
 			expectCondition(server, "Ready", metav1.ConditionTrue, "Running")
+		})
+	})
+
+	Context("When a referenced ConfigMap or Secret changes", func() {
+		const serverName = "fsrv-refchange"
+
+		BeforeEach(func() {
+			createTestPVC(ctx, serverName+"-saves")
+			createTestConfigMap(ctx, serverName+"-config")
+			createTestSecret(ctx, serverName+"-secrets")
+			createFullServer(ctx, serverName)
+			createReadyAgentPod(ctx, serverName)
+		})
+
+		AfterEach(func() {
+			deleteTestObjects(ctx, serverName)
+		})
+
+		It("should reconfigure the agent when the referenced ConfigMap changes", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeAgent.configurations()).To(HaveLen(1))
+
+			delivered := fetchServer(ctx, serverName).Status.ObservedConfigHash
+			Expect(delivered).NotTo(BeEmpty())
+
+			// Only the content of the ConfigMap changes: the generation of
+			// the FactorioServer never sees an edit of a referenced object.
+			updateTestConfigMapData(ctx, serverName+"-config", configINIKey,
+				"[path]\nwrite-data=/var/lib/koujouo/write-data\n[general]\nauto-save-interval=10\n")
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testPollInterval))
+			Expect(fakeAgent.configurations()).To(HaveLen(2))
+
+			Expect(fetchServer(ctx, serverName).Status.ObservedConfigHash).NotTo(Equal(delivered))
+
+			By("not configuring again while the ConfigMap stays as it is")
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeAgent.configurations()).To(HaveLen(2))
+		})
+
+		It("should deliver a changed Secret value on the next configure", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeAgent.configurations()).To(HaveLen(1))
+
+			const rotated = "https://discord.example.com/webhook/rotated"
+
+			updateTestSecretData(ctx, serverName+"-secrets", "discordWebhookURL", rotated)
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testPollInterval))
+
+			configurations := fakeAgent.configurations()
+			Expect(configurations).To(HaveLen(2))
+			Expect(configurations[1].discordWebhookURL).To(Equal(rotated))
 		})
 	})
 
@@ -750,6 +972,11 @@ var _ = Describe("FactorioServer Controller", func() {
 
 			Expect(fakeAgent.stopCount()).To(Equal(1))
 
+			// The stop call carries the token of the Secret, or the agent
+			// refuses to stop the game.
+			Expect(fakeAgent.stopTokensOf()).To(ConsistOf(
+				string(fetchAgentTokenSecret(ctx, serverName).Data[resources.AgentTokenKey])))
+
 			stsKey := types.NamespacedName{Namespace: testNamespace, Name: serverName}
 			stsLookupErr := k8sClient.Get(ctx, stsKey, &appsv1.StatefulSet{})
 			Expect(errors.IsNotFound(stsLookupErr)).To(BeTrue())
@@ -976,6 +1203,12 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(upgrades).To(HaveLen(1))
 
 			upgrade := upgrades[0]
+
+			// The upgrade call carries the token of the Secret, or the agent
+			// hands out no ByteStream.
+			Expect(upgrade.token).To(Equal(
+				string(fetchAgentTokenSecret(ctx, serverName).Data[resources.AgentTokenKey])))
+
 			Expect(upgrade.binary).To(Equal(binary))
 			Expect(upgrade.sizes).To(Equal([]int{
 				expectedAgentChunkSize, expectedAgentChunkSize, expectedAgentChunkSize, testAgentBinaryTail,
@@ -1050,7 +1283,7 @@ var _ = Describe("FactorioServer Controller", func() {
 			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
 				spec.GameConfig = &koujouoanqounetv1.GameConfigSpec{
 					Config: &corev1.ConfigMapKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: serverName + "-missing"},
+						LocalObjectReference: corev1.LocalObjectReference{Name: serverName + "-config"},
 						Key:                  configINIKey,
 					},
 					ServerWhitelist: nil,
@@ -1062,14 +1295,32 @@ var _ = Describe("FactorioServer Controller", func() {
 			deleteTestObjects(ctx, serverName)
 		})
 
-		It("should report the missing reference and fail the reconcile", func() {
-			_, err := reconcileOnce(ctx, reconciler, serverName)
-			Expect(err).To(HaveOccurred())
+		It("should report the missing reference and retry after the retry interval", func() {
+			// A failing reconcile backs off exponentially, so the retry
+			// would take minutes; the missing reference is not an error of
+			// the controller but a state the user is about to fix.
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testRetryInterval))
 
 			server := fetchServer(ctx, serverName)
 			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseFailed))
 			expectCondition(server, "Ready", metav1.ConditionFalse, "ReferencedResourceMissing")
 			expectCondition(server, "Progressing", metav1.ConditionFalse, "ReferencedResourceMissing")
+			Expect(fakeAgent.configurations()).To(BeEmpty())
+
+			By("configuring the agent once the reference exists")
+
+			createTestConfigMap(ctx, serverName+"-config")
+
+			result, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testPollInterval))
+			Expect(fakeAgent.configurations()).To(HaveLen(1))
+
+			server = fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseRunning))
+			Expect(server.Status.ObservedConfigHash).NotTo(BeEmpty())
 		})
 	})
 
@@ -1208,6 +1459,17 @@ func fetchServer(ctx context.Context, name string) *koujouoanqounetv1.FactorioSe
 	return server
 }
 
+// fetchAgentTokenSecret returns the token Secret of the named
+// FactorioServer.
+func fetchAgentTokenSecret(ctx context.Context, serverName string) *corev1.Secret {
+	secret := &corev1.Secret{}
+	name := resources.AgentTokenSecretName(fetchServer(ctx, serverName))
+
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, secret)).To(Succeed())
+
+	return secret
+}
+
 // updateServerSpec updates the spec of the named FactorioServer.
 func updateServerSpec(
 	ctx context.Context,
@@ -1261,6 +1523,27 @@ func createTestSecret(ctx context.Context, name string) {
 	}
 
 	Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+}
+
+// updateTestConfigMapData changes one key of the named ConfigMap, like a
+// user editing config.ini in place. The generation of the FactorioServer
+// that refers to it does not change.
+func updateTestConfigMapData(ctx context.Context, name, key, value string) {
+	configMap := &corev1.ConfigMap{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, configMap)).To(Succeed())
+
+	configMap.Data[key] = value
+	Expect(k8sClient.Update(ctx, configMap)).To(Succeed())
+}
+
+// updateTestSecretData changes one key of the named Secret, like a
+// credential rotation.
+func updateTestSecretData(ctx context.Context, name, key, value string) {
+	secret := &corev1.Secret{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, secret)).To(Succeed())
+
+	secret.Data[key] = []byte(value)
+	Expect(k8sClient.Update(ctx, secret)).To(Succeed())
 }
 
 // createMinimalServer creates a FactorioServer with only the required
@@ -1451,6 +1734,12 @@ func deleteTestObjects(ctx context.Context, serverName string) {
 	_ = k8sClient.Delete(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: serverName + "-secrets"},
 	})
+	_ = k8sClient.Delete(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      serverName + "-agent-token",
+		},
+	})
 }
 
 // deleteTestPVC deletes the test PVC. The API server adds the
@@ -1522,11 +1811,18 @@ func expectAgentStatefulSet(ctx context.Context, serverName, pvcName string) *ap
 		mountPaths = append(mountPaths, mount.MountPath)
 	}
 
-	Expect(mountPaths).To(ConsistOf(resources.SavesMountPath, resources.GameMountPath))
+	Expect(mountPaths).To(ConsistOf(
+		resources.SavesMountPath, resources.GameMountPath, resources.AgentTokenMountPath))
 
 	savesVolume := volumeByName(podSpec.Volumes, resources.SavesVolumeName)
 	Expect(savesVolume.PersistentVolumeClaim).NotTo(BeNil())
 	Expect(savesVolume.PersistentVolumeClaim.ClaimName).To(Equal(pvcName))
+
+	// The agent reads its RPC token from the Secret the controller owns.
+	tokenVolume := volumeByName(podSpec.Volumes, resources.AgentTokenVolumeName)
+	Expect(tokenVolume.Secret).NotTo(BeNil())
+	Expect(tokenVolume.Secret.SecretName).To(
+		Equal(resources.AgentTokenSecretName(fetchServer(ctx, serverName))))
 
 	gameVolume := volumeByName(podSpec.Volumes, resources.GameVolumeName)
 	Expect(gameVolume.Ephemeral).NotTo(BeNil())
@@ -1602,4 +1898,17 @@ func volumeByName(volumes []corev1.Volume, name string) corev1.Volume {
 	Fail("no volume named " + name)
 
 	return corev1.Volume{}
+}
+
+// volumeMountByName returns the volume mount with the given name.
+func volumeMountByName(mounts []corev1.VolumeMount, name string) corev1.VolumeMount {
+	for _, mount := range mounts {
+		if mount.Name == name {
+			return mount
+		}
+	}
+
+	Fail("no volume mount named " + name)
+
+	return corev1.VolumeMount{}
 }

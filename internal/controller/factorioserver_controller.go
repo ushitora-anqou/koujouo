@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -51,6 +53,10 @@ import (
 
 var errControllerImageUnset = errors.New("controllerImage of the manager configuration is not set")
 
+// errAgentTokenEmpty is returned when the agent token Secret exists but
+// carries no token.
+var errAgentTokenEmpty = errors.New("the agent token Secret holds no token")
+
 const (
 	// defaultPollInterval is how often the agent status is polled.
 	defaultPollInterval = 30 * time.Second
@@ -65,6 +71,11 @@ const (
 	// defaultMaxConcurrentReconciles is how many FactorioServers are
 	// reconciled at the same time.
 	defaultMaxConcurrentReconciles = 8
+
+	// agentTokenBytes is the number of random bytes of a new agent token.
+	// The token is delivered as hex, so the file holds twice as many
+	// characters.
+	agentTokenBytes = 32
 )
 
 // FactorioServerReconciler reconciles a FactorioServer object.
@@ -125,7 +136,8 @@ type FactorioServerReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
@@ -229,7 +241,10 @@ func (r *FactorioServerReconciler) reconcileActive(
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
 ) (ctrl.Result, error) {
-	templateHash, err := r.ensureAgentObjects(ctx, log, server)
+	// The token goes to every configure, stop and upgrade call: the agent
+	// verifies it on each of them, because its RPC is reachable by any
+	// client the NetworkPolicy admits.
+	templateHash, token, err := r.ensureAgentObjects(ctx, log, server)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -259,7 +274,7 @@ func (r *FactorioServerReconciler) reconcileActive(
 
 	if needsAgentUpgrade(pod, reported) {
 		// The deferred release above keeps covering the outdated agent.
-		upgraded, status, upgradeErr := r.upgradeAgent(ctx, log, server, pod, agent.Agent, reported.agentVersion)
+		upgraded, status, upgradeErr := r.upgradeAgent(ctx, log, server, pod, agent.Agent, reported.agentVersion, token)
 		if upgradeErr != nil {
 			return ctrl.Result{}, upgradeErr
 		}
@@ -269,13 +284,48 @@ func (r *FactorioServerReconciler) reconcileActive(
 		agent, reported = upgraded, status
 	}
 
-	reported, err = r.configureIfNeeded(ctx, log, server, agent.Agent, reported)
+	return r.configureAndReport(ctx, log, server, agent.Agent, reported, token)
+}
+
+// configureAndReport resolves the configuration of the agent from the
+// referenced ConfigMaps and Secrets, sends it when the agent needs it and
+// reflects the state of the agent on the status. It runs only once the agent
+// is reachable: every reconcile reads the objects through the API server,
+// which is wasted while there is no agent to configure. token is the RPC
+// token the agent verifies on the configure call.
+func (r *FactorioServerReconciler) configureAndReport(
+	ctx context.Context,
+	log logr.Logger,
+	server *koujouoanqounetv1.FactorioServer,
+	agent rpcapi.Agent,
+	reported *agentStatus,
+	token string,
+) (ctrl.Result, error) {
+	config, err := r.buildAgentConfig(ctx, server)
+	if err != nil {
+		if !errors.Is(err, errMissingReference) {
+			return ctrl.Result{}, fmt.Errorf("could not build the agent config: %w", err)
+		}
+
+		return r.requeueMissingReference(ctx, log, server, err)
+	}
+
+	configHash, err := config.configHash()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	reported, err = r.configureIfNeeded(ctx, log, server, agent, reported, config, configHash, token)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	err = r.patchStatus(ctx, server, func(status *koujouoanqounetv1.FactorioServerStatus) {
 		syncAgentStatus(status, server.Generation, reported)
+		// The agent holds this configuration (delivered now, or already
+		// current when needsConfigure was false), so the next reconcile
+		// sends it again only once the hash changes.
+		status.ObservedConfigHash = configHash
 	})
 	if err != nil {
 		return ctrl.Result{}, err
@@ -284,34 +334,50 @@ func (r *FactorioServerReconciler) reconcileActive(
 	return ctrl.Result{RequeueAfter: r.pollInterval()}, nil //nolint:exhaustruct_v5 // Only the poll interval is set.
 }
 
-// configureIfNeeded sends the full configuration when the spec changed
-// and returns the agent state to report.
+// requeueMissingReference reports a ConfigMap or Secret the spec refers to
+// and that cannot be resolved yet, and retries after the short retry
+// interval. A reconcile that fails instead backs off exponentially, which
+// would delay the retry after the user created the object by up to about 16
+// minutes.
+func (r *FactorioServerReconciler) requeueMissingReference(
+	ctx context.Context,
+	log logr.Logger,
+	server *koujouoanqounetv1.FactorioServer,
+	referenceErr error,
+) (ctrl.Result, error) {
+	log.Error(referenceErr, "Could not resolve the referenced ConfigMap or Secret")
+
+	message := fmt.Sprintf("Could not resolve the spec references: %v", referenceErr)
+
+	err := r.patchStatus(ctx, server, func(status *koujouoanqounetv1.FactorioServerStatus) {
+		syncReferenceErrorStatus(status, server.Generation, message)
+	})
+	if err != nil {
+		return ctrl.Result{}, errors.Join(referenceErr, err)
+	}
+
+	return ctrl.Result{RequeueAfter: r.retryInterval()}, nil //nolint:exhaustruct_v5 // Only the retry interval is set.
+}
+
+// configureIfNeeded sends the full configuration when the agent needs it and
+// returns the agent state to report. The configuration and its hash come from
+// the caller, which resolved them once, so this reads neither a ConfigMap nor
+// a Secret again. token is the RPC token the agent verifies on the call.
 func (r *FactorioServerReconciler) configureIfNeeded(
 	ctx context.Context,
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
 	agent rpcapi.Agent,
 	reported *agentStatus,
+	config *agentConfig,
+	configHash string,
+	token string,
 ) (*agentStatus, error) {
-	if !r.needsConfigure(server, reported) {
+	if !r.needsConfigure(server, reported, configHash) {
 		return reported, nil
 	}
 
-	config, err := r.buildAgentConfig(ctx, server)
-	if err != nil {
-		message := fmt.Sprintf("Could not resolve the spec references: %v", err)
-
-		patchErr := r.patchStatus(ctx, server, func(status *koujouoanqounetv1.FactorioServerStatus) {
-			syncReferenceErrorStatus(status, server.Generation, message)
-		})
-		if patchErr != nil {
-			return nil, errors.Join(err, patchErr)
-		}
-
-		return nil, fmt.Errorf("could not build the agent config: %w", err)
-	}
-
-	err = r.callAgentConfigure(ctx, agent, config, r.progressReporter(ctx, log, server))
+	err := r.callAgentConfigure(ctx, agent, config, token, r.progressReporter(ctx, log, server))
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +435,15 @@ func (r *FactorioServerReconciler) reconcileSuspended(
 	}
 
 	if found {
-		err = r.stopAgentOfPod(ctx, log, server, pod)
+		// The stop call carries the token. A suspended server runs no agent
+		// any more, so the token is read from the Secret as it is: this path
+		// creates none.
+		token, err := r.readAgentToken(ctx, server)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		err = r.stopAgentOfPod(ctx, log, server, pod, token)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -390,14 +464,17 @@ func (r *FactorioServerReconciler) reconcileSuspended(
 	return ctrl.Result{}, err
 }
 
-// stopAgentOfPod asks the agent of pod to stop the game gracefully.
-// When the pod is not reachable, the stop is skipped: the pod
-// termination then signals the agent, which saves on SIGTERM.
+// stopAgentOfPod asks the agent of pod to stop the game gracefully. The
+// call carries token, the RPC token of the server, which the agent verifies
+// before it stops the game. When the pod is not reachable, the stop is
+// skipped: the pod termination then signals the agent, which saves on
+// SIGTERM.
 func (r *FactorioServerReconciler) stopAgentOfPod(
 	ctx context.Context,
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
 	pod *corev1.Pod,
+	token string,
 ) error {
 	if pod.Status.PodIP == "" || !podIsReady(pod) {
 		log.Info("Skipping graceful agent stop", "reason", "agent Pod is not ready")
@@ -411,7 +488,7 @@ func (r *FactorioServerReconciler) stopAgentOfPod(
 	}
 	defer agent.Release()
 
-	err = r.callAgentStop(ctx, agent.Agent, r.progressReporter(ctx, log, server))
+	err = r.callAgentStop(ctx, agent.Agent, token, r.progressReporter(ctx, log, server))
 	if err != nil {
 		return err
 	}
@@ -444,14 +521,26 @@ func (r *FactorioServerReconciler) progressReporter(
 }
 
 // needsConfigure reports whether the agent must receive a new full
-// configuration: on a game version drift or whenever the spec generation
-// changed since the last reconcile.
+// configuration: on a game version drift, whenever the spec generation
+// changed since the last reconcile, while the agent reports a failure, which
+// keeps the game version of the configuration it applied before the download
+// or the game start failed, or when the resolved configuration differs from
+// the one delivered last. The last one covers a referenced ConfigMap or
+// Secret that changed without touching the spec: neither bumps the
+// generation, and an agent that resumed from its cached state would otherwise
+// keep the stale values.
 func (r *FactorioServerReconciler) needsConfigure(
 	server *koujouoanqounetv1.FactorioServer,
 	reported *agentStatus,
+	configHash string,
 ) bool {
+	if reported.phase == rpcapi.Phase_failed {
+		return true
+	}
+
 	return reported.gameVersion != server.Spec.GameVersion ||
-		server.Status.ObservedGeneration != server.Generation
+		server.Status.ObservedGeneration != server.Generation ||
+		server.Status.ObservedConfigHash != configHash
 }
 
 // agentPodUnavailable reports whether the agent pod cannot be dialed
@@ -519,25 +608,138 @@ func (r *FactorioServerReconciler) recreateAgentPod(
 	return r.requeueWaitingForAgent(ctx, server, "Recreating the agent Pod for the changed pod template")
 }
 
-// ensureAgentObjects creates the StatefulSet and the NetworkPolicy of
-// server, synchronizes both and returns the hash of the desired pod
-// template.
+// ensureAgentObjects creates the token Secret, the StatefulSet and the
+// NetworkPolicy of server, synchronizes the last two and returns the hash of
+// the desired pod template and the RPC token of the agent.
 func (r *FactorioServerReconciler) ensureAgentObjects(
 	ctx context.Context,
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
-) (string, error) {
+) (string, string, error) {
+	// The token comes first: the StatefulSet mounts its Secret, so the Pod
+	// of a new StatefulSet must find the Secret.
+	token, err := r.ensureAgentToken(ctx, log, server)
+	if err != nil {
+		return "", "", err
+	}
+
 	templateHash, err := r.ensureStatefulSet(ctx, log, server)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	err = r.ensureNetworkPolicy(ctx, log, server)
 	if err != nil {
+		return "", "", err
+	}
+
+	return templateHash, token, nil
+}
+
+// ensureAgentToken returns the RPC token of the agent of server. It creates
+// the Secret holding the token when it is missing and otherwise returns the
+// token already there: the token is never rotated, so only a user who deletes
+// the Secret gets a new one.
+func (r *FactorioServerReconciler) ensureAgentToken(
+	ctx context.Context,
+	log logr.Logger,
+	server *koujouoanqounetv1.FactorioServer,
+) (string, error) {
+	key := types.NamespacedName{Namespace: server.Namespace, Name: resources.AgentTokenSecretName(server)}
+
+	secret := &corev1.Secret{}
+
+	err := r.reader().Get(ctx, key, secret)
+	if err == nil {
+		return agentTokenOf(secret)
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("could not get the agent token Secret: %w", err)
+	}
+
+	token, err := newAgentToken()
+	if err != nil {
 		return "", err
 	}
 
-	return templateHash, nil
+	secret = &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name},
+		Data:       map[string][]byte{resources.AgentTokenKey: []byte(token)},
+	}
+
+	err = controllerutil.SetControllerReference(server, secret, r.Scheme)
+	if err != nil {
+		return "", fmt.Errorf("could not set the controller reference on the agent token Secret: %w", err)
+	}
+
+	err = r.Create(ctx, secret)
+	if err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return "", fmt.Errorf("could not create the agent token Secret: %w", err)
+		}
+
+		// Another reconcile created the Secret first. Its token is the one
+		// the agent Pod of the StatefulSet already reads.
+		err = r.reader().Get(ctx, key, secret)
+		if err != nil {
+			return "", fmt.Errorf("could not get the agent token Secret: %w", err)
+		}
+
+		return agentTokenOf(secret)
+	}
+
+	log.Info("Created the agent token Secret", "name", key.Name)
+
+	return token, nil
+}
+
+// readAgentToken returns the RPC token of the agent of server from its
+// Secret. The suspension path reads the token here instead of through
+// ensureAgentToken: a suspended server runs no agent that could need a
+// Secret, so this creates none. A missing Secret or an empty token is an
+// error, because the stop call then cannot authenticate itself.
+func (r *FactorioServerReconciler) readAgentToken(
+	ctx context.Context,
+	server *koujouoanqounetv1.FactorioServer,
+) (string, error) {
+	name := resources.AgentTokenSecretName(server)
+
+	secret := &corev1.Secret{}
+
+	err := r.reader().Get(ctx, types.NamespacedName{Namespace: server.Namespace, Name: name}, secret)
+	if err != nil {
+		return "", fmt.Errorf("could not get the agent token Secret %s: %w", name, err)
+	}
+
+	token, err := agentTokenOf(secret)
+	if err != nil {
+		return "", err
+	}
+
+	return token, nil
+}
+
+// agentTokenOf returns the token of the Secret.
+func agentTokenOf(secret *corev1.Secret) (string, error) {
+	token := secret.Data[resources.AgentTokenKey]
+	if len(token) == 0 {
+		return "", fmt.Errorf("secret %s: %w", secret.Name, errAgentTokenEmpty)
+	}
+
+	return string(token), nil
+}
+
+// newAgentToken returns a random hex token for the agent RPC.
+func newAgentToken() (string, error) {
+	buffer := make([]byte, agentTokenBytes)
+
+	_, err := rand.Read(buffer)
+	if err != nil {
+		return "", fmt.Errorf("could not read random bytes for the agent token: %w", err)
+	}
+
+	return hex.EncodeToString(buffer), nil
 }
 
 // ensureStatefulSet creates the StatefulSet of server when it is missing
@@ -592,11 +794,11 @@ func (r *FactorioServerReconciler) ensureStatefulSet(
 }
 
 // ensureNetworkPolicy creates the NetworkPolicy of the agent Pod of server
-// and synchronizes it. The agent RPC is unauthenticated and plain text, so
-// the policy admits it from the manager namespace only. Without a manager
-// namespace the policy would admit no source at all, which would cut the
-// manager off from the agent; the controller then leaves the policy out and
-// warns once.
+// and synchronizes it. The agent RPC is plain text and every state-changing
+// call carries the token in clear, so the policy admits the RPC port from
+// the manager namespace only. Without a manager namespace the policy would
+// admit no source at all, which would cut the manager off from the agent;
+// the controller then leaves the policy out and warns once.
 func (r *FactorioServerReconciler) ensureNetworkPolicy(
 	ctx context.Context,
 	log logr.Logger,
@@ -778,11 +980,31 @@ func volumesDrifted(existing, desired []corev1.Volume) bool {
 		return true
 	}
 
+	existingTokenSecret, existingTokenMode := secretVolumeSourceOf(
+		volumeOf(existing, resources.AgentTokenVolumeName))
+	desiredTokenSecret, desiredTokenMode := secretVolumeSourceOf(
+		volumeOf(desired, resources.AgentTokenVolumeName))
+
+	if existingTokenSecret != desiredTokenSecret || existingTokenMode != desiredTokenMode {
+		return true
+	}
+
 	existingGame := volumeOf(existing, resources.GameVolumeName)
 	desiredGame := volumeOf(desired, resources.GameVolumeName)
 
 	return ephemeralStorageOf(existingGame) != ephemeralStorageOf(desiredGame) ||
 		!equality.Semantic.DeepEqual(ephemeralAccessModesOf(existingGame), ephemeralAccessModesOf(desiredGame))
+}
+
+// secretVolumeSourceOf returns the Secret name and the default mode of a
+// Secret volume, or empty values when the volume is absent or of another
+// type.
+func secretVolumeSourceOf(volume *corev1.Volume) (string, int32) {
+	if volume == nil || volume.Secret == nil || volume.Secret.DefaultMode == nil {
+		return "", 0
+	}
+
+	return volume.Secret.SecretName, *volume.Secret.DefaultMode
 }
 
 // volumeOf returns the volume with the given name, or nil.

@@ -73,8 +73,10 @@ func needsAgentUpgrade(pod *corev1.Pod, reported *agentStatus) bool {
 
 // upgradeAgent pushes the agent binary of the controller image to the
 // agent, which execve(2)s it and thereby drops the connection the binary
-// arrived on. It returns the connection to the upgraded agent with its
-// status. The caller keeps owning the capability of the outdated agent.
+// arrived on. The call carries the RPC token of the server, which the
+// agent verifies before it accepts a byte. It returns the connection to
+// the upgraded agent with its status. The caller keeps owning the
+// capability of the outdated agent.
 func (r *FactorioServerReconciler) upgradeAgent(
 	ctx context.Context,
 	log logr.Logger,
@@ -82,8 +84,9 @@ func (r *FactorioServerReconciler) upgradeAgent(
 	pod *corev1.Pod,
 	agent rpcapi.Agent,
 	outdated string,
+	token string,
 ) (*AgentClient, *agentStatus, error) {
-	err := r.pushAgentBinary(ctx, agent)
+	err := r.pushAgentBinary(ctx, agent, token)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -101,11 +104,13 @@ func (r *FactorioServerReconciler) upgradeAgent(
 }
 
 // pushAgentBinary streams the agent binary of the controller image to
-// agent and ends the stream with its sha256. The agent execve(2)s the new
-// binary to complete the upgrade, which closes the connection before it
-// can answer, so a stream that ends in a disconnect is accepted too;
-// dialUpgradedAgent then confirms that the new agent answers.
-func (r *FactorioServerReconciler) pushAgentBinary(ctx context.Context, agent rpcapi.Agent) error {
+// agent and ends the stream with its sha256. The call carries the RPC
+// token of the server, which the agent verifies before it opens the
+// stream. The agent execve(2)s the new binary to complete the upgrade,
+// which closes the connection before it can answer, so a stream that ends
+// in a disconnect is accepted too; dialUpgradedAgent then confirms that
+// the new agent answers.
+func (r *FactorioServerReconciler) pushAgentBinary(ctx context.Context, agent rpcapi.Agent, token string) error {
 	binary, err := os.Open(r.agentBinaryPath())
 	if err != nil {
 		return fmt.Errorf("could not open the agent binary: %w", err)
@@ -113,7 +118,9 @@ func (r *FactorioServerReconciler) pushAgentBinary(ctx context.Context, agent rp
 
 	defer binary.Close() //nolint:errcheck // The binary was only read.
 
-	future, release := agent.Upgrade(ctx, nil)
+	future, release := agent.Upgrade(ctx, func(params rpcapi.Agent_upgrade_Params) error {
+		return params.SetToken(token)
+	})
 	defer release()
 
 	results, err := future.Struct()

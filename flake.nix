@@ -104,6 +104,7 @@
           listenAddress: ":9550"
           saveDir: /var/lib/koujouo
           cacheDir: /opt/koujouo
+          tokenFile: /var/run/koujouo/token
           log:
             development: false
             level: info

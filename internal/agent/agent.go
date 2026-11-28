@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -72,6 +73,11 @@ var (
 	// exits with no error of its own, which the agent did not ask for
 	// either.
 	errUnexpectedGameExit = errors.New("factorio exited unexpectedly")
+
+	// errUnauthenticated is returned by a state-changing RPC call that
+	// carries another token than the one the controller created for this
+	// agent. It never mentions the token itself.
+	errUnauthenticated = errors.New("the RPC token is invalid")
 )
 
 // Options configures an Agent. The zero values of the optional fields
@@ -84,6 +90,17 @@ type Options struct {
 	// CacheDir is the directory for the downloaded game binaries and
 	// the received agent upgrades, on the ephemeral volume.
 	CacheDir string
+
+	// TokenFile is the file holding the RPC token the controller created
+	// for this agent. The agent reads it when it authenticates its RPC
+	// clients; the controller mounts the token Secret on the pod. It has
+	// precedence over Token.
+	TokenFile string
+
+	// Token is the RPC token the agent expects without a token file. The
+	// production agent takes the token from TokenFile; the unit tests set
+	// this field instead, and an empty token accepts any call.
+	Token string
 
 	// HTTPClient issues the game download and the webhook posts.
 	// Defaults to a plain client.
@@ -118,9 +135,21 @@ type Options struct {
 // Agent manages the Factorio process of one pod and implements the
 // Agent capability the controller talks to.
 type Agent struct {
-	log        logr.Logger
-	saveDir    string
-	cacheDir   string
+	log      logr.Logger
+	saveDir  string
+	cacheDir string
+
+	// tokenFile holds the RPC token the controller created for this agent,
+	// in the file of the mounted token Secret. The agent reads the file on
+	// every call that carries a token, so a rotated or recreated Secret
+	// reaches it without a restart.
+	tokenFile string
+
+	// token is the expected RPC token when tokenFile is empty. An empty
+	// token accepts every call: the unit tests and a development agent
+	// pass no token, while the production agent always gets a tokenFile.
+	token string
+
 	httpClient *http.Client
 	execBinary func(path string, argv []string, env []string) error
 	dialRcon   rconDialer
@@ -203,6 +232,8 @@ func New(log logr.Logger, options Options) (*Agent, error) {
 		log:                 log,
 		saveDir:             options.SaveDir,
 		cacheDir:            options.CacheDir,
+		tokenFile:           options.TokenFile,
+		token:               options.Token,
 		httpClient:          options.HTTPClient,
 		execBinary:          options.ExecBinary,
 		dialRcon:            options.DialRcon,
@@ -279,6 +310,16 @@ func (a *Agent) Resume(ctx context.Context) {
 // downloads the binary of the new version when needed and starts the
 // game before returning.
 func (a *Agent) Configure(ctx context.Context, call rpcapi.Agent_configure) error {
+	token, err := call.Args().Token()
+	if err != nil {
+		return fmt.Errorf("could not read the configure token: %w", err)
+	}
+
+	err = a.requireToken(token)
+	if err != nil {
+		return fmt.Errorf("could not authenticate the configure call: %w", err)
+	}
+
 	// A Cap'n Proto server services one call at a time until the
 	// handler calls Go. Applying the configuration drains, downloads
 	// and starts, so the status calls must be serviced meanwhile.
@@ -337,11 +378,21 @@ func (a *Agent) Status(_ context.Context, call rpcapi.Agent_status) error {
 // Stop gracefully stops the game and returns once the save file has
 // been written and the game process has exited.
 func (a *Agent) Stop(ctx context.Context, call rpcapi.Agent_stop) error {
+	token, err := call.Args().Token()
+	if err != nil {
+		return fmt.Errorf("could not read the stop token: %w", err)
+	}
+
+	err = a.requireToken(token)
+	if err != nil {
+		return fmt.Errorf("could not authenticate the stop call: %w", err)
+	}
+
 	// Let the server service the status calls while the drain and the
 	// save are in progress; see Configure.
 	call.Go()
 
-	err := a.stop(ctx)
+	err = a.stop(ctx)
 	if err != nil {
 		return fmt.Errorf("could not stop the game: %w", err)
 	}
@@ -392,6 +443,16 @@ func (a *Agent) Shutdown(ctx context.Context) error {
 // Upgrade returns the ByteStream capability the controller pushes the
 // new agent binary through.
 func (a *Agent) Upgrade(_ context.Context, call rpcapi.Agent_upgrade) error {
+	token, err := call.Args().Token()
+	if err != nil {
+		return fmt.Errorf("could not read the upgrade token: %w", err)
+	}
+
+	err = a.requireToken(token)
+	if err != nil {
+		return fmt.Errorf("could not authenticate the upgrade call: %w", err)
+	}
+
 	receiver, err := newBinReceiver(a)
 	if err != nil {
 		return fmt.Errorf("could not receive the agent binary: %w", err)
@@ -1053,6 +1114,57 @@ func (a *Agent) stop(ctx context.Context) error {
 	defer a.mu.Unlock()
 
 	return a.stopLocked(ctx)
+}
+
+// requireToken verifies the token a state-changing RPC call carries.
+// Every call is verified on its own: the agent serves several connections
+// at a time, so a flag of the agent would let a client that authenticated
+// once open the way for every other client.
+//
+// An empty expected token accepts every call, whatever the call carries:
+// only an agent started without a token file and without a token (the
+// unit tests, a development run) reaches it, because expectedToken turns a
+// missing or empty token file into an error instead.
+func (a *Agent) requireToken(received string) error {
+	expected, err := a.expectedToken()
+	if err != nil {
+		return err
+	}
+
+	if expected == "" {
+		return nil
+	}
+
+	if subtle.ConstantTimeCompare([]byte(received), []byte(expected)) != 1 {
+		return errUnauthenticated
+	}
+
+	return nil
+}
+
+// expectedToken returns the token a call has to carry. The token file is
+// read on every call, so a rotated or recreated Secret reaches the agent
+// without a restart. An empty token accepts every call: the unit tests and
+// a development agent pass none, while the production agent always gets
+// the token file of its Pod.
+func (a *Agent) expectedToken() (string, error) {
+	if a.tokenFile == "" {
+		return a.token, nil
+	}
+
+	content, err := os.ReadFile(a.tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("could not read the RPC token file: %w", err)
+	}
+
+	token := strings.TrimSpace(string(content))
+	if token == "" {
+		// An empty file is no way to run without authentication: the
+		// controller always writes a token into the Secret.
+		return "", errUnauthenticated
+	}
+
+	return token, nil
 }
 
 // readRPCConfig reads the Config struct of a configure call.

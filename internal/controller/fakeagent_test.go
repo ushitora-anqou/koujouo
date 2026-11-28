@@ -48,8 +48,10 @@ var (
 	errFakeChecksum = errors.New("the received agent binary is invalid")
 )
 
-// recordedConfig captures what the controller sent to configure.
+// recordedConfig captures what the controller sent to configure, including
+// the RPC token the real agent verifies.
 type recordedConfig struct {
+	token                 string
 	gameVersion           string
 	fileNames             []string
 	discordWebhookURL     string
@@ -64,6 +66,9 @@ type recordedConfig struct {
 
 // recordedUpgrade captures one agent upgrade the fake received.
 type recordedUpgrade struct {
+	// token is the RPC token of the upgrade call.
+	token string
+
 	// binary is the concatenation of the received chunks.
 	binary []byte
 
@@ -84,6 +89,10 @@ type fakeAgentServer struct {
 	players     uint16
 	configured  []recordedConfig
 	stopped     int
+
+	// stopTokens lists the RPC tokens of the stop calls in order. The fake
+	// does not verify them; the controller tests check what it sent.
+	stopTokens []string
 
 	// agentVersion is the version the status reports; an upgrade
 	// switches it to the version of this build unless keepAgentVersion
@@ -160,6 +169,11 @@ func readConfigureArgs(call rpcapi.Agent_configure) (*recordedConfig, error) {
 	}
 
 	recorded := &recordedConfig{}
+
+	recorded.token, err = call.Args().Token()
+	if err != nil {
+		return nil, fmt.Errorf("could not read the configure token: %w", err)
+	}
 
 	recorded.gameVersion, err = config.GameVersion()
 	if err != nil {
@@ -304,8 +318,14 @@ func (f *fakeAgentServer) Status(_ context.Context, call rpcapi.Agent_status) er
 	return nil
 }
 
-// Stop records the stop and reports the suspended phase.
+// Stop records the stop, including its RPC token, and reports the
+// suspended phase.
 func (f *fakeAgentServer) Stop(_ context.Context, call rpcapi.Agent_stop) error {
+	token, err := call.Args().Token()
+	if err != nil {
+		return fmt.Errorf("could not read the stop token: %w", err)
+	}
+
 	f.mutex.Lock()
 	hold := f.holdStop
 	f.mutex.Unlock()
@@ -320,9 +340,10 @@ func (f *fakeAgentServer) Stop(_ context.Context, call rpcapi.Agent_stop) error 
 	defer f.mutex.Unlock()
 
 	f.stopped++
+	f.stopTokens = append(f.stopTokens, token)
 	f.phase = rpcapi.Phase_suspended
 
-	_, err := call.AllocResults()
+	_, err = call.AllocResults()
 	if err != nil {
 		return fmt.Errorf("could not allocate the stop results: %w", err)
 	}
@@ -331,14 +352,20 @@ func (f *fakeAgentServer) Stop(_ context.Context, call rpcapi.Agent_stop) error 
 }
 
 // Upgrade returns the ByteStream capability the controller pushes the
-// new agent binary through.
+// new agent binary through. The token is recorded on the stream, so the
+// upgrade record carries it.
 func (f *fakeAgentServer) Upgrade(_ context.Context, call rpcapi.Agent_upgrade) error {
+	token, err := call.Args().Token()
+	if err != nil {
+		return fmt.Errorf("could not read the upgrade token: %w", err)
+	}
+
 	results, err := call.AllocResults()
 	if err != nil {
 		return fmt.Errorf("could not allocate the upgrade results: %w", err)
 	}
 
-	stream := rpcapi.ByteStream_ServerToClient(&fakeByteStream{agent: f})
+	stream := rpcapi.ByteStream_ServerToClient(&fakeByteStream{agent: f, token: token})
 
 	err = results.SetBin(stream)
 	if err != nil {
@@ -377,6 +404,7 @@ func (f *fakeAgentServer) setPhase(phase rpcapi.Phase) {
 // ends, like the real agent before it execve(2)s the binary.
 type fakeByteStream struct {
 	agent  *fakeAgentServer
+	token  string
 	buffer bytes.Buffer
 	sizes  []int
 }
@@ -434,6 +462,7 @@ func (f *fakeAgentServer) exec(stream *fakeByteStream, sum []byte) error {
 	defer f.mutex.Unlock()
 
 	f.upgrades = append(f.upgrades, recordedUpgrade{
+		token:  stream.token,
 		binary: slices.Clone(stream.buffer.Bytes()),
 		sizes:  slices.Clone(stream.sizes),
 		sha256: slices.Clone(sum),
@@ -495,6 +524,14 @@ func (f *fakeAgentServer) stopCount() int {
 	defer f.mutex.Unlock()
 
 	return f.stopped
+}
+
+// stopTokensOf returns the RPC tokens of the stop calls in order.
+func (f *fakeAgentServer) stopTokensOf() []string {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	return slices.Clone(f.stopTokens)
 }
 
 // setGameVersion overrides the reported game version.

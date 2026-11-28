@@ -692,6 +692,13 @@ spec:
                 currentGameVersion:
                   description: currentGameVersion is the game version the agent reports running.
                   type: string
+                observedConfigHash:
+                  description: |-
+                    observedConfigHash is the hash of the configuration that was
+                    successfully delivered to the agent. A change of a referenced
+                    ConfigMap or Secret changes the hash, so the controller configures
+                    the agent again without a spec change.
+                  type: string
                 observedGeneration:
                   description: |-
                     observedGeneration is the .metadata.generation the status was

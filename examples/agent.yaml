@@ -16,6 +16,11 @@ saveDir: /var/lib/koujouo
 # upgrade cache. Its content is lost with the pod.
 cacheDir: /opt/koujouo
 
+# File holding the RPC token of this agent. The controller creates the token
+# as a Secret of the namespace and mounts it into the pod; the file is its
+# only copy outside the manager.
+tokenFile: /var/run/koujouo/token
+
 # Logging.
 log:
   # Log in the human-readable console encoding instead of JSON.

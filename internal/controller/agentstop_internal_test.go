@@ -36,6 +36,9 @@ const (
 
 	// stopTestWait bounds the wait for the call once the agent answered.
 	stopTestWait = 5 * time.Second
+
+	// stopTestToken is the RPC token the stop call carries.
+	stopTestToken = "stop-test-token"
 )
 
 // errUnexpectedCall marks an agent method the stop test never expects.
@@ -95,7 +98,7 @@ func TestCallAgentStopIgnoresTheReconcileDeadline(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- reconciler.callAgentStop(ctx, capability, nil)
+		done <- reconciler.callAgentStop(ctx, capability, stopTestToken, nil)
 	}()
 
 	select {

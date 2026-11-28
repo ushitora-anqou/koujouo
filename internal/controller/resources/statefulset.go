@@ -56,11 +56,31 @@ const (
 	// ephemeral volume.
 	GameVolumeName = "game"
 
+	// AgentTokenVolumeName mounts the Secret holding the RPC token of the
+	// agent.
+	AgentTokenVolumeName = "agent-token"
+
 	// SavesMountPath is where the save PersistentVolumeClaim is mounted.
 	SavesMountPath = "/var/lib/koujouo"
 
 	// GameMountPath is where the ephemeral game volume is mounted.
 	GameMountPath = "/opt/koujouo"
+
+	// AgentTokenMountPath is where the RPC token Secret is mounted, so the
+	// token file is <AgentTokenMountPath>/<AgentTokenKey>.
+	AgentTokenMountPath = "/var/run/koujouo" //nolint:gosec // A directory, not a credential.
+
+	// AgentTokenKey is the key of the RPC token in its Secret, and the name
+	// of the file the agent reads the token from.
+	AgentTokenKey = "token"
+
+	// agentTokenSecretSuffix is appended to the FactorioServer name to name
+	// the Secret holding the RPC token; see AgentTokenSecretName.
+	agentTokenSecretSuffix = "-agent-token"
+
+	// agentTokenFileMode is the mode of the mounted token file. The agent
+	// runs as uid 65532 and reads the file as the group of fsGroup 65532.
+	agentTokenFileMode int32 = 0o440
 
 	// GamePortName is the name of the Factorio game UDP port.
 	GamePortName = "game"
@@ -109,6 +129,13 @@ const (
 	// game ephemeral volume to when the spec omits it.
 	defaultEphemeralStorage = "2Gi"
 )
+
+// AgentTokenSecretName returns the name of the Secret that holds the RPC
+// token of the agent of server. The controller creates the Secret and the
+// StatefulSet builder mounts it, so both name it here.
+func AgentTokenSecretName(server *koujouoanqounetv1.FactorioServer) string {
+	return server.Name + agentTokenSecretSuffix
+}
 
 // BuildStatefulSet returns the desired StatefulSet of server. The agent
 // runs as PID 1 with the same image as the controller; the save data is
@@ -167,10 +194,12 @@ func BuildStatefulSet(
 
 // podTemplateHash returns the hash of the pod template fields the
 // controller owns: the labels of the template and its spec, with the agent
-// container image blanked out. The agent replaces its own binary in place,
-// so an image change alone must not recreate the Pod; every other owned
-// field reaches the Pod only through a new Pod, because the StatefulSet
-// update strategy is OnDelete.
+// container image blanked out. The volumes and the volume mounts are part
+// of the spec, so the token Secret volume and its mount change the hash as
+// well. The agent replaces its own binary in place, so an image change
+// alone must not recreate the Pod; every other owned field reaches the Pod
+// only through a new Pod, because the StatefulSet update strategy is
+// OnDelete.
 func podTemplateHash(podSpec corev1.PodSpec, labels map[string]string) (string, error) {
 	hashed := podSpec.DeepCopy()
 
@@ -253,6 +282,7 @@ func agentContainer(server *koujouoanqounetv1.FactorioServer, controllerImage st
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: SavesVolumeName, MountPath: SavesMountPath},
 			{Name: GameVolumeName, MountPath: GameMountPath},
+			{Name: AgentTokenVolumeName, MountPath: AgentTokenMountPath, ReadOnly: true},
 		},
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: new(false),
@@ -289,6 +319,18 @@ func agentVolumes(server *koujouoanqounetv1.FactorioServer) []corev1.Volume {
 			Name: GameVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				Ephemeral: ephemeralVolumeSource(server.Spec.EphemeralVolume),
+			},
+		},
+		{
+			// The token Secret belongs to the controller: unlike the
+			// Secrets the spec refers to, it is delivered to the agent as a
+			// file and never over the RPC.
+			Name: AgentTokenVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  AgentTokenSecretName(server),
+					DefaultMode: new(agentTokenFileMode),
+				},
 			},
 		},
 	}

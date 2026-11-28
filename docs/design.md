@@ -8,7 +8,7 @@
 
 - controller イメージに agent バイナリを同梱する（CNPG 方式）。`spec.agent.image` は存在しない。
 - agent は PID 1 として `/kojouo/agent` を実行する。tini 不要（agent が子プロセスを回収する）。
-- controller ↔ agent は Cap'n Proto RPC over plain TCP（TLS なし、pod IP 直、port 9550）。
+- controller ↔ agent は Cap'n Proto RPC over plain TCP（TLS なし、pod IP 直、port 9550）。状態を変える RPC（configure / stop / upgrade）は、サーバーごとに controller が作るトークンを呼び出しごとに検証する（§6）。status は秘密を運ばないため認証しない。
 - ゲームバイナリは agent が `https://factorio.com/get-download/{version}/headless/linux64` から generic ephemeral volume へダウンロードする。
 - セーブは既存 PVC、Service はユーザー側 Helm chart が用意する。
 - API group は `koujouo.anqou.net` に修正する（現状 `koujouo.anqou.net.koujouo.anqou.net`）。
@@ -61,13 +61,18 @@ c := rpc.NewConn(rpc.NewStreamTransport(conn), nil) // Options は nil でよい
 defer c.Close()
 a := rpcapi.Agent(c.Bootstrap(ctx))
 f, release := a.Configure(ctx, func(ps rpcapi.Agent_configure_Params) error {
+	if err := ps.SetToken(token); err != nil { // §6 の RPC トークン
+		return err
+	}
 	return setConfig(ps.Cfg(), cfg)
 })
 defer release()
 _, err = f.Struct() // 戻り値の解決を待つ
 ```
 
-**ストリーミング（agent バイナリ送信）**。capability は**戻り値**で受け取る。`write` は呼び出し側から server へデータを送るメソッドなので、引数で capability を渡しても agent 側は受け取れない（実装時に検証）。そのため `upgrade @3 () -> (bin :ByteStream);` とし、controller が戻り値の capability に書き込む:
+configure / stop / upgrade はパラメータにトークンを持つ。status はトークンを持たない（秘密を運ばず、controller がトークンの有無を知る前の旧 agent にも問い合わせるため）。
+
+**ストリーミング（agent バイナリ送信）**。capability は**戻り値**で受け取る。`write` は呼び出し側から server へデータを送るメソッドなので、引数で capability を渡しても agent 側は受け取れない（実装時に検証）。そのため `upgrade @3 (token :Text) -> (bin :ByteStream);` とし、controller が戻り値の capability に書き込む:
 
 ```go
 f, release := a.Upgrade(ctx)
@@ -317,6 +322,7 @@ log:
 listenAddress: ":9550"
 saveDir: /var/lib/koujouo
 cacheDir: /opt/koujouo
+tokenFile: /var/run/koujouo/token
 log:
   development: true
   level: info
@@ -357,9 +363,9 @@ Kubernetes API conventions（`sig-architecture/api-conventions.md`）と CloudNa
 | `gameConfig.configMapRef` | `gameConfig.config corev1.ConfigMapKeySelector`（required） | キー指定が必要なため `LocalObjectReference` ではなく `ConfigMapKeySelector`。フィールド名は用途ベース |
 | `gameConfig.whitelistConfigMapRef` | `gameConfig.serverWhitelist *corev1.ConfigMapKeySelector`（optional） | Factorio 用語は server whitelist。キー指定が必要なため同上 |
 | （プランのコメントのみ）`downloadCredentials` | `downloadCredentials {username, token *corev1.SecretKeySelector}`（optional） | experimental/旧版ビルドの `?username=&token=` 用。Secret 参照は SecretKeySelector で統一 |
-| status: `phase` + conditions + `currentGameVersion` + `players` | `phase`（string enum）+ `conditions`（metav1.Condition）+ `currentGameVersion` + `onlinePlayers` + `observedGeneration` | conventions では phase は非推奨だが CNPG をはじめ実在 operator で普遍であり、プランが STATUS 列表示を要求するため維持する。機械判定は conditions（`Ready` / `Progressing` / `Suspended`）で行い、phase は人間向けサマリと位置付ける。`players` は CNPG の `readyInstances` 流儀で主語を明確にした |
+| status: `phase` + conditions + `currentGameVersion` + `players` | `phase`（string enum）+ `conditions`（metav1.Condition）+ `currentGameVersion` + `onlinePlayers` + `observedGeneration` + `observedConfigHash` | conventions では phase は非推奨だが CNPG をはじめ実在 operator で普遍であり、プランが STATUS 列表示を要求するため維持する。機械判定は conditions（`Ready` / `Progressing` / `Suspended`）で行い、phase は人間向けサマリと位置付ける。`players` は CNPG の `readyInstances` 流儀で主語を明確にした。`observedConfigHash` は agent に届けた設定のハッシュで、参照先の ConfigMap / Secret の変更（generation を変えない）を configure の再送につなげる |
 
-Secret/ConfigMap の取得責任は controller にあり、取得した値は Cap'n Proto で agent へ渡す（volume mount しない）。したがって RBAC には configmaps/secrets の `get` が必要。
+Secret/ConfigMap の取得責任は controller にあり、取得した値は Cap'n Proto で agent へ渡す（volume mount しない）。したがって RBAC には configmaps/secrets の `get` が必要。例外は controller 自身が作る RPC トークンの Secret で、これだけは Pod に mount する（§6）。
 
 ### 3.2 Go struct 最終案
 
@@ -526,6 +532,13 @@ type FactorioServerStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// observedConfigHash is the hash of the configuration that was
+	// successfully delivered to the agent. A change of a referenced
+	// ConfigMap or Secret changes the hash, so the controller configures
+	// the agent again without a spec change.
+	// +optional
+	ObservedConfigHash string `json:"observedConfigHash,omitempty"`
+
 	// conditions represent the current state of the FactorioServer.
 	// +listType=map
 	// +listMapKey=type
@@ -571,11 +584,12 @@ RBAC マーカー（controller 側に追加）:
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 ```
 
-`factorioservers` の `create` と `delete` は付与しない。`FactorioServer` はユーザーのものであり、controller が作るのは子オブジェクト（StatefulSet・NetworkPolicy・Pod）だけである。逆に `pods` の `delete` は必要: `OnDelete` の StatefulSet は pod template の変更を動いている Pod に届けないので、controller 自身が Pod を削除して作り直す（§6）。
+`factorioservers` の `create` と `delete` は付与しない。`FactorioServer` はユーザーのものであり、controller が作るのは子オブジェクト（StatefulSet・NetworkPolicy・Secret・Pod）だけである。逆に `pods` の `delete` は必要: `OnDelete` の StatefulSet は pod template の変更を動いている Pod に届けないので、controller 自身が Pod を削除して作り直す（§6）。`secrets` の `create` は RPC トークンの Secret（後述）のためだけに要り、`configmaps` は読み取りのみに留める。
 
 StatefulSet の要点（`internal/controller/resources/statefulset.go`）:
 
@@ -586,17 +600,22 @@ StatefulSet の要点（`internal/controller/resources/statefulset.go`）:
 - `ports`: `{name: game, containerPort: 34197, protocol: UDP}` と `{name: rpc, containerPort: 9550, protocol: TCP}`
 - `livenessProbe`: 名前 `rpc`（TCP 9550）への `tcpSocket`。initialDelay 10 秒・period 20 秒・timeout 5 秒・failureThreshold 3。agent はゲーム起動前（listener を開いた時点）から RPC を提供し、drain 中も応答し続けるので、接続拒否は agent の停止を意味する。controller は接続を再試行するため initialDelay を置く
 - `automountServiceAccountToken: false`（agent は API server と話さない）
-- `volumeMounts`: `/var/lib/koujouo`（saves、spec.savePersistentVolumeClaimName）と `/opt/koujouo`（ephemeral、バイナリ）
+- `volumeMounts`: `/var/lib/koujouo`（saves、spec.savePersistentVolumeClaimName）、`/opt/koujouo`（ephemeral、バイナリ）、`/var/run/koujouo`（RPC トークンの Secret、read-only）
+- `volumes`: 上の 2 つに加えて `agent-token`（`secretVolumeSource`、`secretName: <FactorioServer 名>-agent-token`、`defaultMode: 0440`。fsGroup 65532 が group で読めるようにするため）
 - `imagePullSecrets`: `spec.agent.imagePullSecrets` をそのまま写す（プライベートレジストリ用）
 - `terminationGracePeriodSeconds: 900`（leaveTimeout の上限 300 秒 + セーブ書き込みの待機上限 5 分 + 余裕。pod 削除時に agent が drain と保存を完結させる）
 - `securityContext`: nonroot、`seccompProfile: RuntimeDefault`、`allowPrivilegeEscalation: false`、`readOnlyRootFilesystem: true`（書き込みは volume のみ）
 - `template.annotations` に `koujouo.anqou.net/template-hash`（下記）
 
-**pod template ハッシュ**: controller が所有する pod template のフィールド（labels と spec）の sha256 を、`agent` コンテナの `image` だけ空にして計算する。`OnDelete` の StatefulSet は template の変更を動いている Pod に届けないため、controller は Pod の annotation を desired なハッシュと比べ、違えば Pod を削除する（StatefulSet が作り直す）。image を除くのは、image の変更がインプレース更新（§6）だけで反映されるべきだから: 含めると controller イメージ更新のたびにゲームが再起動する。裏返しとして、image 以外の所有フィールド（save PVC、resources、ephemeral volume、imagePullSecrets、securityContext、probe）を変えると、ゲームが一度再起動する。
+**pod template ハッシュ**: controller が所有する pod template のフィールド（labels と spec）の sha256 を、`agent` コンテナの `image` だけ空にして計算する。`OnDelete` の StatefulSet は template の変更を動いている Pod に届けないため、controller は Pod の annotation を desired なハッシュと比べ、違えば Pod を削除する（StatefulSet が作り直す）。image を除くのは、image の変更がインプレース更新（§6）だけで反映されるべきだから: 含めると controller イメージ更新のたびにゲームが再起動する。裏返しとして、image 以外の所有フィールド（save PVC、resources、ephemeral volume、imagePullSecrets、securityContext、probe、トークン Secret の volume と mount）を変えると、ゲームが一度再起動する。トークン Secret の mount を追加したときに既存のサーバーが 1 回だけゲームを再起動するのはこのため。
 
-**NetworkPolicy**（`internal/controller/resources/networkpolicy.go`）: agent の RPC は認証なしの平文なので、ingress を「UDP 34197 は任意の送信元」「TCP 9550 は manager の namespace のみ」に絞る。egress は制限しない（ゲームのダウンロード、S3、Discord）。manager の namespace は Deployment の `POD_NAMESPACE`（downward API）から取り、`cmd/manager/main.go` は ServiceAccount の namespace ファイルを fallback にする。`ManagerNamespace` が空（クラスタ外で動く manager）だと NetworkPolicy を作らない: 空の namespace selector はどの送信元も許さず、manager が agent から締め出されるため。この場合 RPC は pod ネットワーク全体から到達可能になり、reconcile が警告を 1 回だけログに出す。NetworkPolicy は `FactorioServer` を owner とするので、削除は GC に任せ、suspend では消さない（resume で作り直す必要がない）。
+**NetworkPolicy**（`internal/controller/resources/networkpolicy.go`）: agent の RPC はトークンで認証するが平文なので、ingress を「UDP 34197 は任意の送信元」「TCP 9550 は manager の namespace のみ」に絞る。egress は制限しない（ゲームのダウンロード、S3、Discord）。manager の namespace は Deployment の `POD_NAMESPACE`（downward API）から取り、`cmd/manager/main.go` は ServiceAccount の namespace ファイルを fallback にする。`ManagerNamespace` が空（クラスタ外で動く manager）だと NetworkPolicy を作らない: 空の namespace selector はどの送信元も許さず、manager が agent から締め出されるため。この場合 RPC は pod ネットワーク全体から到達可能になり、reconcile が警告を 1 回だけログに出す（トークンの検証は効いたままである）。NetworkPolicy は `FactorioServer` を owner とするので、削除は GC に任せ、suspend では消さない（resume で作り直す必要がない）。
 
 **Secret / ConfigMap の読み方**: `APIReader`（API server 直、キャッシュなし）で読む。参照される Secret は数が少なく cluster-wide の watch も要らないうえ、manager のメモリキャッシュに Secret を残さずに済む。`readConfigMapKey` / `readSecretKey` はこの reader を使う。
+
+**agent RPC トークン**: controller は `FactorioServer` ごとに `<FactorioServer 名>-agent-token` Secret を作る（`ensureAgentToken`、`resources.AgentTokenSecretName`）。キー `token` に 32 バイトの暗号論的乱数を hex で入れ、`FactorioServer` を owner reference にする。既存の Secret は `APIReader` で読み、あればその値をそのまま使う（ローテーションしない）: ユーザーが Secret を消したときだけ新しいトークンになる。作成が `AlreadyExists` で競合したら読み直して既存の値を使う。Pod へは `agent-token` volume として `/var/run/koujouo` に read-only・`defaultMode: 0440` で mount し、agent は `tokenFile`（既定 `/var/run/koujouo/token`）でそのファイルを指す。`volumesDrifted` は Secret 名と `defaultMode` を比べるので、トークン mount より前に作られた StatefulSet にも volume と mount が修復される。
+
+**トークンの検証**: agent は `configure` / `stop` / `upgrade` の呼び出しパラメータから `token` を読み（`Agent.requireToken`）、`tokenFile` を毎回読み直して `strings.TrimSpace` した値と `crypto/subtle.ConstantTimeCompare` で比べる。接続単位の `authenticate` メソッドや agent 全体の `authenticated` フラグは使わない: agent は複数の接続を同時に処理するので、グローバルなフラグだと 1 回認証したクライアントが他の接続の攻撃者まで通してしまう。呼び出しごとの検証なら、パラメータのフィールド追加だけなので既存のメソッド ID とフィールド番号は変わらず、旧 agent は新しいフィールドを無視してそのまま動く（新 controller は常にトークンを送る）。`tokenFile` が空で `Options.Token` も空なら認証なしで通す（単体テストと開発用のみ。本番の `cmd/agent` は必ず `tokenFile` を渡す）。`tokenFile` が読めない、または空なら `errUnauthenticated` を返す（本番でのトークン欠落を許可しない）。トークンはログ・エラー・status に出さない。`status` はトークンを要求しない: 秘密（バージョンと人数）を運ばず、controller は旧 agent（トークンを知らないビルド）のバージョン確認のためにもトークン無しで呼ぶ。トークンは平文 RPC 上を流れるので、これだけで盗聴に耐えるわけではなく、NetworkPolicy とノードの信頼が前提に残る。`reconcileSuspended` は `readAgentToken` で Secret を読むだけで、停止中のサーバー用に新しい Secret は作らない。
 
 **並行度と status の期限**: `MaxConcurrentReconciles` は 8。configure は drain とダウンロードで数分かかり、reconcile はその完了を待つので、worker が 1 つだと他の `FactorioServer` の reconcile がその間ずっと止まる（workqueue は同じ key を並行実行しないため、1 つのサーバーの reconcile は直列のまま）。`status` 呼び出しは 30 秒（`defaultAgentStatusTimeout`）で打ち切る: 応答しない agent が 1 回のポーリング分だけを費やし、待機全体を占領しない。
 
@@ -655,24 +674,33 @@ struct AgentStatus {
 }
 
 interface Agent {
+  # 状態を変えるメソッドは、接続単位の認証ではなく呼び出しごとに token を
+  # 検証する（agent は複数の接続を同時に処理するため、agent 全体のフラグだと
+  # 一度認証したクライアントが他の接続の攻撃者まで通してしまう）。
+  # token は controller が作る Secret `<FactorioServer 名>-agent-token` の値で、
+  # agent Pod にはファイルとして mount される。agent は呼び出しごとに
+  # ファイルを読み直し、crypto/subtle.ConstantTimeCompare で比べる。
+  # status はトークンを取らない: 秘密（バージョンと人数だけ）を運ばず、
+  # controller は旧 agent の存在を知る前から status を呼ぶため。
+
   # configure applies the desired state. It is idempotent. On a game
   # version change it drains the players, stops the game, downloads the
   # new binary and starts it before returning.
-  configure @0 (cfg :Config) -> ();
+  configure @0 (cfg :Config, token :Text) -> ();
 
   # status reports the current agent/game state. The controller polls it.
   status @1 () -> (st :AgentStatus);
 
   # stop gracefully stops the game (drain + save). Returns after the
   # save file has been written and the game process has exited.
-  stop @2 () -> ();
+  stop @2 (token :Text) -> ();
 
   # upgrade replaces the agent binary: the agent returns a ByteStream
   # capability, the controller pushes the new binary through it and ends
   # the stream with done(sha256). The agent verifies the sha256, then
   # execve(2)s the new binary. The Factorio child process keeps running;
   # its pid travels in the environment.
-  upgrade @3 () -> (bin :ByteStream);
+  upgrade @3 (token :Text) -> (bin :ByteStream);
 }
 
 interface ByteStream {
@@ -686,7 +714,8 @@ interface ByteStream {
 プロトコル上の注意:
 
 - `configure` は常に「フル状態」を送る（差分計算を agent 側でしない）。冪等性のため。
-- 認証なし plain TCP は pod ネットワーク内に限る。agent は `0.0.0.0:9550` で待つ。controller は agent Pod ごとに NetworkPolicy を作り、TCP 9550 を manager の namespace からのみ許可する（UDP 34197 は任意の送信元）。`ManagerNamespace` が空のときだけ NetworkPolicy を作らず、RPC は pod ネットワーク全体から到達可能になる（§3.3）。
+- `configure` / `stop` / `upgrade` は `token` を持つ。トークンはネットワーク上を平文で流れるので、NetworkPolicy とノードの信頼は依然として必要である（§3.3, §6）。フィールド番号は既存のものを変えずに追加してあり、旧 agent は新しいフィールドを無視し、新 agent は検証する。`status` は認証しない: 秘密を運ばず、controller はトークンを知る前（旧 agent）にもバージョン確認のため呼ぶからである。
+- 平文 TCP は pod ネットワーク内に限る。agent は `0.0.0.0:9550` で待つ。controller は agent Pod ごとに NetworkPolicy を作り、TCP 9550 を manager の namespace からのみ許可する（UDP 34197 は任意の送信元）。`ManagerNamespace` が空のときだけ NetworkPolicy を作らず、RPC は pod ネットワーク全体から到達可能になる（§3.3）。その場合もトークンの検証は効いている。
 - `stop` は RPC の return を待つことでセーブ完了を保証する。controller は `suspend` 時に `stop` を呼んでから StatefulSet を削除する。
 - スキーマ変更時は `make generate-capnp` で `rpc/koujouo.capnp.go` を再生成し、コミットする（生成物はリポジトリに含める。CI で `capnp` を実行しない）。
 
@@ -779,9 +808,11 @@ controller の `agentclient.go` は interface 化（`type AgentDialer interface 
 
 1. `ensureAgentObjects(server)` — `ensureStatefulSet` と `ensureNetworkPolicy`。suspend なら agent.stop → STS 削除 → Suspended condition。PVC と NetworkPolicy は触らない（NetworkPolicy は FactorioServer を owner とするので GC が消す）。
 2. pod (agent) の IP を取得し `dial`。失敗時は `RequeueAfter`（短间隔）。
-3. `Agent.status()` を取得。`gameVersion != spec.gameVersion` なら `Agent.configure(fullConfig)` を呼び、返ってくるのを待つ（agent が drain → download → restart を実施）。それ以外は差分（files 等）があれば `configure`。
-4. `syncStatus` で phase / conditions / currentGameVersion / onlinePlayers / observedGeneration を更新。
+3. `Agent.status()` を取得。`gameVersion != spec.gameVersion` なら `Agent.configure(fullConfig)` を呼び、返ってくるのを待つ（agent が drain → download → restart を実施）。それ以外は差分（files 等）があれば `configure`。差分の判定は generation・game version に加えて、解決後の設定全体のハッシュ（`agentConfig.configHash`。game version、files の名前と内容、Discord webhook、leaveTimeout、backup の endpoint/bucket/key、ダウンロード資格情報）と `status.observedConfigHash` の比較で行う。参照先の ConfigMap / Secret の編集は generation を変えないため、このハッシュが無いと spec を触るまで反映されない。
+4. `syncStatus` で phase / conditions / currentGameVersion / onlinePlayers / observedGeneration を更新し、`configure` が成功したときだけ `observedConfigHash` を確定する（進捗ポーリングのパッチでは更新しない。失敗時は次の reconcile が再試行する）。
 5. 定期 requeue（例: 30 秒）で onlinePlayers を更新。
+
+**参照先が見つからないとき**: `spec.gameConfig` / `notification` / `backup` / `downloadCredentials` が指す ConfigMap・Secret・キーが無い場合、controller は `ReferencedResourceMissing` condition を patch したうえで、エラーではなく `RequeueAfter`（`RetryInterval`、既定 5 秒）を返す。エラーを返すと controller-runtime の指数バックオフで再試行が最大 16 分ほど遅れ、ユーザーが参照先を作成・修正してから反映されるまで待たされるため。判定は sentinel error（`errMissingReference`）を `errors.Is` で行い、API サーバー障害や権限不足など他の失敗は従来どおりエラーとして返す（バックオフはそのまま）。エラー自体はログに残す。
 
 **agent の自己復帰**: pod 再起動時、agent は save volume の `agent-state.json`（最後に受け取った Config を保存）から復元し、controller を待たずにゲームを起動する。controller の dial が成功した時点で `configure` により最新化される。
 
@@ -818,7 +849,7 @@ controller の `agentclient.go` は interface 化（`type AgentDialer interface 
 | tar.xz 展開 | `internal/agent/download.go` | 小さな .tar.xz を fixture に展開検証、パストラバーサ (`../`) 拒否 |
 | Discord 投稿 | `internal/agent/notify.go` | httptest サーバで body/ヘッダ/リトライを検証 |
 | S3 アップロード | `internal/agent/backup.go` | S3 mock エンドポイントは自作せず httptest で SigV4 リクエストを受けて key/body を検証（外部ミニオ不要）。失敗経路（5xx を返す endpoint、セーブ無しの saves ディレクトリ）で `backupOnce` が戻り、`backupLoop` が ctx で止まること |
-| capnp プロトコル | `rpc/` + `internal/agent` | `net.Pipe` 上で本物の rpc.Serve/NewConn を使い、configure/status/stop/upgrade（小バイナリ）の往復を検証。`Shutdown` が期限で戻ること（`TestShutdownReturnsWhenTheConfigureHoldsTheLock`）、resume の一時失敗の再試行（`TestResumeRetriesATransientFailure`）。ゲームの異常終了が `Fatal()` に届くこと（`TestAgentReportsACrashedGame`）と、要求された stop が fatal 経路に入らないこと（`TestAgentKeepsAGracefulStopOutOfTheFatalChannel`） |
+| capnp プロトコル | `rpc/` + `internal/agent` | `net.Pipe` 上で本物の rpc.Serve/NewConn を使い、configure/status/stop/upgrade（小バイナリ）の往復を検証。RPC トークン: `Options.Token` を設定した agent で status はトークン無しで成功し、configure / stop / upgrade は誤ったトークンを拒否し、正しいトークンは通り、`Options.TokenFile` の場合は毎回読み直して書き換え後の値を次の呼び出しが見ること（`TestAgentRejectsAWrongToken`、`TestAgentReadsTheTokenFile`）。`Shutdown` が期限で戻ること（`TestShutdownReturnsWhenTheConfigureHoldsTheLock`）、resume の一時失敗の再試行（`TestResumeRetriesATransientFailure`）。ゲームの異常終了が `Fatal()` に届くこと（`TestAgentReportsACrashedGame`）と、要求された stop が fatal 経路に入らないこと（`TestAgentKeepsAGracefulStopOutOfTheFatalChannel`） |
 | 既定 config.ini | `internal/agent/config.go` | 配信ファイルが空のときに `<saveDir>/config.ini` の `write-data` が saveDir を指すこと、配信された config.ini を上書きしないこと |
 | state 復元 | `internal/agent/config.go` | キャッシュ JSON の往復 |
 | CRD 変換/デフォルト | `api/v1` | LeaveTimeoutSeconds のデフォルト等 |
@@ -838,7 +869,10 @@ controller のロジックを実際の API server で検証。agent は動かな
 - gameVersion 変更 → configure が新しい gameVersion で呼ばれる
 - status の反映（phase、conditions、observedGeneration）。suspend のあとに resume して agent がまだ起きていない場合、`Suspended` 条件が残らず `Pending` になる（`status_internal_test.go` と controller の "should report Pending while the resumed agent Pod is missing"）
 - ゲーム異常終了で pod が再起動している間は dial が失敗するので `Pending`（`AgentUnavailable`）になり、再起動した agent がキャッシュから復帰して Running を報告すると `configure` 無しで Running に戻る（"should continue with the agent that resumed the cached configuration"）
-- ConfigMap/Secret 参照の解決とエラー（NotFound→condition）
+- ConfigMap/Secret 参照の解決とエラー（NotFound→condition）。参照先の config.ini や webhook URL を変更すると、spec を触らなくても次の reconcile が configure を送り、`status.observedConfigHash` が変わる（"When a referenced ConfigMap or Secret changes"）。参照先が無い場合はエラーではなく `RequeueAfter`（`testRetryInterval`）を返し、作成後の reconcile で configure が届く（"When a spec reference cannot be resolved"）
+- 未変更のサーバーは configure を再送しない（"should not reconfigure an unchanged server"）。キャッシュから resume した agent も、設定のハッシュが一致すれば configure されない（"should continue with the agent that resumed the cached configuration"）
+- RPC トークンの Secret（"When reconciling the agent token Secret" と "When the agent is reachable"）: 作成される Secret のキー `token` が 32 バイトの hex で空でないこと、owner reference が付くこと、2 回目の reconcile が同じトークンと同じ resourceVersion を返すこと（ローテーションしない）、Secret を削除すると次の reconcile が新しいトークンで作り直すこと、pod template に `agent-token` volume と `/var/run/koujouo` の read-only mount があること、それらを持たない古い StatefulSet が修復されること
+- RPC トークンの送信: fake agent が configure / stop / upgrade の受け取ったトークンを記録し、reconcile が送った値が `ensureAgentToken` の作った Secret の `token` と一致すること（"should configure the agent and report its status"、suspend の stop、"should stream the agent binary and continue with the upgraded agent"）
 - RBAC: `make manifests` で生成された role が envtest で機能することは検証しない（e2e でカバー）
 
 ### 7.3 e2e（kind、`make test-e2e`）
@@ -926,7 +960,7 @@ image の 3 job のうち `meta` と `build` は `make` を通さず `nix build`
 11. **`agent-state.json`**: save volume に最終 Config を保存するため、Discord の webhook URL と S3 の鍵が平文で入る（パーミッション 0600）。
 12. **`config/` の Kustomize マニフェストと e2e の追従**: → 解消。Kustomize のツリー（`config/`）は削除し、Helm chart `charts/koujouo` が manager の設定を ConfigMap（`koujouo-config`）として書き、Deployment の `args` を `--config /etc/koujouo/manager.yaml` だけにした。`controllerImage` は chart が自身の `image` values から書くので、`KOUJOUO_CONTROLLER_IMAGE` も `config/default/manager_metrics_patch.yaml` も不要になった。`make manifests` は CRD と manager の ClusterRole を `charts/koujouo/templates/` に直接生成し、`make lint` が `helm lint charts/koujouo` を回す。サンプルは `examples/` に移した（適用順は `examples/README.md`）。e2e（`test/e2e`）も `helm upgrade --install` で chart をデプロイし、`helm uninstall` と CRD の明示削除で後始末する（§7.3）。
 13. **reconcile のタイムアウトと configure / stop の待機**: 待機と進捗の status パッチは `context.WithoutCancel` で reconcile の期限から切り離してある。controller の停止時のみ中断され、次の reconcile が続きを行う。`callAgentStop` も同じ扱いで、期限で戻さない（戻すと、ゲームが動いたまま StatefulSet を消すことになる）。`agentstop_internal_test.go` がその挙動を固定している。
-14. **agent Pod のネットワーク分離**: → NetworkPolicy を controller が作る（§3.3, §6）。「NetworkPolicy はユーザー側で任意設定」という当初案は取り下げた: 認証なしの平文 RPC を既定で pod ネットワークに晒すのは危険で、ユーザーに設定を忘れさせないため。`ManagerNamespace`（`POD_NAMESPACE`）が空のときだけ作らない。
+14. **agent Pod のネットワーク分離**: → NetworkPolicy を controller が作る（§3.3, §6）。「NetworkPolicy はユーザー側で任意設定」という当初案は取り下げた: トークンで認証するようになっても RPC は平文で、トークン自体も pod ネットワーク上を流れるため、既定で晒さない。`ManagerNamespace`（`POD_NAMESPACE`）が空のときだけ作らない（この場合もトークンの検証は効く）。
 15. **pod template の変更をどう反映するか**: → ハッシュ annotation（`koujouo.anqou.net/template-hash`）で判定し、controller が Pod を削除して StatefulSet に作り直させる（§3.3, §6）。`OnDelete` のままでは template の変更が動いている Pod に届かないため。image だけはハッシュから除き、インプレース更新の経路に限定する。副作用として image 以外の変更はゲームを 1 回再起動する（README の Known limitations に記載）。
 16. **`spec.gameConfig` を省略したときの write-data**: → agent が既定の config.ini（`[path]\nwrite-data=<saveDir>`）を書く（§6）。省略できることを README に明記した。
 17. **e2e に「gameConfig なし」「ダウンロード中の suspend」のシナリオが無い**: **未着手のまま**。前者は unit テスト（`TestWriteConfigFilesWritesADefaultConfigIni`）でカバーしたが、実ゲームでの既定 config.ini の起動は未検証。後者は `Shutdown` の期限（`TestShutdownReturnsWhenTheConfigureHoldsTheLock`）でロック競合としてカバーしたが、実クラスタでの挙動は未確認。

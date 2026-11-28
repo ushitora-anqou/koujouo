@@ -8,7 +8,12 @@ servers. It introduces the `FactorioServer` custom resource.
 A `FactorioServer` runs exactly one Factorio headless server. For each one the
 controller creates a StatefulSet with a single replica of an **agent**, a small
 process that is shipped in the controller image. The agent and the controller
-talk over Cap'n Proto RPC.
+talk over Cap'n Proto RPC on plain TCP (port 9550). The transport is not
+encrypted, so the NetworkPolicy around the agent Pod stays (see Known
+limitations), and every state-changing call — `configure`, `stop`, `upgrade` —
+carries the RPC token of the server, which the agent verifies against the token
+file it mounts. `status` needs no token: it reports the versions and the player
+count only.
 
 The agent:
 
@@ -28,6 +33,13 @@ The save data lives on a PersistentVolumeClaim that you create yourself. The
 controller never creates or deletes it, so the world survives suspension and
 reinstallation. The game settings are read from ConfigMaps and Secrets by the
 controller and handed to the agent over RPC; they are not mounted into the Pod.
+The one Secret the agent Pod mounts is the controller's own RPC token,
+`<FactorioServer name>-agent-token`, read-only at `/var/run/koujouo`: the
+controller creates it for every server and keeps the token it holds. The agent
+compares the token of each `configure`, `stop` and `upgrade` call with that
+file on every call, so a client has to know the token to change anything, and a
+recreated Secret reaches the agent without a restart. The token never appears in
+a log, an error or the status.
 
 ## Getting Started
 
@@ -103,6 +115,15 @@ starts a default server. The `write-data` path of the delivered `config.ini` is
 rewritten to the save directory either way (config key `saveDir`,
 `/var/lib/koujouo` by default), so the autosaves land on the save volume.
 
+Editing a referenced ConfigMap or Secret takes effect without touching the
+`FactorioServer`: every 30-second poll resolves the references, hashes the
+configuration (`config.ini`, the whitelist, the Discord webhook URL, the S3 and
+download credentials, the leave timeout) into `status.observedConfigHash`, and
+sends a `configure` when the hash changed. A ConfigMap, Secret or key that does
+not exist yet is reported in the `ReferencedResourceMissing` condition and
+retried every few seconds, so creating it afterwards needs no spec change
+either.
+
 The controller creates the StatefulSet, the agent downloads Factorio
 `2.1.24`, creates a save and starts the server:
 
@@ -136,6 +157,12 @@ which replaces itself in place. The game keeps running. For this to hold the
 StatefulSet uses the `OnDelete` update strategy: its Pod is not replaced when
 the image changes.
 
+Any other change of the pod template replaces the Pod, and the game restarts
+once. One such change is the read-only mount of the RPC token Secret at
+`/var/run/koujouo`: the first reconcile that mounts it deletes the Pod of that
+server, so a server upgraded from a release without the mount restarts its game
+once.
+
 ## Configuration
 
 Both binaries take their configuration from a YAML file, named by the only
@@ -161,6 +188,11 @@ manager's own image. With an empty `controllerImage` the controller cannot
 create a StatefulSet. The Helm chart always sets it to its own image, so the
 `image` values of the chart are the single place to change it; the
 `controllerImage` key of `examples/manager.yaml` is for `make run` only.
+
+The agent's `tokenFile` names the file the controller's token Secret is mounted
+as (`/var/run/koujouo/token` by default). Keep the default: the controller
+mounts the Secret at that path, and the image configuration of the agent names
+the same file.
 
 ### Image pull secrets
 
@@ -208,6 +240,15 @@ namespace stays in `ImagePullBackOff`.
   process of the same Pod can read it from `/proc/<pid>/cmdline`. Factorio
   accepts it no other way. When you add a sidecar to the agent Pod, trust
   that process with the password.
+- The agent RPC is plain text on TCP 9550, and the RPC token of a server
+  travels in clear. The NetworkPolicy around the agent Pod therefore stays part
+  of the defence: the controller admits the port from the manager namespace
+  (`POD_NAMESPACE`) only. A CNI that does not enforce NetworkPolicy, or a
+  manager that runs outside a cluster (`ManagerNamespace` unset, so no policy is
+  created), leaves the port reachable from the whole Pod network — the token
+  still has to match, but it can be read off the wire. Keep the manager and the
+  agents on nodes and a network you trust. `status` is the one call without a
+  token; it exposes the agent and game versions and the player count only.
 
 ### To Uninstall
 **Delete the instances (CRs) from the cluster:**

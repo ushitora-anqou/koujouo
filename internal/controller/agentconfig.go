@@ -18,12 +18,16 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
 	koujouoanqounetv1 "github.com/ushitora-anqou/koujouo/api/v1"
@@ -33,6 +37,13 @@ import (
 var errKeyMissing = errors.New("key is missing")
 
 var errTooManyFiles = errors.New("too many files")
+
+// errMissingReference marks a spec reference the controller cannot resolve
+// yet: the referenced ConfigMap or Secret does not exist, or the selected key
+// is missing. The reconcile reports it on the status and retries after the
+// retry interval instead of backing off exponentially, so creating or fixing
+// the object reaches the agent within seconds.
+var errMissingReference = errors.New("missing reference")
 
 const (
 	// defaultLeaveTimeoutSeconds is applied when the spec omits it.
@@ -77,12 +88,81 @@ type agentConfig struct {
 	downloadToken       string
 }
 
+// hashableAgentConfig fixes the field order of the JSON the configuration
+// hash is computed from. It carries every field of agentConfig: a field left
+// out would change the configuration without changing the hash, and the
+// agent would keep the stale value. The JSON names are internal to the hash;
+// only their stability matters.
+type hashableAgentConfig struct {
+	GameVersion         string          `json:"gameVersion"`
+	Files               []hashableFile  `json:"files"`
+	DiscordWebhookURL   string          `json:"discordWebhookUrl"`
+	LeaveTimeoutSeconds int32           `json:"leaveTimeoutSeconds"`
+	Backup              *hashableBackup `json:"backup"`
+	DownloadUsername    string          `json:"downloadUsername"`
+	DownloadToken       string          `json:"downloadToken"`
+}
+
+// hashableFile is one delivered file in the hashed configuration. The order
+// of the files is the order of agentConfig.files.
+type hashableFile struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+// hashableBackup is the backup section of the hashed configuration.
+type hashableBackup struct {
+	EndpointURL     string `json:"endpointUrl"`
+	Bucket          string `json:"bucket"`
+	AccessKeyID     string `json:"accessKeyId"`
+	SecretAccessKey string `json:"secretAccessKey"`
+}
+
+// configHash returns the hash of the resolved configuration, which the
+// controller keeps in status.observedConfigHash. A change of any value a
+// configure call carries, including one of a referenced ConfigMap or Secret,
+// changes the hash. The hash keeps the secrets themselves out of the status.
+func (c *agentConfig) configHash() (string, error) {
+	payload := hashableAgentConfig{
+		GameVersion:         c.gameVersion,
+		Files:               make([]hashableFile, 0, len(c.files)),
+		DiscordWebhookURL:   c.discordWebhookURL,
+		LeaveTimeoutSeconds: c.leaveTimeoutSeconds,
+		Backup:              nil,
+		DownloadUsername:    c.downloadUsername,
+		DownloadToken:       c.downloadToken,
+	}
+
+	for _, file := range c.files {
+		payload.Files = append(payload.Files, hashableFile{Name: file.name, Content: file.content})
+	}
+
+	if c.backup != nil {
+		payload.Backup = &hashableBackup{
+			EndpointURL:     c.backup.endpointURL,
+			Bucket:          c.backup.bucket,
+			AccessKeyID:     c.backup.accessKeyID,
+			SecretAccessKey: c.backup.secretAccessKey,
+		}
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("could not marshal the configuration for its hash: %w", err)
+	}
+
+	sum := sha256.Sum256(encoded)
+
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // callAgentConfigure sends the full desired state to the agent and waits
 // for the return, which the agent issues after the state is applied (on a
-// game version change: after drain, download and restart). While it
-// waits, it polls the agent and reports each phase change through
-// onProgress, so a drain or a download of several minutes stays visible
-// on the FactorioServer status.
+// game version change: after drain, download and restart). The call
+// carries the RPC token of the server, which the agent verifies before it
+// applies anything. While it waits, it polls the agent and reports each
+// phase change through onProgress, so a drain or a download of several
+// minutes stays visible on the FactorioServer status.
 //
 // The wait is not bound to the reconcile context: a drain waits for the
 // leave timeout, which the user may set past the reconcile timeout of
@@ -93,10 +173,11 @@ func (r *FactorioServerReconciler) callAgentConfigure(
 	ctx context.Context,
 	agent rpcapi.Agent,
 	config *agentConfig,
+	token string,
 	onProgress func(reported *agentStatus),
 ) error {
 	future, release := agent.Configure(context.WithoutCancel(ctx), func(params rpcapi.Agent_configure_Params) error {
-		return setAgentConfig(params, config)
+		return setAgentConfig(params, config, token)
 	})
 	defer release()
 
@@ -174,8 +255,15 @@ func sameAgentPhase(previous, current *agentStatus) bool {
 		previous.players == current.players
 }
 
-// setAgentConfig writes config into the configure call parameters.
-func setAgentConfig(params rpcapi.Agent_configure_Params, config *agentConfig) error {
+// setAgentConfig writes config and the RPC token into the configure call
+// parameters. The token is the value of the agent token Secret; the agent
+// verifies it before it applies the configuration.
+func setAgentConfig(params rpcapi.Agent_configure_Params, config *agentConfig, token string) error {
+	err := params.SetToken(token)
+	if err != nil {
+		return fmt.Errorf("could not set the RPC token: %w", err)
+	}
+
 	out, err := params.NewCfg()
 	if err != nil {
 		return fmt.Errorf("could not allocate the Config struct: %w", err)
@@ -317,15 +405,19 @@ func (r *FactorioServerReconciler) callAgentStatus(ctx context.Context, agent rp
 
 // callAgentStop asks the agent to stop the game gracefully and waits
 // for the return, which the agent issues after the save file has been
-// written and the game process has exited. Like callAgentConfigure, the
-// wait outlives the reconcile deadline and reports each phase change
-// through onProgress.
+// written and the game process has exited. The call carries the RPC token
+// of the server; the agent verifies it before it stops the game. Like
+// callAgentConfigure, the wait outlives the reconcile deadline and
+// reports each phase change through onProgress.
 func (r *FactorioServerReconciler) callAgentStop(
 	ctx context.Context,
 	agent rpcapi.Agent,
+	token string,
 	onProgress func(reported *agentStatus),
 ) error {
-	future, release := agent.Stop(context.WithoutCancel(ctx), nil)
+	future, release := agent.Stop(context.WithoutCancel(ctx), func(params rpcapi.Agent_stop_Params) error {
+		return params.SetToken(token)
+	})
 	defer release()
 
 	done := make(chan error, 1)
@@ -514,12 +606,14 @@ func (r *FactorioServerReconciler) readConfigMapKey(
 
 	err := r.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: selector.Name}, configMap)
 	if err != nil {
-		return "", fmt.Errorf("could not get ConfigMap %s: %w", selector.Name, err)
+		return "", referenceError(fmt.Errorf("could not get ConfigMap %s: %w", selector.Name, err))
 	}
 
 	value, ok := configMap.Data[selector.Key]
 	if !ok {
-		return "", fmt.Errorf("could not read key %q of ConfigMap %s: %w", selector.Key, selector.Name, errKeyMissing)
+		return "", referenceError(
+			fmt.Errorf("could not read key %q of ConfigMap %s: %w", selector.Key, selector.Name, errKeyMissing),
+		)
 	}
 
 	return value, nil
@@ -535,13 +629,27 @@ func (r *FactorioServerReconciler) readSecretKey(
 
 	err := r.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: selector.Name}, secret)
 	if err != nil {
-		return "", fmt.Errorf("could not get Secret %s: %w", selector.Name, err)
+		return "", referenceError(fmt.Errorf("could not get Secret %s: %w", selector.Name, err))
 	}
 
 	value, ok := secret.Data[selector.Key]
 	if !ok {
-		return "", fmt.Errorf("could not read key %q of Secret %s: %w", selector.Key, selector.Name, errKeyMissing)
+		return "", referenceError(
+			fmt.Errorf("could not read key %q of Secret %s: %w", selector.Key, selector.Name, errKeyMissing),
+		)
 	}
 
 	return string(value), nil
+}
+
+// referenceError marks err as errMissingReference when the referenced object
+// or key does not exist. Any other failure (an API server error, a missing
+// permission) stays a plain error and keeps the exponential backoff of a
+// failed reconcile.
+func referenceError(err error) error {
+	if apierrors.IsNotFound(err) || errors.Is(err, errKeyMissing) {
+		return fmt.Errorf("%w: %w", errMissingReference, err)
+	}
+
+	return err
 }

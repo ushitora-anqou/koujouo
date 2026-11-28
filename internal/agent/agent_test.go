@@ -94,6 +94,13 @@ const (
 
 	// fakeGameJoinLine is the player event the fake game prints.
 	fakeGameJoinLine = "   1.000 [JOIN] tester joined the game"
+
+	// testRPCToken is the RPC token the token tests expect, wrongRPCToken
+	// another one and secondRPCToken the replacement the token file of the
+	// recreated Secret holds.
+	testRPCToken   = "test-rpc-token"
+	wrongRPCToken  = "wrong-rpc-token"
+	secondRPCToken = "second-rpc-token"
 )
 
 // fakeFactorioScript returns the shell script standing in for the game
@@ -310,9 +317,20 @@ func assertNoFatal(t *testing.T, gameAgent *Agent) {
 }
 
 // tryConfigure sends a full configuration over the wire without failing
-// the test.
+// the test. The token-less agent of these tests authenticates nothing.
 func tryConfigure(ctx context.Context, client rpcapi.Agent, config *Config) error {
+	return tryConfigureWithToken(ctx, client, config, "")
+}
+
+// tryConfigureWithToken sends a full configuration and the RPC token the
+// agent verifies.
+func tryConfigureWithToken(ctx context.Context, client rpcapi.Agent, config *Config, token string) error {
 	future, release := client.Configure(ctx, func(params rpcapi.Agent_configure_Params) error {
+		err := params.SetToken(token)
+		if err != nil {
+			return err
+		}
+
 		return fillConfigureParams(params, config)
 	})
 	defer release()
@@ -355,6 +373,19 @@ func callStop(t *testing.T, client rpcapi.Agent) {
 	if err != nil {
 		t.Fatalf("could not stop the game: %v", err)
 	}
+}
+
+// tryStop stops the game over the wire with the RPC token without failing
+// the test.
+func tryStop(ctx context.Context, client rpcapi.Agent, token string) error {
+	future, release := client.Stop(ctx, func(params rpcapi.Agent_stop_Params) error {
+		return params.SetToken(token)
+	})
+	defer release()
+
+	_, err := future.Struct()
+
+	return err
 }
 
 // fillConfigureParams writes the configuration into the call params.
@@ -1074,5 +1105,173 @@ func newFlakyDownloadClient(t *testing.T, version string) (*http.Client, func() 
 		defer mutex.Unlock()
 
 		return requests
+	}
+}
+
+// TestAgentRejectsAWrongToken verifies the token check of every
+// state-changing call: configure, stop and upgrade fail with another token
+// than the expected one, while status keeps answering without a token. The
+// agent verifies each call on its own, so a client that authenticated once
+// opens nothing for the next one.
+func TestAgentRejectsAWrongToken(t *testing.T) {
+	t.Parallel()
+
+	options := roundTripOptions(t.TempDir(), t.TempDir(), nil)
+	options.Token = testRPCToken
+
+	client, gameAgent := newRPCAgent(t, logr.Discard(), options)
+
+	// status carries no secret, and the controller polls it before it knows
+	// whether the agent verifies a token at all.
+	if status := callStatus(t, client); status.phase != rpcapi.Phase_pending {
+		t.Errorf("phase of a status without a token = %s, want pending", status.phase)
+	}
+
+	assertRefusesAWrongToken(t, client, gameAgent)
+
+	assertAcceptsTheRightToken(t, client)
+}
+
+// assertRefusesAWrongToken verifies that another token than the expected one
+// is refused, and that a refused configure applies nothing.
+func assertRefusesAWrongToken(t *testing.T, client rpcapi.Agent, gameAgent *Agent) {
+	t.Helper()
+
+	requireUnauthenticated(t, "configure",
+		tryConfigureWithToken(t.Context(), client, roundTripConfig(), wrongRPCToken))
+
+	if phase := gameAgent.snapshot().phase; phase != rpcapi.Phase_pending {
+		t.Errorf("phase after the refused configure = %s, want pending", phase)
+	}
+
+	requireUnauthenticated(t, "stop", tryStop(t.Context(), client, wrongRPCToken))
+
+	// A refused upgrade hands out no ByteStream either.
+	requireUnauthenticated(t, "upgrade", tryUpgradeWithoutBinary(t.Context(), client, wrongRPCToken))
+}
+
+// assertAcceptsTheRightToken verifies that the token of the agent lets the
+// state-changing calls through.
+func assertAcceptsTheRightToken(t *testing.T, client rpcapi.Agent) {
+	t.Helper()
+
+	// The right token stops a game that never ran, which leaves the
+	// suspended phase: the test needs no game binary for that.
+	err := tryStop(t.Context(), client, testRPCToken)
+	if err != nil {
+		t.Fatalf("stop with the right token failed: %v", err)
+	}
+
+	if phase := callStatus(t, client).phase; phase != rpcapi.Phase_suspended {
+		t.Errorf("phase after the stop = %s, want suspended", phase)
+	}
+
+	err = tryUpgradeWithoutBinary(t.Context(), client, testRPCToken)
+	if err != nil {
+		t.Fatalf("upgrade with the right token failed: %v", err)
+	}
+}
+
+// requireUnauthenticated fails the test unless err reports a refused token.
+func requireUnauthenticated(t *testing.T, call string, err error) {
+	t.Helper()
+
+	if err == nil || !strings.Contains(err.Error(), errUnauthenticated.Error()) {
+		t.Fatalf("%s with a wrong token = %v, want %v", call, err, errUnauthenticated)
+	}
+}
+
+// tryUpgradeWithoutBinary requests the upgrade ByteStream with an RPC token
+// and releases it without pushing a binary, which would execve(2) the test
+// process.
+func tryUpgradeWithoutBinary(ctx context.Context, client rpcapi.Agent, token string) error {
+	future, release := client.Upgrade(ctx, func(params rpcapi.Agent_upgrade_Params) error {
+		return params.SetToken(token)
+	})
+	defer release()
+
+	results, err := future.Struct()
+	if err != nil {
+		return err
+	}
+
+	results.Bin().Release()
+
+	return nil
+}
+
+// TestAgentReadsTheTokenFile verifies that the agent takes the expected
+// token from the mounted file and reads it again on every call, so a
+// recreated Secret reaches it without a restart.
+func TestAgentReadsTheTokenFile(t *testing.T) {
+	t.Parallel()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+
+	writeTokenFile(t, tokenFile, testRPCToken+"\n")
+
+	options := roundTripOptions(t.TempDir(), t.TempDir(), nil)
+	options.TokenFile = tokenFile
+
+	client, _ := newRPCAgent(t, logr.Discard(), options)
+
+	// The trailing newline of the file is trimmed.
+	err := tryStop(t.Context(), client, testRPCToken)
+	if err != nil {
+		t.Fatalf("stop with the token of the file failed: %v", err)
+	}
+
+	// A recreated Secret replaces the file content; the next call must
+	// already use the new token.
+	writeTokenFile(t, tokenFile, secondRPCToken+"\n")
+
+	err = tryStop(t.Context(), client, testRPCToken)
+	if err == nil || !strings.Contains(err.Error(), errUnauthenticated.Error()) {
+		t.Fatalf("stop with the old token after the file changed = %v, want %v", err, errUnauthenticated)
+	}
+
+	err = tryStop(t.Context(), client, secondRPCToken)
+	if err != nil {
+		t.Fatalf("stop with the new token of the file failed: %v", err)
+	}
+
+	// An empty file grants nothing: a mounted Secret always holds a token,
+	// so an empty one is a broken mount, not a way to run unauthenticated.
+	writeTokenFile(t, tokenFile, "\n")
+
+	err = tryStop(t.Context(), client, "")
+	if err == nil || !strings.Contains(err.Error(), errUnauthenticated.Error()) {
+		t.Fatalf("stop with an empty token file = %v, want %v", err, errUnauthenticated)
+	}
+}
+
+// TestAgentWithoutATokenAcceptsEveryCall verifies that an agent started
+// without a token file and without a token accepts every call: that is the
+// agent of the unit tests and of a development run. The production agent
+// always gets a token file, and a missing or empty one stays an error.
+func TestAgentWithoutATokenAcceptsEveryCall(t *testing.T) {
+	t.Parallel()
+
+	client, _ := newRPCAgent(t, logr.Discard(), roundTripOptions(t.TempDir(), t.TempDir(), nil))
+
+	// A token the agent knows nothing about passes, because the agent
+	// verifies none at all.
+	err := tryStop(t.Context(), client, testRPCToken)
+	if err != nil {
+		t.Fatalf("stop with a token against an agent without one failed: %v", err)
+	}
+
+	if phase := callStatus(t, client).phase; phase != rpcapi.Phase_suspended {
+		t.Errorf("phase after the stop = %s, want suspended", phase)
+	}
+}
+
+// writeTokenFile writes a token file, failing the test on errors.
+func writeTokenFile(t *testing.T, path, token string) {
+	t.Helper()
+
+	err := os.WriteFile(path, []byte(token), privateFileMode)
+	if err != nil {
+		t.Fatalf("could not write the token file %s: %v", path, err)
 	}
 }

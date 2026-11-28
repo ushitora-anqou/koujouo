@@ -56,6 +56,7 @@ const (
 	defaultListenAddress  = ":9550"
 	defaultSaveDir        = "/var/lib/koujouo"
 	defaultCacheDir       = "/opt/koujouo"
+	defaultTokenFile      = "/var/run/koujouo/token" //nolint:gosec // A path, not a credential.
 	defaultLogDevelopment = false
 	defaultLogLevel       = "info"
 	shutdownTimeout       = 9 * time.Minute
@@ -85,6 +86,10 @@ type agentConfig struct {
 	// CacheDir is the game binary and upgrade cache directory on the
 	// ephemeral volume.
 	CacheDir string `mapstructure:"cacheDir"`
+
+	// TokenFile is the file holding the RPC token the controller created
+	// for this agent. The controller mounts its Secret on the pod.
+	TokenFile string `mapstructure:"tokenFile"`
 
 	Log logConfig `mapstructure:"log"`
 }
@@ -149,6 +154,7 @@ func loadConfig(path string) (agentConfig, error) {
 	settings.SetDefault("listenAddress", defaultListenAddress)
 	settings.SetDefault("saveDir", defaultSaveDir)
 	settings.SetDefault("cacheDir", defaultCacheDir)
+	settings.SetDefault("tokenFile", defaultTokenFile)
 	settings.SetDefault("log.development", defaultLogDevelopment)
 	settings.SetDefault("log.level", defaultLogLevel)
 
@@ -195,8 +201,9 @@ func newLogger(cfg logConfig) (logr.Logger, error) {
 // exits non-zero.
 func run(ctx context.Context, log logr.Logger, cfg agentConfig) error {
 	gameAgent, err := agent.New(log, agent.Options{ //nolint:exhaustruct_v5 // The defaults fill the optional fields.
-		SaveDir:  cfg.SaveDir,
-		CacheDir: cfg.CacheDir,
+		SaveDir:   cfg.SaveDir,
+		CacheDir:  cfg.CacheDir,
+		TokenFile: cfg.TokenFile,
 	})
 	if err != nil {
 		return fmt.Errorf("could not create the agent: %w", err)
