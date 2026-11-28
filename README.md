@@ -254,7 +254,7 @@ nix develop
 | `make test` | Scans the git history for secrets, then runs the unit and envtest tests |
 | `make test-e2e` | End-to-end tests on a dedicated Kind cluster with the real Factorio binary |
 
-Every push and pull request runs the `CI` workflow
+Every push to `master` and every pull request runs the `CI` workflow
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), which is `go mod tidy`,
 `make all` and `make check-uncomitted`. `make all` regenerates the code and the
 chart, lints them and runs both test layers (the e2e tests included), so run it

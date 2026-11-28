@@ -290,10 +290,13 @@ go2nix Nix plugin is built against nixpkgs' Nix 2.34.9 and needs that exact
 ABI. Keep the pinned version in step with `nixVersions.nix_2_34` of the nixpkgs
 input in `flake.lock`.
 
-`ci.yml` runs on every push and pull request: one job on `ubuntu-latest` that does
-`go mod tidy`, then `make all`, then `make check-uncomitted` — the same two commands a
-commit has to pass locally. The checkout fetches the full history (`fetch-depth: 0`): `make test`
-scans it for secrets with gitleaks, and a shallow clone would hide every commit but the latest.
+`ci.yml` runs on every push to `master` and on every pull request: one job on
+`ubuntu-latest` that does `go mod tidy`, then `make all`, then `make check-uncomitted` —
+the same two commands a commit has to pass locally. The push trigger names `master` only:
+a branch of this repository with an open pull request would otherwise run the job twice,
+once for the push and once for the pull request. The checkout fetches the full history
+(`fetch-depth: 0`): `make test` scans it for secrets with gitleaks, and a shallow clone would
+hide every commit but the latest.
 
 - `make all` is the pre-commit gate:
   `fmt generate manifests lint-config lint test test-e2e`. It regenerates the DeepCopy code, the
