@@ -763,8 +763,9 @@ test/e2e/
   factorio_e2e_test.go     新規  §7 の e2e シナリオ
 
 flake.nix                   修正  §2（go2nix の manager、devShell、go2nix プラグイン、image、agent の設定ファイル）
-Makefile                    修正  §2.2（generate-capnp、build/run のパス）、§7.4（all / check-uncomitted）
-.github/workflows/ci.yml    新規  §7.4（make all + check-uncomitted の 1 workflow。lint.yml / test.yml / test-e2e.yml を統合）
+Makefile                    修正  §2.2（generate-capnp、build/run のパス）、§7.4（all / check-uncomitted）、release / release-image / release-chart（§7.4 のリリース workflow と同じ archive）
+.github/workflows/ci.yml    新規  §7.4（make all + check-uncomitted の 1 workflow。lint.yml / test.yml を統合）
+.github/workflows/e2e.yml   新規  §7.4（make test-e2e だけを回す workflow: PR、master push、日次、手動）
 docs/design.md              本書
 ```
 
@@ -794,6 +795,8 @@ controller の `agentclient.go` は interface 化（`type AgentDialer interface 
 
 **agent の終了と復帰**: `Shutdown`（SIGTERM）は `terminating` フラグをロック取得前に立て、期限付きで lifecycle ロックを待つ。ダウンロード中の configure がロックを保持していても、configure はゲームを起動する直前にフラグを見て中断し、`Shutdown` は期限で戻る（pod の grace period を超えない）。`terminating` は configure がロックを取ったあとにも効く必要があるので atomic にしてある。逆に resume（controller を待たずキャッシュ済み設定で起動する経路）は、一時的な失敗で `Failed` のまま固まらないよう 3 回まで指数バックオフで再試行する: controller は resume が置き換えた configure 呼び出しを繰り返さない。
 
+**ゲーム異常終了による agent の終了**: 要求されていないゲームの終了（クラッシュ、OOM kill など）は、ゲームだけを `failed` にして agent を動かしたままにしない。`watchGame` は自分がまだ持っているゲームの終了だけを `Agent.Fatal()` のチャネルに `errUnexpectedGameExit` として流し、`cmd/agent` の `waitForSignal` はシグナル・RPC サーバーのエラーと並べてこのチャネルを待つ。fatal を受けると listener を閉じ、`shutdown` を呼ぶ（ゲームは既に終わっているので stop は何もしない）うえで fatal のエラーを返すため、agent は非ゼロで終了し、`restartPolicy: Always` の kubelet がコンテナを再起動する。新しい agent は `Resume` → `resumeFromState` で save volume の `agent-state.json` から復帰し、controller の `configure` を待たずにゲームを起動する。繰り返し落ちるゲームは CrashLoopBackOff として観測できる。要求された stop（SIGTERM、`stop`、バージョン変更）は fatal 経路に入らない: `watchGame` は自分が持っているゲームだけを報告し、`stopLocked` は終了が見える前にハンドルをクリアする。resume 自体の失敗（ダウンロード・起動の失敗）はゲームを起動しなかっただけなので fatal ではなく、従来どおり 3 回の再試行で諦める。
+
 **ゲーム出力の読み取り**: `copyGameOutput` は行単位で agent ログに写し、`[JOIN]` / `[LEAVE]` を Discord へ流す。読み取りがゲームの書き込みを止めないことが最優先なので、(a) `bufio.Scanner` のバッファを 64 KiB から開始し 1 MiB の行まで受け付け、(b) scanner が諦めた残りを `io.Copy(io.Discard, reader)` で読み捨て、(c) 通知は容量 64 のキューと送信ゴルーチンに分離し、キューが溢れたら通知を捨てる（webhook が詰まってもゲームを止めない）。
 
 **save volume の権限**: pod に `fsGroup: 65532` を付ける。root 所有の volume を払い出す CSI でも、nonroot の agent が書き込れるようにするため。
@@ -815,7 +818,7 @@ controller の `agentclient.go` は interface 化（`type AgentDialer interface 
 | tar.xz 展開 | `internal/agent/download.go` | 小さな .tar.xz を fixture に展開検証、パストラバーサ (`../`) 拒否 |
 | Discord 投稿 | `internal/agent/notify.go` | httptest サーバで body/ヘッダ/リトライを検証 |
 | S3 アップロード | `internal/agent/backup.go` | S3 mock エンドポイントは自作せず httptest で SigV4 リクエストを受けて key/body を検証（外部ミニオ不要）。失敗経路（5xx を返す endpoint、セーブ無しの saves ディレクトリ）で `backupOnce` が戻り、`backupLoop` が ctx で止まること |
-| capnp プロトコル | `rpc/` + `internal/agent` | `net.Pipe` 上で本物の rpc.Serve/NewConn を使い、configure/status/stop/upgrade（小バイナリ）の往復を検証。`Shutdown` が期限で戻ること（`TestShutdownReturnsWhenTheConfigureHoldsTheLock`）、resume の一時失敗の再試行（`TestResumeRetriesATransientFailure`） |
+| capnp プロトコル | `rpc/` + `internal/agent` | `net.Pipe` 上で本物の rpc.Serve/NewConn を使い、configure/status/stop/upgrade（小バイナリ）の往復を検証。`Shutdown` が期限で戻ること（`TestShutdownReturnsWhenTheConfigureHoldsTheLock`）、resume の一時失敗の再試行（`TestResumeRetriesATransientFailure`）。ゲームの異常終了が `Fatal()` に届くこと（`TestAgentReportsACrashedGame`）と、要求された stop が fatal 経路に入らないこと（`TestAgentKeepsAGracefulStopOutOfTheFatalChannel`） |
 | 既定 config.ini | `internal/agent/config.go` | 配信ファイルが空のときに `<saveDir>/config.ini` の `write-data` が saveDir を指すこと、配信された config.ini を上書きしないこと |
 | state 復元 | `internal/agent/config.go` | キャッシュ JSON の往復 |
 | CRD 変換/デフォルト | `api/v1` | LeaveTimeoutSeconds のデフォルト等 |
@@ -834,6 +837,7 @@ controller のロジックを実際の API server で検証。agent は動かな
 - `callAgentStop` は `context.WithoutCancel` で呼ぶため reconcile の期限では戻らない（`agentstop_internal_test.go`）。期限で戻すと、ゲームが動いたまま StatefulSet を消すことになる
 - gameVersion 変更 → configure が新しい gameVersion で呼ばれる
 - status の反映（phase、conditions、observedGeneration）。suspend のあとに resume して agent がまだ起きていない場合、`Suspended` 条件が残らず `Pending` になる（`status_internal_test.go` と controller の "should report Pending while the resumed agent Pod is missing"）
+- ゲーム異常終了で pod が再起動している間は dial が失敗するので `Pending`（`AgentUnavailable`）になり、再起動した agent がキャッシュから復帰して Running を報告すると `configure` 無しで Running に戻る（"should continue with the agent that resumed the cached configuration"）
 - ConfigMap/Secret 参照の解決とエラー（NotFound→condition）
 - RBAC: `make manifests` で生成された role が envtest で機能することは検証しない（e2e でカバー）
 
@@ -849,7 +853,7 @@ controller のロジックを実際の API server で検証。agent は動かな
 6. `helm upgrade --install koujouo charts/koujouo --namespace koujouo-system --set image.repository=<repo> --set image.tag=<tag>` でデプロイする。`managerImage` は `<repo>:<tag>` なので、registry のポートを repository 側に残すため最後の `/` より後ろの `:` で repository と tag に分ける。**tag は旧イメージ（`oldManagerImage`）のもの**を使う: 初期の manager と agent は `e2e-old` で動き、シナリオ 3 が release を `managerImage` に upgrade する
 7. `kubectl wait deployment/koujouo-controller-manager -n koujouo-system --for=condition=Available --timeout=5m` で待つ（Deployment 名・ServiceAccount 名・metrics Service 名・`koujouo-metrics-reader` ClusterRole 名は chart が `fullnameOverride: koujouo` で作る名前と一致する）
 
-`AfterSuite` は `helm uninstall koujouo --namespace koujouo-system`（失敗しても続行）→ CRD の削除（keep annotation のため uninstall では消えない）→ manager Namespace の削除 → cert-manager の teardown の順で行う。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image 2 つのビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 60m。agent upgrade の分だけ増やしてある。CI の job は `timeout-minutes: 90`）を指定する。
+`AfterSuite` は `helm uninstall koujouo --namespace koujouo-system`（失敗しても続行）→ CRD の削除（keep annotation のため uninstall では消えない）→ manager Namespace の削除 → cert-manager の teardown の順で行う。CertManager は不要（webhook が無い）なので、`make test-e2e` は `CERT_MANAGER_INSTALL_SKIP=true` を渡す。suite は image 2 つのビルドと Factorio の 2 回のダウンロードを含むため、`go test` の既定 10 分では足りず、`-timeout`（`E2E_TIMEOUT`、既定 60m。agent upgrade の分だけ増やしてある。e2e.yml の job は `timeout-minutes: 90`）を指定する。
 
 | コンテナ | ファイル | 内容 |
 |---|---|---|
@@ -885,20 +889,23 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 
 ### 7.4 CI
 
-`.github/workflows/ci.yml` の 1 workflow・1 job（`ubuntu-latest`、`timeout-minutes: 90`）で、コミット前にローカルで通すのと同じゲートを回す。step は checkout（SHA 固定）、Nix install（`cachix/install-nix-action`、`install_url` / `install_sha256` で upstream 2.34.9 に固定）、dev shell への enter（`nicknovitski/nix-develop`）、`go mod tidy`、`make all`、`make check-uncomitted` の順で、master への push と pull request のたびに実行する（PR ブランチへの push は pull_request と重複するため対象外）。以前の `lint.yml` / `test.yml` / `test-e2e.yml` の 3 workflow はこれに統合した。go2nix のプラグインは nixpkgs の Nix 2.34.9 に対してビルドされており、別ビルドの Nix では `undefined symbol: nix::eBlackHole` で読み込めないため、flake.lock の `nixVersions.nix_2_34` を更新するときはこの固定も合わせる。
+`.github/workflows/ci.yml` の 1 workflow・1 job（`ubuntu-latest`、`timeout-minutes: 30`）で、コミット前にローカルで通すのと同じゲートを回す。step は checkout（SHA 固定）、Nix install（`cachix/install-nix-action`、`install_url` / `install_sha256` で upstream 2.34.9 に固定）、dev shell への enter（`nicknovitski/nix-develop`）、`go mod tidy`、`make all`、`make check-uncomitted` の順で、master への push と pull request のたびに実行する（PR ブランチへの push は pull_request と重複するため対象外）。以前の `lint.yml` / `test.yml` は `ci.yml` に、`test-e2e.yml` は `e2e.yml` に引き継いだ。go2nix のプラグインは nixpkgs の Nix 2.34.9 に対してビルドされており、別ビルドの Nix では `undefined symbol: nix::eBlackHole` で読み込めないため、flake.lock の `nixVersions.nix_2_34` を更新するときはこの固定も合わせる。
 
-- `make all`: `fmt generate manifests lint-config lint test test-e2e`。生成物（DeepCopy・capnp・chart の CRD と ClusterRole）の再生成、golangci-lint の設定検証（`lint-config`）と lint（`golangci-lint` + `helm lint`）、unit + envtest（`make test`。最初に gitleaks が git 履歴をスキャンするため、checkout は `fetch-depth: 0` で全履歴を取得する）、e2e（`make test-e2e`）を順に実行する。`build` は含めない: `test` が manager と agent のコンパイルを兼ね、`test-e2e` が image のビルド（`make docker-build` → `nix build .#dockerImage` → `docker load`）を兼ねるため。e2e には repository secret `DISCORD_WEBHOOK_URL` を env で渡す。secret が無ければ値は空になり、suite は Secret を作らずに通知なしで動く（skip しない）。`timeout-minutes: 90` は image のビルドと Factorio の 2 回のダウンロードを含む e2e に合わせた値。
+- `make all`: `fmt generate manifests lint-config lint test`。生成物（DeepCopy・capnp・chart の CRD と ClusterRole）の再生成、golangci-lint の設定検証（`lint-config`）と lint（`golangci-lint` + `helm lint`）、unit + envtest（`make test`。最初に gitleaks が git 履歴をスキャンするため、checkout は `fetch-depth: 0` で全履歴を取得する）を順に実行する。`build` は含めない: `test` が manager と agent のコンパイルを兼ねるため。e2e（`make test-e2e`）は含めない: Docker、Kind クラスタ、image のビルドと Factorio のダウンロードが要り最大 60 分かかるので、`e2e.yml` が回す。`timeout-minutes: 30` は lint と unit + envtest に envtest バイナリのダウンロードを足した分数に余裕を見た値。
 - `make check-uncomitted`: `fmt generate manifests` を実行した後に `git status --porcelain` を見て、追跡ファイルの変更と未追跡ファイルの両方で失敗する。CI では `go mod tidy` が `make all` の前の step なので、tidy が差分を生む `go.mod` / `go.sum` もここで検出される。生成物のコミット漏れを CI で検出するのはこれが初めてで、以前の「workflow は生成物を比較しないので自分で make してコミットすること」という運用を置き換える。ユーザーが別の未コミット変更を持っている場合も失敗するのは意図どおり（クリーンなツリーで実行する）。綴りは `check-uncommitted` ではなく `check-uncomitted`（ユーザー指定のターゲット名）。
 
-runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`nix build .#dockerImage` → `docker load` → tag）と `kind load docker-image`、kind 内での `curlimages/curl` と `busybox` の pull がそのまま動く。e2e のテストファイルは `//go:build e2e` のため `make lint` の対象外（`test/utils` は対象内）。flake は go2nix を lockfile 無しで使うため（§2.3）`vendorHash` の更新は無く、`go.mod` / `go.sum` を更新する PR もそのままビルドできる。CI は dev shell の中で `make` を回すので、go2nix の Nix プラグインは shellHook が設定する `NIX_CONFIG` 経由で読み込まれる。
+`e2e.yml` は `make test-e2e` だけを回す workflow で、pull request、master への push、日次（18:00 UTC = 03:00 JST）、手動 dispatch で起動する。step は `ci.yml` と同じ checkout（`fetch-depth: 0`。flake が git の revision を image に焼き、追跡ファイルだけをビルドするため）/ Nix install / dev shell / `go mod tidy` のあと `make test-e2e` を実行する。`DISCORD_WEBHOOK_URL` は repository secret からこの workflow だけが渡す（secret が無ければ空になり、suite は Secret を作らずに通知なしで動く）。job は `timeout-minutes: 90`（`E2E_TIMEOUT` の 60m と image のビルド・クラスタの後始末の分）。失敗時は suite のログを artifact に残し（`tee e2e.log` と `actions/upload-artifact`）、クラスタの状態（`kubectl get all -A`、events、manager のログ、Pod）を出力し、成否にかかわらず Kind クラスタ `koujouo-test-e2e` を削除する（成功時は `test-e2e` 自身が消すので `|| true`）。workflow は ref ごとに `concurrency` で 1 本に絞り、新しい commit が前の run を cancel する。
 
-**リリース workflow（`.github/workflows/release.yml`）**: `master` への push と `v*` tag の push で image を GHCR（`ghcr.io/ushitora-anqou/koujouo`、§2.4 の名前）へ publish する。Dockerfile は使わず、flake の `.#dockerImage` を runner 上でビルドする。job は 3 つ:
+runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`nix build .#dockerImage` → `docker load` → tag）と `kind load docker-image`、kind 内での `curlimages/curl` と `busybox` の pull がそのまま動く（これらは `e2e.yml` の仕事）。e2e のテストファイルは `//go:build e2e` のため `make lint` の対象外（`test/utils` は対象内）。flake は go2nix を lockfile 無しで使うため（§2.3）`vendorHash` の更新は無く、`go.mod` / `go.sum` を更新する PR もそのままビルドできる。CI は dev shell の中で `make` を回すので、go2nix の Nix プラグインは shellHook が設定する `NIX_CONFIG` 経由で読み込まれる。
+
+**リリース workflow（`.github/workflows/release.yml`）**: `master` への push と `v*` tag の push で image を GHCR（`ghcr.io/ushitora-anqou/koujouo`、§2.4 の名前）へ publish する。Dockerfile は使わず、flake の `.#dockerImage` を runner 上でビルドする。job は 4 つ（`chart` は `v*` tag のみ）:
 
 1. `meta`: `nix eval --json .#dockerImage --apply 'p: {repo = p.imageName; tag = p.imageTag;}'` でリポジトリ名を取り、`docker/metadata-action` で最終タグを決める。`master` push は `master` と `latest`、`v*` tag は `vX.Y.Z` のみ（`latest` は default branch に限るので、古い tag で `latest` が巻き戻らない）
 2. `build`: `linux/amd64`（`ubuntu-latest`）と `linux/arm64`（`ubuntu-26.04-arm`）の matrix。`nix build .#dockerImage` は runner の native system を評価するので cross も emulation も無い。各 arch は `<version>-linux-<arch>` を push し、digest を artifact で `merge` に渡す
 3. `merge`: `docker buildx imagetools create` で per-arch digest から最終タグを原子的に作る（buildx は v0.31.0 に固定。v0.31.1 以降 `imagetools create` が GHCR で壊れているため: docker/buildx#3708）。最後に `imagetools inspect` で検証する
+4. `chart`: `v*` tag のみ（`if: startsWith(github.ref, 'refs/tags/v')`、`needs: [meta]`）。`meta.outputs.version` の `v` を落として chart のバージョン（`v0.1.0` → `0.1.0`。接頭辞が無ければ失敗させる）を求め、`helm lint` のあと `make release-chart RELEASE_VERSION=<version>` を実行して `dist/koujouo-<version>.tgz` を作る。GitHub Release が無ければ `gh release create`、既にあれば `gh release upload --clobber` で archive を添付する。job は `permissions: contents: write` を持ち、失敗を握り潰す step は無い（chart の無い release は release として不完全なので run を赤にする）。`build`/`merge` の完了は待たないので、失敗すると image だけが publish された状態になりうる
 
-`make` は通さず `nix build` を直接呼ぶが、go2nix の Nix プラグイン（§2.3）が評価に要るので全 job が dev shell に入る。`latest` が付くのは `master` への push だけなので、`v*` tag のビルドが済んだ image をそのまま配るには `vX.Y.Z` を指す。
+image の 3 job のうち `meta` と `build` は `make` を通さず `nix build` を直接呼ぶが、go2nix の Nix プラグイン（§2.3）が評価に要るので dev shell に入る（`merge` は digest を Docker で束ねるだけでどちらも要らない）。`chart` も dev shell に入り、`make release-chart` を通す（ローカルの `make release` と同じ archive を作るため）。`latest` が付くのは `master` への push だけなので、`v*` tag のビルドが済んだ image をそのまま配るには `vX.Y.Z` を指す。chart は GitHub Release 以外に publish しない（GHCR の chart repository は持たない）。
 
 ---
 
@@ -913,7 +920,7 @@ runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`n
 5. **phase の二重管理**: → conditions を正とし、phase は conditions から合成する（`internal/controller/status.go`）。
 6. **`[JOIN]` / `[LEAVE]` の正確なログ形式**: **未検証のまま**。プレイヤー接続を要するため、unit テストのフィクスチャでしか確認していない。実運用でプレイヤーの出入りを確認し、必要なら `internal/agent/logs.go` の正規表現を調整すること。
 7. **experimental ビルドの認証付きダウンロード**: `?username=&token=` の URL 組み立ては unit テストで検証済み。実際の認証付きダウンロードは行っていない。
-8. **ゲームプロセスの異常終了**: agent は phase を `failed` にするが、自動再起動しない（次の `configure` まで止まる）。README の Known limitations に記載。
+8. **ゲームプロセスの異常終了**: → agent は `Agent.Fatal()` で `errUnexpectedGameExit` を報告し、`cmd/agent` が listener を閉じて非ゼロで終了する。コンテナは `restartPolicy: Always` の kubelet が再起動し、新しい agent が `agent-state.json` から復帰する（§6）。繰り返し落ちるゲームは CrashLoopBackOff になる。要求された stop は fatal 経路に入らない。README の Known limitations に記載。
 9. **過去バージョンのゲームバイナリ**: ephemeral volume に残る（約 313 MB / 版）。Pod 再作成で消える。既定 2Gi では数回のバージョン変更で埋まる。
 10. **GitHub Actions 上での e2e**: ローカルの kind（docker 29.9.3 / kind v0.33.0）でのみ確認済み。runner 上では未実行。Docker Hub と factorio.com への外向き通信が必要。
 11. **`agent-state.json`**: save volume に最終 Config を保存するため、Discord の webhook URL と S3 の鍵が平文で入る（パーミッション 0600）。

@@ -182,9 +182,13 @@ namespace stays in `ImagePullBackOff`.
 
 ## Known limitations
 
-- If the game process exits on its own, for example after a crash, the status
-  turns `Failed` and the agent does not restart it. Set `.spec.suspend: true`
-  and back to `false`, or change `.spec.gameVersion`, to start it again.
+- If the game process exits on its own, for example after a crash, the agent
+  exits as well and the kubelet restarts the agent Pod (`restartPolicy:
+  Always`). The new agent restores the game from `agent-state.json` on the save
+  volume, without waiting for a `configure` call from the controller. A game
+  that keeps crashing ends in `CrashLoopBackOff`: look for the cause on the
+  game's side (a mod, an out-of-memory kill) rather than at the operator.
+  Toggling `.spec.suspend` is no longer needed to start the game again.
 - The StatefulSet uses the `OnDelete` update strategy, so a controller image
   update does not replace the agent Pod: the manager streams the new agent
   binary into the running one and the game keeps running. Every other owned pod
@@ -250,14 +254,12 @@ helm upgrade --install koujouo "koujouo-${VERSION}.tgz" -n koujouo-system --crea
   --set image.tag=${TAG}
 ```
 
-The archive is versioned after the tag without its `v` (`v0.1.0` gives chart
-version `0.1.0` and `appVersion: 0.1.0`), while the release keeps the `v` on
-the image tag (`ghcr.io/ushitora-anqou/koujouo:v0.1.0`), so `--set
-image.tag=${TAG}` runs the image of the release. The chart defaults `image.tag`
-to `latest`, the image of `master`, and Helm only falls back to the
-`appVersion` when the tag is empty. Override `image.repository` as well when
-you pull the image from your own registry (see
-[By pulling the published image](#by-pulling-the-published-image)).
+The release keeps the `v` on the image tag (`ghcr.io/ushitora-anqou/koujouo:v0.1.0`)
+while the chart carries the version without it, so `--set image.tag=${TAG}` runs
+the image of the release. The chart defaults `image.tag` to `latest`, the image
+of `master`, and Helm only falls back to the `appVersion` when the tag is empty.
+Override `image.repository` as well when you pull the image from your own
+registry (see [By pulling the published image](#by-pulling-the-published-image)).
 
 To build the same archive from a checkout, package it yourself:
 

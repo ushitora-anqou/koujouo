@@ -94,9 +94,22 @@ A running server is reconciled in this order: ensure the StatefulSet and the Net
 wait for a ready agent Pod → `status` → `upgrade` when the agent reports another build than
 the manager → `configure` when the spec generation or the game version changed → patch the
 status → requeue after 30s. `spec.suspend: true` calls `stop`, deletes the StatefulSet and
-keeps the PVC. A game that exits on its own turns the server `Failed`; the agent does not
-restart it by design (see the known limitations in README.md).
+keeps the PVC. A game that exits on its own ends the whole agent rather than only the game:
+the Pod restarts and the new agent resumes the game from the cache it left on the save
+volume (see the next bullet and the known limitations in README.md).
 
+- **A game that exits on its own ends the agent, so the kubelet restarts the Pod**
+  (`internal/agent/agent.go`, `cmd/agent/main.go`). `watchGame` reports the exit of a game the
+  agent still runs on the channel `Agent.Fatal()` returns; `cmd/agent` waits on that channel
+  beside the signals and the RPC server error, and a fatal error makes it close the listener,
+  call `Shutdown` (a crashed game leaves nothing to stop) and return the error, so the process
+  exits non-zero. The kubelet then restarts the container under its `restartPolicy: Always`,
+  and the new agent resumes the game from `agent-state.json` on the save volume
+  (`Resume`/`resumeFromState`) before the controller dials it again. A game that keeps
+  crashing therefore shows up as `CrashLoopBackOff`. A **requested** stop stays out of that
+  path: `watchGame` reports only a game the agent still owns and `stopLocked` clears the
+  handle before the exit is seen, so SIGTERM, `stop` and a version change never look like a
+  crash.
 - **The agent Pod is protected by a NetworkPolicy** (`internal/controller/resources/networkpolicy.go`).
   Ingress admits UDP 34197 from any source, because the players connect from anywhere, and
   TCP 9550 — the unauthenticated, plain-text Cap'n Proto RPC — from the manager namespace
@@ -579,15 +592,16 @@ code:
 
 | Area | Test |
 | --- | --- |
-| `shutdown` absorbs the closed listener and joins the serve error; `waitForSignal` returns a server error and no error on a signal | `cmd/agent/main_test.go` |
+| `shutdown` absorbs the closed listener and joins the serve error; `waitForSignal` returns a server error, the error of a game that exited on its own and no error on a signal | `cmd/agent/main_test.go` |
 | `Suspended` is cleared when a resumed server reports again (`derivePhase` and the `sync*Status` helpers) | `internal/controller/status_internal_test.go` |
 | `callAgentStop` runs under `context.WithoutCancel`: the reconcile deadline does not end it | `internal/controller/agentstop_internal_test.go` |
 | The NetworkPolicy ports, its manager-namespace source, its survival of a suspension and its absence without `ManagerNamespace` | `factorioserver_controller_test.go`, "When reconciling the agent NetworkPolicy" |
 | A changed pod template (save PVC, `spec.agent.resources`) recreates the Pod, an image-only change does not, and the annotations the controller does not own survive | `factorioserver_controller_test.go`, "When the agent Pod runs an outdated pod template" |
 | Suspension: the stop call, the StatefulSet and PVC end state, the unreachable agent (the StatefulSet stays), the unready Pod (no stop) and the stop that outlives the reconcile deadline | `factorioserver_controller_test.go`, "When suspending the server" |
+| A restarted Pod: the server turns `Pending` while the crashed agent is gone and continues with the agent that resumed the cached configuration, which needs no `configure` | `factorioserver_controller_test.go`, "When the agent crashed and the Pod restarted" |
 | Long game output lines, a webhook that does not answer, an overlong stream that must still be drained | `internal/agent/logs_test.go` |
 | The default `config.ini` of a configuration without `spec.gameConfig`, and the delivered one winning | `internal/agent/config_test.go` |
-| `Shutdown` returning at its deadline while a configure holds the lock, and the resume retry of a transient failure | `internal/agent/agent_test.go` |
+| `Shutdown` returning at its deadline while a configure holds the lock, the resume retry of a transient failure, a game that exits on its own reaching `Fatal()` and a graceful stop staying out of it | `internal/agent/agent_test.go` |
 | A failing S3 endpoint and an empty saves directory: the backup is logged and skipped, the loop still ends with its context | `internal/agent/backup_test.go` |
 
 **E2E suite** (`test/e2e/`, build tag `e2e`)
