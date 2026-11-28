@@ -41,6 +41,10 @@ const shutdownTestDeadline = 5 * time.Second
 // shutdown.
 var errTestServe = errors.New("the RPC server failed")
 
+// errTestGameCrash stands in for the error of a game that exited on its
+// own.
+var errTestGameCrash = errors.New("factorio exited unexpectedly")
+
 // newTestAgent returns an agent on temporary volumes. It runs no game, so
 // its Shutdown returns without waiting for a save.
 func newTestAgent(t *testing.T) *agent.Agent {
@@ -145,13 +149,34 @@ func TestWaitForSignalReturnsTheServerError(t *testing.T) {
 
 	signals := make(chan os.Signal, 1)
 	serveError := make(chan error, 1)
+	gameFatal := make(chan error, 1)
 
 	serveError <- errTestServe
 
-	err := waitForSignal(logr.Discard(), signals, serveError)
+	err := waitForSignal(logr.Discard(), signals, serveError, gameFatal)
 	if !errors.Is(err, errTestServe) {
 		t.Errorf("waitForSignal() error = %v, want %v", err, errTestServe)
 	}
+}
+
+// TestWaitForSignalReturnsTheGameFatalError verifies that a game which
+// exited on its own ends the wait with the error the agent reported, so
+// the agent exits non-zero and the kubelet restarts the Pod.
+func TestWaitForSignalReturnsTheGameFatalError(t *testing.T) {
+	t.Parallel()
+
+	signals := make(chan os.Signal, 1)
+	serveError := make(chan error, 1)
+	gameFatal := make(chan error, 1)
+
+	gameFatal <- errTestGameCrash
+
+	withinDeadline(t, "waitForSignal", func() {
+		err := waitForSignal(logr.Discard(), signals, serveError, gameFatal)
+		if !errors.Is(err, errTestGameCrash) {
+			t.Errorf("waitForSignal() error = %v, want %v", err, errTestGameCrash)
+		}
+	})
 }
 
 // TestWaitForSignalReturnsOnASignal verifies that a termination signal
@@ -161,10 +186,11 @@ func TestWaitForSignalReturnsOnASignal(t *testing.T) {
 
 	signals := make(chan os.Signal, 1)
 	serveError := make(chan error, 1)
+	gameFatal := make(chan error, 1)
 
 	signals <- syscall.SIGTERM
 
-	err := waitForSignal(logr.Discard(), signals, serveError)
+	err := waitForSignal(logr.Discard(), signals, serveError, gameFatal)
 	if err != nil {
 		t.Errorf("waitForSignal() error = %v, want nil after a signal", err)
 	}

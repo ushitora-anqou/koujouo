@@ -67,6 +67,11 @@ var (
 	// errTerminating is returned by a configure call that arrives after
 	// the agent received its termination signal.
 	errTerminating = errors.New("the agent is terminating")
+
+	// errUnexpectedGameExit is reported when a game the agent still runs
+	// exits with no error of its own, which the agent did not ask for
+	// either.
+	errUnexpectedGameExit = errors.New("factorio exited unexpectedly")
 )
 
 // Options configures an Agent. The zero values of the optional fields
@@ -145,6 +150,12 @@ type Agent struct {
 	// lifecycle lock is still held elsewhere.
 	terminating atomic.Bool
 
+	// fatal carries the error that must end the agent process. It is
+	// buffered and written at most once, so reporting never blocks the
+	// game watcher; the entry point waits on it to exit non-zero and let
+	// the kubelet restart the Pod.
+	fatal chan error
+
 	// statusMu guards the status snapshot, so a status call never
 	// waits for a lifecycle operation and can report a drain in
 	// progress.
@@ -200,6 +211,7 @@ func New(log logr.Logger, options Options) (*Agent, error) {
 		drainPollInterval:   options.DrainPollInterval,
 		backupPeriod:        options.BackupPeriod,
 		saveWaitTimeout:     options.SaveWaitTimeout,
+		fatal:               make(chan error, 1),
 		status: statusSnapshot{ //nolint:exhaustruct_v5 // Reports no game before the first configure.
 			phase: rpcapi.Phase_pending,
 		},
@@ -398,6 +410,24 @@ func (a *Agent) Upgrade(_ context.Context, call rpcapi.Agent_upgrade) error {
 	}
 
 	return nil
+}
+
+// Fatal returns the channel that carries the error which must end the
+// agent process. A game that exits on its own sends exactly one error;
+// the entry point then returns it, so the agent exits non-zero and the
+// kubelet restarts the Pod under its restartPolicy.
+func (a *Agent) Fatal() <-chan error {
+	return a.fatal
+}
+
+// reportFatal publishes the error that ends the agent process. It never
+// blocks and keeps only the first error, because the agent exits on it
+// and a game of the next Pod reports its own crashes.
+func (a *Agent) reportFatal(err error) {
+	select {
+	case a.fatal <- err:
+	default:
+	}
 }
 
 // resumeUpgraded adopts the game of the previous agent process.
@@ -822,7 +852,12 @@ func (a *Agent) whitelistPathLocked(config *Config) string {
 	return filepath.Join(a.saveDir, serverWhitelistName)
 }
 
-// watchGame marks the agent failed when the game exits on its own.
+// watchGame ends the agent when the game exits on its own. The graceful
+// stop closes the exit channel as well, but it clears a.game first, so
+// the guard below keeps a requested stop out of the fatal path: only a
+// game the agent still runs counts as a crash. The execve(2) of an
+// upgrade replaces this process while the watcher waits, so the previous
+// agent reports nothing about the game the next agent re-attaches to.
 func (a *Agent) watchGame(game gameHandle) {
 	go func() {
 		<-game.Exited()
@@ -846,6 +881,13 @@ func (a *Agent) watchGame(game gameHandle) {
 		a.log.Error(err, "Factorio exited unexpectedly")
 
 		a.setPhaseLocked(rpcapi.Phase_failed)
+
+		fatalErr := errUnexpectedGameExit
+		if err != nil {
+			fatalErr = fmt.Errorf("%w: %w", errUnexpectedGameExit, err)
+		}
+
+		a.reportFatal(fatalErr)
 	}()
 }
 

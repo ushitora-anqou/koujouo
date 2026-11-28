@@ -189,8 +189,10 @@ func newLogger(cfg logConfig) (logr.Logger, error) {
 	return zap.New(zap.UseFlagOptions(&options)).WithName("agent"), nil
 }
 
-// run starts the agent and blocks until it is signalled or the RPC
-// server fails. It stops the game gracefully before it returns.
+// run starts the agent and blocks until it is signalled, the RPC server
+// fails or the game exits on its own. It stops the game gracefully before
+// it returns and reports an error in the last two cases, so the agent
+// exits non-zero.
 func run(ctx context.Context, log logr.Logger, cfg agentConfig) error {
 	gameAgent, err := agent.New(log, agent.Options{ //nolint:exhaustruct_v5 // The defaults fill the optional fields.
 		SaveDir:  cfg.SaveDir,
@@ -222,14 +224,20 @@ func run(ctx context.Context, log logr.Logger, cfg agentConfig) error {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
 
-	serveErr := waitForSignal(log, signals, serveError)
+	waitErr := waitForSignal(log, signals, serveError, gameAgent.Fatal())
 
-	return shutdown(ctx, log, gameAgent, listener, serveError, serveErr)
+	return shutdown(ctx, log, gameAgent, listener, serveError, waitErr)
 }
 
-// waitForSignal blocks until the agent is signalled or the RPC server
-// fails, and returns the server error when it failed.
-func waitForSignal(log logr.Logger, signals <-chan os.Signal, serveError <-chan error) error {
+// waitForSignal blocks until the agent is signalled, the RPC server fails
+// or the game exits on its own, and returns the error of the last two, so
+// the agent exits non-zero and the kubelet restarts the Pod.
+func waitForSignal(
+	log logr.Logger,
+	signals <-chan os.Signal,
+	serveError <-chan error,
+	gameFatal <-chan error,
+) error {
 	select {
 	case sig := <-signals:
 		log.Info("Received signal, stopping the game gracefully", "signal", sig.String())
@@ -239,6 +247,16 @@ func waitForSignal(log logr.Logger, signals <-chan os.Signal, serveError <-chan 
 		log.Error(err, "RPC server failed, stopping the game gracefully")
 
 		return fmt.Errorf("the RPC server failed: %w", err)
+	case err := <-gameFatal:
+		// The game is already gone, so there is nothing to stop: the
+		// caller still shuts down to close the listener and to collect
+		// the serve goroutine, and then exits non-zero. The kubelet
+		// restarts the Pod (restartPolicy: Always) whatever the exit
+		// code, and the new agent resumes the game from the cached
+		// configuration.
+		log.Error(err, "Factorio exited unexpectedly, terminating the agent so that the Pod restarts")
+
+		return err
 	}
 }
 
@@ -255,15 +273,18 @@ func listen(ctx context.Context, listenAddress string) (net.Listener, error) {
 }
 
 // shutdown closes the RPC listener, gracefully stops the game and waits
-// for the RPC server to return. serveErr is the error the server
-// already returned, or nil while it is still serving.
+// for the RPC server to return. waitErr is the error waitForSignal
+// already returned, or nil after a signal. A game that exited on its own
+// leaves nothing to stop, so Shutdown only reports the suspended phase;
+// closing the listener ends the serve goroutine, whose error the buffered
+// channel absorbs when waitErr already ended the wait.
 func shutdown(
 	ctx context.Context,
 	log logr.Logger,
 	gameAgent *agent.Agent,
 	listener net.Listener,
 	serveError <-chan error,
-	serveErr error,
+	waitErr error,
 ) error {
 	err := listener.Close()
 	if err != nil && !errors.Is(err, net.ErrClosed) {
@@ -280,13 +301,13 @@ func shutdown(
 		stopErr = fmt.Errorf("could not stop the game gracefully: %w", stopErr)
 	}
 
-	if serveErr == nil {
+	if waitErr == nil {
 		// The server returns once the listener is closed.
-		serveErr = <-serveError
-		if errors.Is(serveErr, net.ErrClosed) {
-			serveErr = nil
+		waitErr = <-serveError
+		if errors.Is(waitErr, net.ErrClosed) {
+			waitErr = nil
 		}
 	}
 
-	return errors.Join(stopErr, serveErr)
+	return errors.Join(stopErr, waitErr)
 }

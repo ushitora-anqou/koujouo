@@ -72,6 +72,10 @@ const (
 	// so a shutdown that ignores its deadline fails fast.
 	shutdownDeadline = 100 * time.Millisecond
 
+	// quietGracePeriod is how long a test waits for an error that must
+	// not arrive.
+	quietGracePeriod = 100 * time.Millisecond
+
 	// deliveredConfigIni is the config.ini content sent over the wire.
 	deliveredConfigIni = "[path]\nwrite-data=/tmp/old\n"
 
@@ -274,6 +278,34 @@ func waitForPhase(t *testing.T, gameAgent *Agent, phase rpcapi.Phase) {
 		}
 
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForFatal waits for the error the game watcher reports, so the entry
+// point can end the process.
+func waitForFatal(t *testing.T, gameAgent *Agent) error {
+	t.Helper()
+
+	select {
+	case err := <-gameAgent.Fatal():
+		return err
+	case <-time.After(rpcCallDeadline):
+		t.Fatalf("Fatal() reported no error within %s", rpcCallDeadline)
+
+		return nil
+	}
+}
+
+// assertNoFatal verifies that the agent reported no fatal error: the
+// crash path must not pick up a game the agent stopped or handed over
+// itself.
+func assertNoFatal(t *testing.T, gameAgent *Agent) {
+	t.Helper()
+
+	select {
+	case err := <-gameAgent.Fatal():
+		t.Errorf("Fatal() reported %v, want no error", err)
+	case <-time.After(quietGracePeriod):
 	}
 }
 
@@ -831,7 +863,8 @@ func TestAgentStatusAnswersDuringADrain(t *testing.T) {
 }
 
 // TestAgentReportsACrashedGame verifies that a game that exits on its
-// own is reported as failed until the next configure restarts it.
+// own ends the agent: the crash reaches the Fatal channel, so the entry
+// point exits non-zero and the kubelet restarts the Pod.
 func TestAgentReportsACrashedGame(t *testing.T) {
 	t.Parallel()
 
@@ -851,29 +884,40 @@ func TestAgentReportsACrashedGame(t *testing.T) {
 
 	<-crashed.Exited()
 
-	waitForPhase(t, gameAgent, rpcapi.Phase_failed)
-
-	status := callStatus(t, client)
-	if status.phase != rpcapi.Phase_failed {
-		t.Errorf("phase after the crash = %s, want failed", status.phase)
+	fatalErr := waitForFatal(t, gameAgent)
+	if !errors.Is(fatalErr, errUnexpectedGameExit) {
+		t.Errorf("fatal error = %v, want an unexpected exit", fatalErr)
 	}
 
-	if status.players != 0 {
-		t.Errorf("players after the crash = %d, want 0", status.players)
+	// The status is still read by the controller until the process ends.
+	if phase := callStatus(t, client).phase; phase != rpcapi.Phase_failed {
+		t.Errorf("phase after the crash = %s, want failed", phase)
 	}
 
-	t.Cleanup(func() { killGame(gameAgent) })
-
-	// The controller sends the full configuration again; that restarts the game.
-	callConfigure(t, client, roundTripConfig())
-
-	if pid := gamePid(gameAgent); pid <= 0 {
-		t.Fatal("the agent runs no game after the configure that follows the crash")
+	if game := runningGame(gameAgent); game != nil {
+		t.Errorf("the agent still runs the crashed game (pid %d)", game.Pid())
 	}
 
-	if phase := callStatus(t, client).phase; phase != rpcapi.Phase_running {
-		t.Errorf("phase after the restart = %s, want running", phase)
-	}
+	assertNoFatal(t, gameAgent)
+}
+
+// TestAgentKeepsAGracefulStopOutOfTheFatalChannel verifies the guard of
+// the game watcher: a stop the agent asked for closes the exit channel of
+// the game as well, but the stop clears the handle first, so the SIGTERM
+// path never looks like a crash. A crash report would end the process
+// before the shutdown finished the save.
+func TestAgentKeepsAGracefulStopOutOfTheFatalChannel(t *testing.T) {
+	t.Parallel()
+
+	gameAgent, game := newStopTestAgent(t, newFakeRcon(0))
+
+	// Watch the game the stop is about to end, like startGameLocked does.
+	gameAgent.watchGame(game)
+
+	stopAgent(t, gameAgent)
+
+	assertSuspended(t, gameAgent)
+	assertNoFatal(t, gameAgent)
 }
 
 // TestAgentShutdownRefusesAConfigure verifies the SIGTERM path: once

@@ -414,6 +414,74 @@ var _ = Describe("FactorioServer Controller", func() {
 		})
 	})
 
+	Context("When the agent crashed and the Pod restarted", func() {
+		const serverName = "fsrv-restart"
+
+		BeforeEach(func() {
+			createTestPVC(ctx, serverName+"-saves")
+			createTestConfigMap(ctx, serverName+"-config")
+			createTestSecret(ctx, serverName+"-secrets")
+			createFullServer(ctx, serverName)
+			createReadyAgentPod(ctx, serverName)
+		})
+
+		AfterEach(func() {
+			deleteTestObjects(ctx, serverName)
+		})
+
+		It("should continue with the agent that resumed the cached configuration", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeAgent.configurations()).To(HaveLen(1))
+
+			server := fetchServer(ctx, serverName)
+			Expect(server.Status.ObservedGeneration).To(Equal(server.Generation))
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseRunning))
+
+			By("seeing no agent while the crashed Pod restarts")
+
+			// The agent exits on a game crash, so nothing answers on the
+			// Pod address until the kubelet started the container again.
+			// The container keeps its restart count and its state volume.
+			reconciler.Dialer = &failingDialer{}
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testRetryInterval))
+
+			server = fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhasePending))
+			expectCondition(server, "Ready", metav1.ConditionFalse, "AgentUnavailable")
+			Expect(server.Status.ObservedGeneration).To(Equal(server.Generation))
+
+			By("continuing with the restarted agent that resumed the game")
+
+			// The restarted agent starts the game from the cached
+			// configuration without a configure call, so it reports the
+			// running game of the same version. The status generation and
+			// the game version still match the spec, so the controller
+			// sends no configuration again.
+			resumed := newFakeAgentServer()
+			resumed.setGameVersion(testGameVersion)
+			resumed.setPhase(rpcapi.Phase_running)
+
+			reconciler.Dialer = &fakeAgentDialer{agent: resumed}
+
+			result, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testPollInterval))
+
+			Expect(resumed.configurations()).To(BeEmpty())
+			Expect(fakeAgent.configurations()).To(HaveLen(1))
+
+			server = fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseRunning))
+			Expect(server.Status.CurrentGameVersion).To(Equal(testGameVersion))
+			Expect(server.Status.ObservedGeneration).To(Equal(server.Generation))
+			expectCondition(server, "Ready", metav1.ConditionTrue, "Running")
+		})
+	})
+
 	Context("When the agent Pod runs an outdated pod template", func() {
 		const serverName = "fsrv-template"
 
