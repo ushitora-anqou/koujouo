@@ -1,7 +1,9 @@
-# Release workflow: build the image with Nix and publish it to GHCR.
+# Release workflow: build the image with Nix and publish it to GHCR, and, on a
+# v* tag, package the Helm chart and attach it to the GitHub Release.
 #
 # Flow: meta (image name + final tags) -> build (matrix over the platforms,
-# native runners, per-arch tag push) -> merge (imagetools create).
+# native runners, per-arch tag push) -> merge (imagetools create), plus chart
+# (package the chart and publish the GitHub Release) on a v* tag.
 #
 # Conventions:
 # - image: imageName and imageTag are evaluated from the flake package
@@ -19,8 +21,17 @@
 #   (builtins.resolveGoPackages), which the shellHook of the dev shell appends
 #   to NIX_CONFIG. Every job that evaluates the flake enters the dev shell
 #   first, because nix-develop exports that environment to the later steps.
-# - the workflow does not go through `make`: it runs `nix build .#dockerImage`
-#   directly, so a change of the Makefile cannot break the release.
+# - the image jobs do not go through `make`: they run `nix build .#dockerImage`
+#   directly, so a change of the Makefile cannot break the image. The chart job
+#   is the exception: it runs `make release-chart`, the target a local release
+#   uses, so both produce the same archive.
+# - chart: the chart is released by the same v* tag. Its version is the tag
+#   without the `v` (v0.1.0 -> 0.1.0), the same version the image carries, and
+#   `helm package --version/--app-version` sets it without rewriting Chart.yaml.
+#   The archive is attached to the GitHub Release, which is the only place it
+#   is published: `gh` is preinstalled on the runner and needs no new action
+#   pin, and one publication path cannot leave the chart in half of the places
+#   a release is expected in. A master push publishes the image only.
 
 name: Release image
 
@@ -248,3 +259,106 @@ jobs:
             docker buildx imagetools inspect "${t}" | tee -a "$GITHUB_STEP_SUMMARY"
             echo "::endgroup::"
           done <<< "${TAGS}"
+
+  # ── Chart: package the chart and attach it to the GitHub Release ──────────
+  #
+  # A v* tag only: a master push updates the image tags of the branch and
+  # releases nothing.
+  #
+  # No step may continue on failure: a release without its chart (or a chart
+  # without its release) is a broken release, and hiding the error in a warning
+  # would leave it that way while the run reports success. `needs: [meta]` puts
+  # this job beside `build` and `merge`, not after them, so a failure here can
+  # leave the image tags in GHCR without a GitHub Release, and a release naming
+  # image tags that `merge` did not create yet; either way the run is red.
+  chart:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [meta]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload the chart archive to it
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
+        with:
+          # go2nix builds its Nix plugin against the upstream Nix of nixpkgs
+          # (2.34.9). Install that exact release so the plugin's ABI matches;
+          # the hash is the published sha256 of the installer script.
+          install_url: https://releases.nixos.org/nix/nix-2.34.9/install
+          install_sha256: a03ce2e9eaf4ea1560260b9a93e311dbaf589d28fb5c9318f8d9e768ee6339d8
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # The dev shell provides helm, which packages the chart.
+      - name: Enter the Nix dev shell
+        uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1.2.1
+
+      # The chart version is the tag without its `v` (v0.1.0 -> 0.1.0), which
+      # is what the chart holds as its version and appVersion. metadata-action
+      # reports the image tag as the ref writes it (v0.1.0), so strip the prefix
+      # here, and refuse a version that does not carry it rather than package a
+      # chart whose version the release does not name.
+      - name: Derive the chart version from the tag
+        id: chart-version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          if [ -z "$version" ] || [ "$version" = "$VERSION" ]; then
+            echo "::error::Expected a v* tag, but metadata-action reported '${VERSION}'"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Lint the chart
+        run: helm lint charts/koujouo
+
+      # The same target a local release runs (`make release-chart`), so the
+      # archive attached here and the one built from a checkout are identical.
+      - name: Package the chart
+        env:
+          CHART_VERSION: ${{ steps.chart-version.outputs.version }}
+        run: make release-chart RELEASE_VERSION="${CHART_VERSION}"
+
+      # `gh release view` fails while the release does not exist yet: create it
+      # with the archive then, and upload into it when an earlier run made it
+      # (`--clobber` replaces an archive of the same name). The notes name the
+      # image tag as it is (`v0.1.0`) and the chart version without its `v`
+      # (`0.1.0`); the chart defaults `image.tag` to `latest`, so the install
+      # command names the image tag of the release.
+      - name: Publish the GitHub Release with the chart archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ needs.meta.outputs.repo }}
+          IMAGE_TAG: ${{ needs.meta.outputs.version }}
+          CHART_VERSION: ${{ steps.chart-version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="koujouo-${CHART_VERSION}.tgz"
+          notes="$(
+            printf '%s\n' \
+              "Multi-arch image (\`linux/amd64\`, \`linux/arm64\`): \`${REPO}:${IMAGE_TAG}\`" \
+              "" \
+              "Helm chart \`${archive}\`: version and appVersion \`${CHART_VERSION}\`, the tag without its \`v\`" \
+              "" \
+              '```' \
+              "helm upgrade --install koujouo ${archive} -n koujouo-system --create-namespace \\" \
+              "  --set image.tag=${IMAGE_TAG}" \
+              '```'
+          )"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists: uploading the chart archive to it"
+            gh release upload "${TAG}" dist/*.tgz --clobber
+          else
+            gh release create "${TAG}" dist/*.tgz --title "${TAG}" --notes "${notes}"
+          fi
+          echo "Published ${archive} to the release ${TAG}" | tee -a "$GITHUB_STEP_SUMMARY"

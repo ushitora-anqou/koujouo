@@ -237,14 +237,42 @@ kubectl delete crd factorioservers.koujouo.anqou.net
 
 The chart lives in [`charts/koujouo`](charts/koujouo) and is what the
 [quick start](#to-deploy-on-the-cluster) installs. Users can install it from a
-checkout of this repository as shown there, or package it into an archive of
-its own:
+checkout of this repository as shown there, or from the archive a release
+carries: every `v*` tag attaches `koujouo-<version>.tgz` to its GitHub Release,
+versioned after the tag without its `v` (`v0.1.0` gives `koujouo-0.1.0.tgz`,
+chart version `0.1.0`, `appVersion: 0.1.0`).
 
 ```sh
+TAG=v0.1.0
+VERSION=${TAG#v}
+curl -LO "https://github.com/ushitora-anqou/koujouo/releases/download/${TAG}/koujouo-${VERSION}.tgz"
+helm upgrade --install koujouo "koujouo-${VERSION}.tgz" -n koujouo-system --create-namespace \
+  --set image.tag=${TAG}
+```
+
+The archive is versioned after the tag without its `v` (`v0.1.0` gives chart
+version `0.1.0` and `appVersion: 0.1.0`), while the release keeps the `v` on
+the image tag (`ghcr.io/ushitora-anqou/koujouo:v0.1.0`), so `--set
+image.tag=${TAG}` runs the image of the release. The chart defaults `image.tag`
+to `latest`, the image of `master`, and Helm only falls back to the
+`appVersion` when the tag is empty. Override `image.repository` as well when
+you pull the image from your own registry (see
+[By pulling the published image](#by-pulling-the-published-image)).
+
+To build the same archive from a checkout, package it yourself:
+
+```sh
+make release-chart VERSION=v0.1.0   # dist/koujouo-0.1.0.tgz
+# or, without the Makefile:
 helm package charts/koujouo
 helm upgrade --install koujouo koujouo-0.1.0.tgz -n koujouo-system --create-namespace \
   --set image.repository=<some-registry>/koujouo --set image.tag=tag
 ```
+
+`make release-chart` runs `helm lint` first and writes the archive into `dist/`
+(ignored by git) with the version from `VERSION`, so `Chart.yaml` keeps its own
+version. `make release` builds both artifacts of a release: the image pushed to
+`IMG` (`make release-image`) and that chart archive.
 
 `make manifests` refreshes the generated parts of the chart (the CRD and the
 manager ClusterRole), so commit the chart together with the API changes it

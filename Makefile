@@ -223,6 +223,40 @@ docker-build-e2e-old: ## Build the docker image of a previous build for the e2e 
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
+##@ Release
+
+# A v* tag release builds the same artifacts in .github/workflows/release.yml:
+# the multi-arch image on GHCR and the chart archive attached to the GitHub
+# Release. The targets here build them from a local tree, and `release` runs
+# both; the image goes to ${IMG}, which has to name a registry you hold
+# credentials for, and its tag is whatever IMG names. Publishing the GitHub
+# Release is left to the workflow, which has the token for it.
+#
+# VERSION is the chart version as well, so `release-chart` needs a semver
+# version there: `helm package --version` rejects the revision a dirty tree
+# produces. RELEASE_VERSION drops the leading `v` of a tag, so
+# `make release-chart VERSION=v0.1.0` packages the chart as 0.1.0 with
+# appVersion 0.1.0, the tag without its `v` as the release names them.
+RELEASE_VERSION ?= $(patsubst v%,%,$(VERSION))
+DIST_DIR ?= dist
+
+.PHONY: release
+release: release-image release-chart ## Build and push the image and package the Helm chart.
+
+.PHONY: release-image
+release-image: docker-build docker-push ## Build and push the docker image with the manager to IMG.
+
+# `helm package --version/--app-version` sets the versions of the archive
+# without rewriting Chart.yaml: the checked-in chart keeps its own version,
+# while the packaged one carries $(RELEASE_VERSION).
+.PHONY: release-chart
+release-chart: ## Lint the Helm chart and package it into the dist directory as version RELEASE_VERSION.
+	"$(HELM)" lint charts/koujouo
+	mkdir -p "$(DIST_DIR)"
+	"$(HELM)" package charts/koujouo --destination "$(DIST_DIR)" \
+		--version "$(RELEASE_VERSION)" --app-version "$(RELEASE_VERSION)"
+	ls -l "$(DIST_DIR)"/*.tgz
+
 ##@ Dependencies
 
 ## Tool Binaries

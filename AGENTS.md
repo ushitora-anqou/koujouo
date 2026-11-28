@@ -48,7 +48,8 @@ flake.lock                        Pinned Nix inputs (update with `nix flake upda
 Makefile                          Build, test and image commands
 .github/workflows/ci.yml          CI: make all and check-uncomitted
 .github/workflows/e2e.yml         CI: make test-e2e (Kind, Docker)
-.github/workflows/release.yml     Release: multi-arch image to GHCR
+.github/workflows/release.yml     Release: multi-arch image to GHCR; on a `v*` tag the chart
+                                  `.tgz` attached to the GitHub Release
 PROJECT                           Kubebuilder metadata Auto-generated (DO NOT EDIT)
 ```
 
@@ -336,12 +337,18 @@ suite needs.
 make all               # fmt generate manifests lint-config lint test
 make check-uncomitted  # Fails unless the regeneration leaves nothing to commit
 ```
+
 `make all` does not run the e2e suite: it regenerates the code and the chart, lints and runs the
 unit and envtest tests, and, inside `test`, the gitleaks scan of the git history. Run the e2e
 suite with `make test-e2e` locally or let the E2E workflow (`.github/workflows/e2e.yml`) run it —
 it needs Docker, a Kind cluster and up to 60 minutes. `check-uncomitted` fails on any uncommitted
 change by design, so commit (or at least `git add`) your work first and run it to learn whether
 the generated files are up to date.
+
+`make release` builds the two release artifacts from a local tree and is not part of either
+command: `make release-image` (the image of this tree, pushed to `IMG`) and `make release-chart`
+(`helm lint`, then `helm package` into `dist/`). See "Release Targets" under "Distribution
+Options".
 
 **After editing `*_types.go` or markers:**
 ```
@@ -422,24 +429,37 @@ the unit and envtest suites, which take minutes.
   cluster need the rest. `make test-e2e` receives `DISCORD_WEBHOOK_URL` from a repository secret of
   the same name when one is configured; without it the suite runs without Discord notifications.
 - `release.yml` is separate: it builds `nix build .#dockerImage` and publishes it to GHCR (see the
-  next paragraph). It does not go through the Makefile, so a change of a `make` target cannot break
-  it.
+  next paragraph). The image jobs do not go through the Makefile, so a change of a `make` target
+  cannot break them; only its `chart` job runs `make release-chart`.
 
 CI therefore also compares the regenerated files with the committed ones: run the `make` targets
 under "After Making Changes" yourself and commit their output.
 
 `release.yml` publishes the image on a push to `master` and on a `v*` tag: a `master` push tags
 `master` and `latest`, a `v*` tag tags `vX.Y.Z` only, so an old tag cannot move `latest`. It runs
-three jobs. `meta` takes the repository name from the flake (`dockerImage.imageName`) and lets
-`docker/metadata-action` compute the final tags. `build` runs once per platform — `linux/amd64` on
-`ubuntu-latest`, `linux/arm64` on `ubuntu-26.04-arm` — and `nix build .#dockerImage` resolves to
-the runner's own system there, so each architecture is built natively (no cross-compilation or
-emulation); each run pushes `<version>-linux-<arch>` and uploads its digest. `merge` assembles the
-per-arch digests into the final multi-arch tags with `docker buildx imagetools create`, which
-needs buildx pinned to v0.31.0 (`imagetools create` is broken on GHCR since v0.31.1,
-docker/buildx#3708). The workflow runs `nix build` rather than a `make` target; `meta` and `build`
-enter the dev shell because evaluating the flake needs go2nix's Nix plugin, which the `shellHook`
-exports through `NIX_CONFIG`. `merge` only assembles the digests with Docker and needs neither.
+four jobs. `meta` takes the repository name from the flake (`dockerImage.imageName`) and lets
+`docker/metadata-action` compute the final tags (including `version`, the tag as it is written).
+`build` runs once per platform — `linux/amd64` on `ubuntu-latest`, `linux/arm64` on
+`ubuntu-26.04-arm` — and `nix build .#dockerImage` resolves to the runner's own system there, so
+each architecture is built natively (no cross-compilation or emulation); each run pushes
+`<version>-linux-<arch>` and uploads its digest. `merge` assembles the per-arch digests into the
+final multi-arch tags with `docker buildx imagetools create`, which needs buildx pinned to v0.31.0
+(`imagetools create` is broken on GHCR since v0.31.1, docker/buildx#3708). The image jobs run
+`nix build` rather than a `make` target; `meta` and `build` enter the dev shell because evaluating
+the flake needs go2nix's Nix plugin, which the `shellHook` exports through `NIX_CONFIG`. `merge`
+only assembles the digests with Docker and needs neither.
+
+On a `v*` tag (only: a `master` push releases no chart) a fourth job, `chart`, adds the Helm chart
+to the release: it strips the `v` of `meta.outputs.version` (`v0.1.0` → `0.1.0`), runs `helm lint`
+and `make release-chart RELEASE_VERSION=<version>`, and attaches `dist/koujouo-<version>.tgz` to
+the GitHub Release of the tag with `gh release create` (`gh release upload --clobber` when the
+release exists). The chart version and its `appVersion` are both the tag without the `v`, while
+the image keeps the `v` (the tag metadata-action reports). The job carries
+`permissions: contents: write` (the top-level `packages: write` stays as it is) and no step
+continues on failure: a release missing its chart fails the run. The image is pushed by
+`build`/`merge`, which `chart` does not wait for (`needs: [meta]`), so a failed run can leave the
+image published without a GitHub Release; the chart publishes to no other place (no GHCR chart
+repository), so the archive has a single source.
 
 ## CLI Commands Cheat Sheet
 
@@ -520,6 +540,9 @@ make secrets      # Scan the git history for committed secrets with gitleaks
 make test         # Secret scan + agent unit tests + controller envtest suite (skips test/e2e)
 make test-e2e     # End-to-end on a dedicated Kind cluster, with the real Factorio binary
 make run          # Run the manager on the host (uses current kubeconfig context)
+make release      # Release artifacts: the image pushed to IMG and the chart .tgz in dist/
+make release-image  # Just the image: docker-build docker-push IMG=<registry>/koujouo:<tag>
+make release-chart  # Just the chart: helm lint, then helm package into dist/
 ```
 
 Tests come in three layers:
@@ -773,7 +796,9 @@ helm upgrade --install koujouo charts/koujouo -n koujouo-system --create-namespa
   an asset of this repository and is not hosted anywhere else
 - The CRD carries `helm.sh/resource-policy: keep`, so `helm uninstall` keeps it and the
   `FactorioServer`s it holds; delete the CRD yourself once none is left
-- `helm package charts/koujouo` produces an archive for users without a checkout
+- `helm package charts/koujouo` produces an archive for users without a checkout; `make
+  release-chart` does the same with the version from `VERSION`, and a `v*` tag attaches it to the
+  GitHub Release (see "Release Targets")
 - `make lint` runs `helm lint charts/koujouo`; `make manifests` refreshes the generated parts of
   the chart
 
@@ -787,6 +812,26 @@ make docker-build docker-push IMG=$IMG
 `make docker-build` runs `nix build .#dockerImage`, loads the archive into
 the local container runtime, and re-tags it to `${IMG}`. Remember that the
 flake only builds from git-tracked files.
+
+### Release Targets
+
+| Target | What it does |
+| --- | --- |
+| `make release` | `release-image` and `release-chart`: the image pushed to `IMG` and the chart packaged |
+| `make release-image` | `docker-build docker-push`: builds the image of this tree and pushes it to `IMG` |
+| `make release-chart` | `helm lint`, then `helm package` into `dist/` as version `$(RELEASE_VERSION)` |
+
+`RELEASE_VERSION` defaults to `VERSION` without its leading `v`
+(`$(patsubst v%,%,$(VERSION))`), and both the chart version and its
+`appVersion` are set from it (`helm package --version --app-version`, which
+leaves `Chart.yaml` alone). `helm package` wants a semantic version, so pass one
+explicitly when the default is a git revision: `make release-chart
+RELEASE_VERSION=0.1.0`. `DIST_DIR` (default `dist`) moves the output; git
+ignores it and the `*.tgz` archives.
+
+A `v*` tag release is `release.yml`, not these targets: it publishes the image
+to GHCR and attaches `dist/koujouo-<version>.tgz` to the GitHub Release, which
+needs `gh` and a token, so the targets above stop at the artifacts.
 
 ## References
 

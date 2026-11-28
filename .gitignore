@@ -32,6 +32,11 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 
+# Release artifacts: the chart archives `make release-chart` writes, and the
+# directory it writes them into
+dist/
+*.tgz
+
 # Tool-managed directory (local agent configuration and state)
 .commandcode/
 
