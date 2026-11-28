@@ -275,6 +275,12 @@ exports the dev shell environment to subsequent steps. All actions are pinned by
 commit SHA. Dependabot (`.github/dependabot.yml`) updates Go modules and the
 pinned actions weekly.
 
+The action installs upstream Nix 2.34.9 (`determinate: false` and a
+`nix-package-url` pinned per architecture), because the go2nix Nix plugin is
+built against nixpkgs' Nix 2.34.9 and Determinate Nix is a different build
+whose ABI the plugin cannot load (`undefined symbol: nix::eBlackHole`). Keep
+the pinned version in step with `nixVersions.nix_2_34` in `flake.lock`.
+
 `ci.yml` runs on every push and pull request: one job on `ubuntu-latest` that does
 `go mod tidy`, then `make all`, then `make check-uncomitted` — the same two commands a
 commit has to pass locally.
