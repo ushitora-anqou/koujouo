@@ -38,6 +38,12 @@ const (
 	// defaultLeaveTimeoutSeconds is applied when the spec omits it.
 	defaultLeaveTimeoutSeconds = 60
 
+	// defaultAgentStatusTimeout bounds a status call. The agent answers it
+	// without taking the lifecycle lock, so it is quick; the bound only
+	// matters for an agent that stops responding without closing the
+	// connection, which would otherwise wait forever.
+	defaultAgentStatusTimeout = 30 * time.Second
+
 	// configFileName and serverWhitelistFileName are the file names the
 	// agent expects in Config.files.
 	configFileName          = "config.ini"
@@ -122,7 +128,8 @@ const defaultConfigureProgressInterval = 2 * time.Second
 // A failing poll is not fatal: the configure result decides the outcome.
 // Status patches go on without a deadline as well, so a long drain is
 // reported all the way to its end; only a controller shutdown ends the
-// wait early.
+// wait early. Each poll is bounded by defaultAgentStatusTimeout, so an
+// agent that stops answering costs one poll, not the whole wait.
 func (r *FactorioServerReconciler) awaitConfigure(
 	ctx context.Context,
 	agent rpcapi.Agent,
@@ -147,6 +154,8 @@ func (r *FactorioServerReconciler) awaitConfigure(
 		case <-ticker.C:
 		}
 
+		// callAgentStatus bounds the poll itself, so an agent that stopped
+		// answering costs one poll, not the wait.
 		reported, err := r.callAgentStatus(waitCtx, agent)
 		if err != nil || sameAgentPhase(last, reported) {
 			continue
@@ -268,9 +277,14 @@ func writeBackupSettings(out rpcapi.Config, backup *backupSettings) error {
 	return nil
 }
 
-// callAgentStatus polls the current state of the agent.
+// callAgentStatus polls the current state of the agent. The call is bounded
+// by defaultAgentStatusTimeout: an agent that keeps the connection open
+// without answering would otherwise hold the caller forever.
 func (r *FactorioServerReconciler) callAgentStatus(ctx context.Context, agent rpcapi.Agent) (*agentStatus, error) {
-	future, release := agent.Status(ctx, nil)
+	statusCtx, cancel := context.WithTimeout(ctx, defaultAgentStatusTimeout)
+	defer cancel()
+
+	future, release := agent.Status(statusCtx, nil)
 	defer release()
 
 	result, err := future.Struct()

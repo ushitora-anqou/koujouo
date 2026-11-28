@@ -681,6 +681,41 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(errors.IsNotFound(stsLookupErr)).To(BeTrue())
 			Expect(fakeAgent.stopCount()).To(Equal(1))
 		})
+
+		It("should report Pending while the resumed agent Pod is missing", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.Suspend = true
+			})
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fetchServer(ctx, serverName).Status.Phase).To(Equal(koujouoanqounetv1.PhaseSuspended))
+
+			By("resuming the server before the agent Pod is there again")
+
+			// envtest runs no StatefulSet controller, so the Pod of the
+			// deleted StatefulSet does not come back on its own.
+			Expect(k8sClient.Delete(ctx, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: serverName + "-0"},
+			})).To(Succeed())
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.Suspend = false
+			})
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testRetryInterval))
+
+			server := fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhasePending))
+			expectCondition(server, "Ready", metav1.ConditionFalse, "AgentUnavailable")
+			expectCondition(server, "Progressing", metav1.ConditionTrue, "AgentUnavailable")
+			expectCondition(server, "Suspended", metav1.ConditionFalse, "AgentUnavailable")
+		})
 	})
 
 	Context("When the agent runs another version", func() {

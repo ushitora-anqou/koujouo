@@ -73,19 +73,24 @@ func syncAgentStatus(status *koujouoanqounetv1.FactorioServerStatus, generation 
 }
 
 // syncUnavailableStatus reflects an agent that cannot be reached yet,
-// for example while its pod is starting.
+// for example while its pod is starting. The server is not suspended: the
+// condition is cleared so that resuming one reports Pending instead of
+// keeping the phase of the suspension.
 func syncUnavailableStatus(status *koujouoanqounetv1.FactorioServerStatus, generation int64, message string) {
 	setCondition(status, conditionReady, false, reasonAgentUnavailable, message, generation)
 	setCondition(status, conditionProgressing, true, reasonAgentUnavailable, message, generation)
+	setCondition(status, conditionSuspended, false, reasonAgentUnavailable, message, generation)
 
 	status.Phase = derivePhase(status.Conditions)
 }
 
 // syncReferenceErrorStatus reflects a spec reference (ConfigMap or Secret)
-// that could not be resolved.
+// that could not be resolved. Like syncUnavailableStatus, it clears the
+// Suspended condition of a previous suspension.
 func syncReferenceErrorStatus(status *koujouoanqounetv1.FactorioServerStatus, generation int64, message string) {
 	setCondition(status, conditionReady, false, reasonReferencedMissing, message, generation)
 	setCondition(status, conditionProgressing, false, reasonReferencedMissing, message, generation)
+	setCondition(status, conditionSuspended, false, reasonReferencedMissing, message, generation)
 
 	status.Phase = derivePhase(status.Conditions)
 }

@@ -37,6 +37,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -60,6 +61,10 @@ const (
 
 	// eventAction is the action recorded on FactorioServer events.
 	eventAction = "Reconcile"
+
+	// defaultMaxConcurrentReconciles is how many FactorioServers are
+	// reconciled at the same time.
+	defaultMaxConcurrentReconciles = 8
 )
 
 // FactorioServerReconciler reconciles a FactorioServer object.
@@ -163,6 +168,12 @@ func (r *FactorioServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	err := ctrl.NewControllerManagedBy(mgr).
+		// A configure call takes minutes: it drains the players and
+		// downloads the game, and the reconcile waits for the agent to
+		// return. A single worker would hold back the reconciles of every
+		// other FactorioServer for that long. The workqueue never runs the
+		// same key concurrently, so one FactorioServer stays serial.
+		WithOptions(controller.Options{MaxConcurrentReconciles: defaultMaxConcurrentReconciles}).
 		// The controller writes the status itself, so a status-only update
 		// must not enqueue the next reconcile: the agent is polled through
 		// the requeue interval and through the Pod watch.
