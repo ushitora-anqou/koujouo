@@ -119,7 +119,7 @@ type FactorioServerReconciler struct {
 	managerNamespaceWarned atomic.Bool
 }
 
-// +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
@@ -721,6 +721,10 @@ func syncPodSpec(podSpec, desiredPodSpec *corev1.PodSpec) {
 		podSpec.AutomountServiceAccountToken, desiredPodSpec.AutomountServiceAccountToken,
 	) {
 		podSpec.AutomountServiceAccountToken = desiredPodSpec.AutomountServiceAccountToken
+	}
+
+	if !equality.Semantic.DeepEqual(podSpec.ImagePullSecrets, desiredPodSpec.ImagePullSecrets) {
+		podSpec.ImagePullSecrets = desiredPodSpec.ImagePullSecrets
 	}
 
 	if volumesDrifted(podSpec.Volumes, desiredPodSpec.Volumes) {

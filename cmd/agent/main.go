@@ -47,7 +47,7 @@ import (
 // is not given. The image of the agent holds the file.
 const defaultConfigPath = "/etc/koujouo/agent.yaml"
 
-// Agent defaults. The shutdown deadline stays below the 600 seconds
+// Agent defaults. The shutdown deadline stays below the 900 seconds
 // termination grace period of the StatefulSet, so the graceful stop
 // finishes before the kubelet would kill the pod.
 //

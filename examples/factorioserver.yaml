@@ -40,6 +40,10 @@ spec:
   #       memory: 1Gi
   #     limits:
   #       memory: 1500Mi
+  #   # Secrets the kubelet uses to pull the image of the agent Pod, needed
+  #   # only for an image in a private registry.
+  #   imagePullSecrets:
+  #     - name: my-registry-secret
   # ephemeralVolume:
   #   volumeClaimTemplate:
   #     spec:

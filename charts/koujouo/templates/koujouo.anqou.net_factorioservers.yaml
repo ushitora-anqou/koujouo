@@ -58,6 +58,28 @@ spec:
                 agent:
                   description: agent configures the agent container of the StatefulSet.
                   properties:
+                    imagePullSecrets:
+                      description: |-
+                        imagePullSecrets are the Secrets the kubelet uses to pull the
+                        image of the agent Pod. They are needed when the image lives in a
+                        private registry.
+                      items:
+                        description: |-
+                          LocalObjectReference contains enough information to let you locate the
+                          referenced object inside the same namespace.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      type: array
                     resources:
                       description: resources for the agent container (requests/limits).
                       properties:
@@ -551,8 +573,9 @@ spec:
                   description: |-
                     leaveTimeoutSeconds is how long the agent waits for players to
                     leave after warning them before it forces a save and shutdown.
-                    Defaults to 60. The maximum leaves room for the save write inside
-                    the 900 second termination grace period of the agent Pod.
+                    Defaults to 60, and 0 waits for no player at all. The maximum
+                    leaves room for the save write inside the 900 second termination
+                    grace period of the agent Pod.
                   format: int32
                   maximum: 300
                   minimum: 0

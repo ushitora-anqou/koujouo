@@ -170,6 +170,10 @@ create a StatefulSet. The Helm chart always sets it to its own image, so the
 - The Discord notification for a player who joins or leaves relies on the
   `[JOIN]` / `[LEAVE]` lines of the Factorio log. Its format was not verified
   against a live multiplayer session; only the parsing is unit tested.
+- The RCON password reaches the game as a command line argument, so another
+  process of the same Pod can read it from `/proc/<pid>/cmdline`. Factorio
+  accepts it no other way. When you add a sidecar to the agent Pod, trust
+  that process with the password.
 
 ### To Uninstall
 **Delete the instances (CRs) from the cluster:**

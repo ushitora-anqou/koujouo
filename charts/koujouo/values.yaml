@@ -17,9 +17,22 @@ image:
   # /kojouo/agent. The chart passes the same image to the manager's
   # controllerImage, so the agent StatefulSets run it as well.
   repository: ghcr.io/ushitora-anqou/koujouo
-  # Overrides the image tag whose default is the chart appVersion.
-  tag: ""
+  # The tag the release workflow pushes. Empty falls back to
+  # Chart.appVersion, which the registry does not hold: the release pushes
+  # only `master`, `latest` and the `v*` tags, so an empty tag leaves the
+  # manager in ImagePullBackOff.
+  tag: latest
   pullPolicy: IfNotPresent
+
+# Secrets the kubelet uses to pull the image of the manager Pod, as a list
+# of `- name: <secret>`. The agent Pods take theirs from
+# spec.agent.imagePullSecrets of the FactorioServer.
+imagePullSecrets: []
+
+# Update strategy of the manager Deployment. RollingUpdate keeps the old pod
+# serving until the new one is ready; config.leaderElection makes sure that
+# only one of the two reconciles during that overlap.
+deploymentStrategy: RollingUpdate
 
 serviceAccount:
   # Create the ServiceAccount the manager runs as, which the RBAC of the chart
@@ -85,8 +98,10 @@ config:
   # Address the health probes (GET /healthz and /readyz) bind to.
   healthProbeBindAddress: ":8081"
   # Elect a leader, so that only one manager of several replicas is active.
-  # The chart runs a single replica, so this stays false.
-  leaderElection: false
+  # During a rolling update the old and the new pod run at the same time;
+  # leader election keeps a single one reconciling. Clear it only together
+  # with deploymentStrategy: Recreate.
+  leaderElection: true
   # Serve the metrics endpoint over HTTPS, authenticated and authorized by the
   # API server. Takes effect only when metricsBindAddress is not "0".
   secureMetrics: true

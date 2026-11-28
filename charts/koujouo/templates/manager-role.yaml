@@ -47,8 +47,6 @@ rules:
     resources:
       - factorioservers
     verbs:
-      - create
-      - delete
       - get
       - list
       - patch

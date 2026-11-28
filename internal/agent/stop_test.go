@@ -334,6 +334,60 @@ func TestStopTimesOut(t *testing.T) {
 	assertSuspended(t, gameAgent)
 }
 
+// TestStopWithZeroLeaveTimeout verifies that a configured leave timeout of
+// 0 means "wait for no player at all" instead of falling back to the
+// default.
+func TestStopWithZeroLeaveTimeout(t *testing.T) {
+	t.Parallel()
+
+	conn := newFakeRcon(3)
+
+	gameAgent, game := newStopTestAgent(t, conn)
+
+	gameAgent.mu.Lock()
+	gameAgent.config.LeaveTimeoutSeconds = 0
+	gameAgent.mu.Unlock()
+
+	elapsed := stopAgent(t, gameAgent)
+
+	if elapsed >= stopTestLeaveTimeoutSeconds*time.Second {
+		t.Errorf("stop() took %v, want no wait for a leave timeout of 0", elapsed)
+	}
+
+	assertSignals(t, game, syscall.SIGINT)
+
+	if chats := conn.recordedChats(); len(chats) != 1 {
+		t.Errorf("chats = %q, want one drain warning", chats)
+	}
+
+	assertSuspended(t, gameAgent)
+}
+
+// TestLeaveTimeoutSecondsDefaults verifies the fallback: only a missing
+// configuration yields the default, a configured value is reported as it
+// is.
+func TestLeaveTimeoutSecondsDefaults(t *testing.T) {
+	t.Parallel()
+
+	gameAgent, err := New(logr.Discard(), Options{
+		SaveDir:  t.TempDir(),
+		CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("could not create the agent: %v", err)
+	}
+
+	if got := gameAgent.leaveTimeoutSeconds(); got != defaultLeaveTimeoutSeconds {
+		t.Errorf("leaveTimeoutSeconds() = %d, want %d without a configuration", got, defaultLeaveTimeoutSeconds)
+	}
+
+	gameAgent.config = &Config{LeaveTimeoutSeconds: 0}
+
+	if got := gameAgent.leaveTimeoutSeconds(); got != 0 {
+		t.Errorf("leaveTimeoutSeconds() = %d, want 0", got)
+	}
+}
+
 // TestStopWithoutRcon verifies that a stop whose RCON endpoint does
 // not answer still stops the game without a warning.
 func TestStopWithoutRcon(t *testing.T) {

@@ -48,8 +48,9 @@ type FactorioServerSpec struct {
 
 	// leaveTimeoutSeconds is how long the agent waits for players to
 	// leave after warning them before it forces a save and shutdown.
-	// Defaults to 60. The maximum leaves room for the save write inside
-	// the 900 second termination grace period of the agent Pod.
+	// Defaults to 60, and 0 waits for no player at all. The maximum
+	// leaves room for the save write inside the 900 second termination
+	// grace period of the agent Pod.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=300
@@ -95,6 +96,12 @@ type AgentSpec struct {
 	// resources for the agent container (requests/limits).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// imagePullSecrets are the Secrets the kubelet uses to pull the
+	// image of the agent Pod. They are needed when the image lives in a
+	// private registry.
+	// +optional
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
 // GameConfigSpec selects the game configuration files from ConfigMaps.

@@ -173,6 +173,10 @@ var _ = Describe("FactorioServer Controller", func() {
 			container := statefulSet.Spec.Template.Spec.Containers[0]
 			Expect(container.Resources.Requests.Cpu().String()).To(Equal("100m"))
 			Expect(container.Resources.Requests.Memory().String()).To(Equal("256Mi"))
+
+			// A private registry needs the Secret on the agent Pod.
+			Expect(statefulSet.Spec.Template.Spec.ImagePullSecrets).To(ConsistOf(
+				corev1.LocalObjectReference{Name: serverName + "-registry"}))
 		})
 
 		It("should keep the game running across controller image upgrades", func() {
@@ -209,6 +213,7 @@ var _ = Describe("FactorioServer Controller", func() {
 			}
 			existing.Spec.Template.Spec.SecurityContext = nil
 			existing.Spec.Template.Spec.AutomountServiceAccountToken = nil
+			existing.Spec.Template.Spec.ImagePullSecrets = nil
 			existing.Spec.Template.Spec.Containers[0].SecurityContext = nil
 			existing.Spec.Template.Spec.Containers[0].LivenessProbe = nil
 
@@ -238,6 +243,10 @@ var _ = Describe("FactorioServer Controller", func() {
 			// The agent never talks to the API server, so the ServiceAccount
 			// token must not come back either.
 			Expect(*statefulSet.Spec.Template.Spec.AutomountServiceAccountToken).To(BeFalse())
+
+			// The image pull Secrets the spec names come back as well.
+			Expect(statefulSet.Spec.Template.Spec.ImagePullSecrets).To(ConsistOf(
+				corev1.LocalObjectReference{Name: serverName + "-registry"}))
 		})
 
 		It("should configure the agent and report its status", func() {
@@ -1122,6 +1131,7 @@ func fullServerSpec(name string) koujouoanqounetv1.FactorioServerSpec {
 					corev1.ResourceMemory: resource.MustParse("256Mi"),
 				},
 			},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: name + "-registry"}},
 		},
 		GameConfig: &koujouoanqounetv1.GameConfigSpec{
 			Config: &corev1.ConfigMapKeySelector{

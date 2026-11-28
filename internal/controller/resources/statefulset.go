@@ -193,7 +193,7 @@ func podTemplateHash(podSpec corev1.PodSpec, labels map[string]string) (string, 
 
 // agentPodSpec returns the pod spec of the agent pod.
 func agentPodSpec(server *koujouoanqounetv1.FactorioServer, controllerImage string) corev1.PodSpec {
-	return corev1.PodSpec{
+	podSpec := corev1.PodSpec{
 		// The agent never talks to the API server, so it carries no
 		// ServiceAccount token.
 		AutomountServiceAccountToken:  new(false),
@@ -210,6 +210,12 @@ func agentPodSpec(server *koujouoanqounetv1.FactorioServer, controllerImage stri
 		Containers: []corev1.Container{agentContainer(server, controllerImage)},
 		Volumes:    agentVolumes(server),
 	}
+
+	if server.Spec.Agent != nil {
+		podSpec.ImagePullSecrets = append([]corev1.LocalObjectReference(nil), server.Spec.Agent.ImagePullSecrets...)
+	}
+
+	return podSpec
 }
 
 // agentContainer returns the agent container of the agent pod.

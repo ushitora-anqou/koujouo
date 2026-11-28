@@ -103,9 +103,11 @@ func (a *Agent) drainGame(ctx context.Context) {
 	a.drain(ctx, conn, a.leaveTimeoutSeconds())
 }
 
-// leaveTimeoutSeconds returns how long the drain waits for the players.
+// leaveTimeoutSeconds returns how long the drain waits for the players. A
+// configured 0 waits for no player at all; only a missing configuration
+// falls back to the default.
 func (a *Agent) leaveTimeoutSeconds() int32 {
-	if a.config != nil && a.config.LeaveTimeoutSeconds > 0 {
+	if a.config != nil && a.config.LeaveTimeoutSeconds >= 0 {
 		return a.config.LeaveTimeoutSeconds
 	}
 

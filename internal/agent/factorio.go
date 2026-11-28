@@ -117,7 +117,10 @@ type startParams struct {
 }
 
 // factorioArgs assembles the game command line. A create run omits the
-// RCON arguments because it exits as soon as the save is written.
+// RCON arguments because it exits as soon as the save is written. The
+// RCON password reaches the game as an argument, so every process of the
+// Pod can read it from /proc/<pid>/cmdline: Factorio takes it no other
+// way, and the agent trusts the other containers of the Pod.
 func factorioArgs(params startParams) []string {
 	args := []string{"-c", params.configPath}
 

@@ -6,8 +6,13 @@ metadata:
   labels:
     {{- include "koujouo.labels" . | nindent 4 }}
 spec:
-  # A single replica: the manager elects no leader by default.
+  # A single replica: leader election keeps one manager active while the
+  # rolling update briefly runs two Pods.
   replicas: 1
+  {{- with .Values.deploymentStrategy }}
+  strategy:
+    type: {{ . }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "koujouo.selectorLabels" . | nindent 6 }}
@@ -25,6 +30,10 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "koujouo.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:

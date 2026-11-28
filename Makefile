@@ -11,7 +11,14 @@ YEAR ?= $(shell date +%Y)
 # the same value the Nix flake bakes into the image, so a locally built
 # manager recognizes the agents of an image built from the same tree as
 # agents of its own version.
-VERSION ?= $(shell git describe --always --dirty --exclude='*' 2>/dev/null || echo dev)
+#
+# A dirty tree adds the build time: building twice from the same commit with
+# different uncommitted changes would otherwise stamp both builds with the
+# same version, and the manager would take the new agent for a build of its
+# own version and skip the in-place upgrade. Releases are built from a clean
+# commit, so only development builds carry the suffix.
+VERSION ?= $(shell v=$$(git describe --always --dirty --exclude='*' 2>/dev/null || echo dev); \
+  if [ "$${v%-dirty}" != "$$v" ]; then echo "$$v-$$(date +%s)"; else echo "$$v"; fi)
 LDFLAGS ?= -X github.com/ushitora-anqou/koujouo/internal/version.Agent=$(VERSION)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
