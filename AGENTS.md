@@ -111,8 +111,8 @@ them with `go install` or download them manually (the Go tools of go.mod are
 the exception: they run as `go tool <name>`, never installed):
 
 ```bash
-nix develop   # go, golangci-lint, kubebuilder, kind, kubectl, helm, yq,
-              # setup-envtest, controller-gen, capnp
+nix develop   # go, golangci-lint, gitleaks, kubebuilder, kind, kubectl, helm,
+              # yq, setup-envtest, controller-gen, capnp
 ```
 
 - `controller-gen` is provided by the nixpkgs `kubernetes-controller-tools` package
@@ -288,7 +288,8 @@ commit has to pass locally.
 - `make all` is the pre-commit gate:
   `fmt generate manifests lint-config lint test test-e2e`. It regenerates the DeepCopy code, the
   capnp code and the chart, verifies the golangci-lint configuration, runs `golangci-lint` and
-  `helm lint`, then the unit and envtest suite (`test`) and the Kind end-to-end suite (`test-e2e`,
+  `helm lint`, then the unit and envtest suite (`test`, which scans the git history for secrets
+  first) and the Kind end-to-end suite (`test-e2e`,
   which builds the image with Nix and needs Docker). It has no `build` step on purpose: `test`
   compiles the manager and the agent, and `test-e2e` builds the image. `test-e2e` receives
   `DISCORD_WEBHOOK_URL` from a repository secret of the same name when one is configured; without
@@ -393,7 +394,8 @@ kubebuilder create webhook \
 
 ```bash
 nix develop       # Enter the dev shell first
-make test         # Agent unit tests + controller envtest suite (skips test/e2e)
+make secrets      # Scan the git history for committed secrets with gitleaks
+make test         # Secret scan + agent unit tests + controller envtest suite (skips test/e2e)
 make test-e2e     # End-to-end on a dedicated Kind cluster, with the real Factorio binary
 make run          # Run the manager on the host (uses current kubeconfig context)
 ```
@@ -411,7 +413,9 @@ Tests come in three layers:
   (`AgentBinaryPath`). Check `suite_test.go` for the setup.
 - **E2E** (`test/e2e/`): Kind, the Nix-built image and the real game; see below.
 
-`make test` resolves envtest binaries via `setup-envtest` (downloaded on demand);
+`make test` begins with `make secrets`, which scans the whole git history with gitleaks; it
+therefore needs a full checkout (CI passes `fetch-depth: 0` to `actions/checkout`). It resolves
+envtest binaries via `setup-envtest` (downloaded on demand);
 the `ENVTEST_K8S_VERSION` is derived from `k8s.io/api` in go.mod. `make test`, `make build`,
 `make run` and `make test-e2e` regenerate the manifests and the code first
 (`manifests generate fmt`), so they can leave modified generated files behind.

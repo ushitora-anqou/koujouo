@@ -250,14 +250,17 @@ nix develop
 | `make generate-capnp` | Regenerates `rpc/koujouo.capnp.go` after editing `rpc/koujouo.capnp` |
 | `make lint` | Runs golangci-lint and `helm lint charts/koujouo` |
 | `make lint-fix` | Runs golangci-lint and fixes what it can |
-| `make test` | Unit tests and envtest tests |
+| `make secrets` | Scans the git history for committed secrets with gitleaks |
+| `make test` | Scans the git history for secrets, then runs the unit and envtest tests |
 | `make test-e2e` | End-to-end tests on a dedicated Kind cluster with the real Factorio binary |
 
 Every push and pull request runs the `CI` workflow
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), which is `go mod tidy`,
 `make all` and `make check-uncomitted`. `make all` regenerates the code and the
 chart, lints them and runs both test layers (the e2e tests included), so run it
-before you push. `make check-uncomitted` runs `fmt generate manifests` once more
+before you push. `make test` begins with a gitleaks scan of the git history, so
+the workflow checks out the full history (`fetch-depth: 0`).
+`make check-uncomitted` runs `fmt generate manifests` once more
 and fails when that leaves anything uncommitted — a generated file you forgot, an
 untracked file, or any other change in your working tree.
 

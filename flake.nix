@@ -177,6 +177,7 @@
             [
               go
               golangci-lint
+              gitleaks
               kubebuilder
               kind
               kubectl

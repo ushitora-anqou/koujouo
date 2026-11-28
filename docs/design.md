@@ -779,6 +779,8 @@ controller の `agentclient.go` は interface 化（`type AgentDialer interface 
 
 ### 7.2 integration（envtest、`make test`）
 
+`make test` は最初に `make secrets` で gitleaks に git 履歴をスキャンさせる（作業ツリーではない。未追跡のローカルファイルはリポジトリの一部ではないため）。`--redact` を付けるのは、検出した秘密情報を CI のログに出さないためである。
+
 controller のロジックを実際の API server で検証。agent は動かないため `AgentDialer` に in-process fake を注入する。
 
 - FactorioServer 作成 → StatefulSet（replica 1、command、volumes、labels）が正しく作られる
@@ -838,7 +840,7 @@ Discord 通知の検証範囲: join/leave はプレイヤーの接続が必要�
 
 `.github/workflows/ci.yml` の 1 workflow・1 job（`ubuntu-latest`、`timeout-minutes: 90`）で、コミット前にローカルで通すのと同じゲートを回す。step は checkout（SHA 固定）、Nix install（`cachix/install-nix-action`、`install_url` / `install_sha256` で upstream 2.34.9 に固定）、dev shell への enter（`nicknovitski/nix-develop`）、`go mod tidy`、`make all`、`make check-uncomitted` の順で、push と pull request のたびに実行する。以前の `lint.yml` / `test.yml` / `test-e2e.yml` の 3 workflow はこれに統合した。go2nix のプラグインは nixpkgs の Nix 2.34.9 に対してビルドされており、別ビルドの Nix では `undefined symbol: nix::eBlackHole` で読み込めないため、flake.lock の `nixVersions.nix_2_34` を更新するときはこの固定も合わせる。
 
-- `make all`: `fmt generate manifests lint-config lint test test-e2e`。生成物（DeepCopy・capnp・chart の CRD と ClusterRole）の再生成、golangci-lint の設定検証（`lint-config`）と lint（`golangci-lint` + `helm lint`）、unit + envtest（`make test`）、e2e（`make test-e2e`）を順に実行する。`build` は含めない: `test` が manager と agent のコンパイルを兼ね、`test-e2e` が image のビルド（`make docker-build` → `nix build .#dockerImage` → `docker load`）を兼ねるため。e2e には repository secret `DISCORD_WEBHOOK_URL` を env で渡す。secret が無ければ値は空になり、suite は Secret を作らずに通知なしで動く（skip しない）。`timeout-minutes: 90` は image のビルドと Factorio の 2 回のダウンロードを含む e2e に合わせた値。
+- `make all`: `fmt generate manifests lint-config lint test test-e2e`。生成物（DeepCopy・capnp・chart の CRD と ClusterRole）の再生成、golangci-lint の設定検証（`lint-config`）と lint（`golangci-lint` + `helm lint`）、unit + envtest（`make test`。最初に gitleaks が git 履歴をスキャンするため、checkout は `fetch-depth: 0` で全履歴を取得する）、e2e（`make test-e2e`）を順に実行する。`build` は含めない: `test` が manager と agent のコンパイルを兼ね、`test-e2e` が image のビルド（`make docker-build` → `nix build .#dockerImage` → `docker load`）を兼ねるため。e2e には repository secret `DISCORD_WEBHOOK_URL` を env で渡す。secret が無ければ値は空になり、suite は Secret を作らずに通知なしで動く（skip しない）。`timeout-minutes: 90` は image のビルドと Factorio の 2 回のダウンロードを含む e2e に合わせた値。
 - `make check-uncomitted`: `fmt generate manifests` を実行した後に `git status --porcelain` を見て、追跡ファイルの変更と未追跡ファイルの両方で失敗する。CI では `go mod tidy` が `make all` の前の step なので、tidy が差分を生む `go.mod` / `go.sum` もここで検出される。生成物のコミット漏れを CI で検出するのはこれが初めてで、以前の「workflow は生成物を比較しないので自分で make してコミットすること」という運用を置き換える。ユーザーが別の未コミット変更を持っている場合も失敗するのは意図どおり（クリーンなツリーで実行する）。綴りは `check-uncommitted` ではなく `check-uncomitted`（ユーザー指定のターゲット名）。
 
 runner は `ubuntu-latest` の Docker を使うため、`make docker-build`（`nix build .#dockerImage` → `docker load` → tag）と `kind load docker-image`、kind 内での `curlimages/curl` と `busybox` の pull がそのまま動く。e2e のテストファイルは `//go:build e2e` のため `make lint` の対象外（`test/utils` は対象内）。flake は go2nix を lockfile 無しで使うため（§2.3）`vendorHash` の更新は無く、`go.mod` / `go.sum` を更新する PR もそのままビルドできる。CI は dev shell の中で `make` を回すので、go2nix の Nix プラグインは shellHook が設定する `NIX_CONFIG` 経由で読み込まれる。

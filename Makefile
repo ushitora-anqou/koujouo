@@ -84,8 +84,16 @@ generate: generate-capnp ## Generate code containing DeepCopy, DeepCopyInto, and
 fmt: ## Run go fmt against code.
 	go fmt ./...
 
+# The scan reads the git history, not the working tree: an untracked file (a
+# developer's .envrc, an ignored scratch manifest) is not part of the
+# repository, and scanning it would fail `make test` for that developer only.
+# `--redact` keeps a found secret out of the log.
+.PHONY: secrets
+secrets: ## Scan the git history for committed secrets.
+	"$(GITLEAKS)" git . --no-banner --redact
+
 .PHONY: test
-test: manifests generate fmt ## Run tests.
+test: secrets manifests generate fmt ## Run the secret scan and the tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
@@ -217,6 +225,7 @@ YQ ?= yq
 CONTROLLER_GEN ?= controller-gen
 ENVTEST ?= setup-envtest
 GOLANGCI_LINT ?= golangci-lint
+GITLEAKS ?= gitleaks
 
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
