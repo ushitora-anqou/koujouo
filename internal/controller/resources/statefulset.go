@@ -18,6 +18,9 @@ limitations under the License.
 package resources
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -34,6 +37,13 @@ const (
 	// FactorioServerLabelKey labels every object that belongs to one
 	// FactorioServer, with the resource name as the value.
 	FactorioServerLabelKey = "koujouo.anqou.net/factorioserver"
+
+	// TemplateHashAnnotation holds the hash of the pod template fields the
+	// controller owns, so it can tell a Pod of an outdated template from a
+	// current one. The agent container image is left out of the hash: the
+	// agent replaces its own binary in place, so an image change must not
+	// recreate the Pod.
+	TemplateHashAnnotation = "koujouo.anqou.net/template-hash"
 
 	// AgentContainerName is the name of the agent container.
 	AgentContainerName = "agent"
@@ -89,6 +99,13 @@ func BuildStatefulSet(
 ) (*appsv1.StatefulSet, error) {
 	labels := map[string]string{FactorioServerLabelKey: server.Name}
 
+	podSpec := agentPodSpec(server, controllerImage)
+
+	templateHash, err := podTemplateHash(podSpec, labels)
+	if err != nil {
+		return nil, err
+	}
+
 	statefulSet := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      server.Name,
@@ -109,19 +126,46 @@ func BuildStatefulSet(
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
+					Labels:      labels,
+					Annotations: map[string]string{TemplateHashAnnotation: templateHash},
 				},
-				Spec: agentPodSpec(server, controllerImage),
+				Spec: podSpec,
 			},
 		},
 	}
 
-	err := controllerutil.SetControllerReference(server, statefulSet, scheme)
+	err = controllerutil.SetControllerReference(server, statefulSet, scheme)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set controller reference on StatefulSet: %w", err)
 	}
 
 	return statefulSet, nil
+}
+
+// podTemplateHash returns the hash of the pod template fields the
+// controller owns: the labels of the template and its spec, with the agent
+// container image blanked out. The agent replaces its own binary in place,
+// so an image change alone must not recreate the Pod; every other owned
+// field reaches the Pod only through a new Pod, because the StatefulSet
+// update strategy is OnDelete.
+func podTemplateHash(podSpec corev1.PodSpec, labels map[string]string) (string, error) {
+	hashed := podSpec.DeepCopy()
+
+	for i := range hashed.Containers {
+		hashed.Containers[i].Image = ""
+	}
+
+	payload, err := json.Marshal(struct {
+		Labels map[string]string `json:"labels"`
+		Spec   corev1.PodSpec    `json:"spec"`
+	}{Labels: labels, Spec: *hashed})
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal the pod template for its hash: %w", err)
+	}
+
+	sum := sha256.Sum256(payload)
+
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // agentPodSpec returns the pod spec of the agent pod.

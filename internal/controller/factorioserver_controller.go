@@ -119,7 +119,7 @@ type FactorioServerReconciler struct {
 // +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -218,7 +218,7 @@ func (r *FactorioServerReconciler) reconcileActive(
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
 ) (ctrl.Result, error) {
-	err := r.ensureAgentObjects(ctx, log, server)
+	templateHash, err := r.ensureAgentObjects(ctx, log, server)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -228,8 +228,9 @@ func (r *FactorioServerReconciler) reconcileActive(
 		return ctrl.Result{}, err
 	}
 
-	if agentPodUnavailable(pod, found) {
-		return r.requeueWaitingForAgent(ctx, server, "Waiting for the agent Pod to become ready")
+	result, waiting, err := r.waitForAgentPod(ctx, log, server, pod, found, templateHash)
+	if waiting {
+		return result, err
 	}
 
 	agent, err := r.Dialer.Dial(ctx, pod)
@@ -448,35 +449,102 @@ func agentPodUnavailable(pod *corev1.Pod, found bool) bool {
 	return !found || pod.Status.PodIP == "" || !podIsReady(pod)
 }
 
+// podTemplateOutdated reports whether the agent pod runs a pod template
+// other than the desired one. A pod that is already being deleted is not
+// outdated again: its replacement is on the way.
+func podTemplateOutdated(pod *corev1.Pod, found bool, templateHash string) bool {
+	if !found || pod.DeletionTimestamp != nil {
+		return false
+	}
+
+	return pod.Annotations[resources.TemplateHashAnnotation] != templateHash
+}
+
+// waitForAgentPod reports whether the reconcile has to wait for the agent
+// Pod instead of dialing it: a Pod of an outdated pod template is deleted
+// so that the StatefulSet replaces it, and a missing or unready Pod is
+// waited for. The result and error are the ones of that requeue.
+func (r *FactorioServerReconciler) waitForAgentPod(
+	ctx context.Context,
+	log logr.Logger,
+	server *koujouoanqounetv1.FactorioServer,
+	pod *corev1.Pod,
+	found bool,
+	templateHash string,
+) (ctrl.Result, bool, error) {
+	if podTemplateOutdated(pod, found, templateHash) {
+		result, err := r.recreateAgentPod(ctx, log, server, pod)
+
+		return result, true, err
+	}
+
+	if agentPodUnavailable(pod, found) {
+		result, err := r.requeueWaitingForAgent(ctx, server, "Waiting for the agent Pod to become ready")
+
+		return result, true, err
+	}
+
+	return ctrl.Result{}, false, nil //nolint:exhaustruct_v5 // The Pod is dialable; no requeue.
+}
+
+// recreateAgentPod deletes the agent pod so that the StatefulSet replaces
+// it with one of the current pod template, and returns the requeue that
+// waits for the replacement. The kubelet sends the agent a SIGTERM, and the
+// agent stops the game gracefully and saves the world before it exits.
+func (r *FactorioServerReconciler) recreateAgentPod(
+	ctx context.Context,
+	log logr.Logger,
+	server *koujouoanqounetv1.FactorioServer,
+	pod *corev1.Pod,
+) (ctrl.Result, error) {
+	err := r.Delete(ctx, pod)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("could not delete the agent Pod: %w", err)
+	}
+
+	log.Info("Deleted the agent Pod for the changed pod template", "pod", pod.Name)
+	r.recordEvent(server, "AgentPodRecreated", "Deleted the agent Pod "+pod.Name+" for the changed pod template")
+
+	return r.requeueWaitingForAgent(ctx, server, "Recreating the agent Pod for the changed pod template")
+}
+
 // ensureAgentObjects creates the StatefulSet and the NetworkPolicy of
-// server and synchronizes both.
+// server, synchronizes both and returns the hash of the desired pod
+// template.
 func (r *FactorioServerReconciler) ensureAgentObjects(
 	ctx context.Context,
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
-) error {
-	err := r.ensureStatefulSet(ctx, log, server)
+) (string, error) {
+	templateHash, err := r.ensureStatefulSet(ctx, log, server)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	return r.ensureNetworkPolicy(ctx, log, server)
+	err = r.ensureNetworkPolicy(ctx, log, server)
+	if err != nil {
+		return "", err
+	}
+
+	return templateHash, nil
 }
 
 // ensureStatefulSet creates the StatefulSet of server when it is missing
-// and synchronizes the fields the controller owns on an existing one.
+// and synchronizes the fields the controller owns on an existing one. It
+// returns the hash of the desired pod template, which tells the agent Pod
+// of an outdated template apart from a current one.
 func (r *FactorioServerReconciler) ensureStatefulSet(
 	ctx context.Context,
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
-) error {
+) (string, error) {
 	if r.ControllerImage == "" {
-		return fmt.Errorf("could not build the agent StatefulSet: %w", errControllerImageUnset)
+		return "", fmt.Errorf("could not build the agent StatefulSet: %w", errControllerImageUnset)
 	}
 
 	desired, err := resources.BuildStatefulSet(server, r.ControllerImage, r.Scheme)
 	if err != nil {
-		return fmt.Errorf("could not build the desired StatefulSet: %w", err)
+		return "", fmt.Errorf("could not build the desired StatefulSet: %w", err)
 	}
 
 	statefulSet := &appsv1.StatefulSet{
@@ -497,7 +565,7 @@ func (r *FactorioServerReconciler) ensureStatefulSet(
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("could not ensure the StatefulSet: %w", err)
+		return "", fmt.Errorf("could not ensure the StatefulSet: %w", err)
 	}
 
 	if result == controllerutil.OperationResultCreated {
@@ -509,7 +577,7 @@ func (r *FactorioServerReconciler) ensureStatefulSet(
 		log.Info("Updated StatefulSet", "name", server.Name)
 	}
 
-	return nil
+	return desired.Spec.Template.Annotations[resources.TemplateHashAnnotation], nil
 }
 
 // ensureNetworkPolicy creates the NetworkPolicy of the agent Pod of server
@@ -609,9 +677,25 @@ func syncStatefulSet(existing, desired *appsv1.StatefulSet) {
 		template.Labels = desired.Spec.Template.Labels
 	}
 
+	// Only the template hash is owned here: every other annotation of the
+	// pod template belongs to the user.
+	hash := desired.Spec.Template.Annotations[resources.TemplateHashAnnotation]
+	if template.Annotations[resources.TemplateHashAnnotation] != hash {
+		if template.Annotations == nil {
+			template.Annotations = map[string]string{}
+		}
+
+		template.Annotations[resources.TemplateHashAnnotation] = hash
+	}
+
 	podSpec := &template.Spec
 	desiredPodSpec := &desired.Spec.Template.Spec
 
+	syncPodSpec(podSpec, desiredPodSpec)
+}
+
+// syncPodSpec copies the pod spec fields the controller owns.
+func syncPodSpec(podSpec, desiredPodSpec *corev1.PodSpec) {
 	if !equality.Semantic.DeepEqual(podSpec.SecurityContext, desiredPodSpec.SecurityContext) {
 		podSpec.SecurityContext = desiredPodSpec.SecurityContext
 	}

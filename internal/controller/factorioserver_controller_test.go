@@ -48,8 +48,13 @@ import (
 const (
 	testNamespace       = "default"
 	testControllerImage = "koujouo-test/controller:v0.0.1"
-	testPollInterval    = 30 * time.Second
-	testRetryInterval   = 5 * time.Second
+
+	// testNextControllerImage is a controller image of another build; only
+	// the agent container image of the pod template changes with it.
+	testNextControllerImage = "koujouo-test/controller:v0.0.2"
+
+	testPollInterval  = 30 * time.Second
+	testRetryInterval = 5 * time.Second
 
 	// testManagerNamespace is the namespace the test reconciler runs in, as
 	// POD_NAMESPACE of the manager Deployment names it in a cluster.
@@ -380,6 +385,174 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseRunning))
 			Expect(server.Status.CurrentGameVersion).To(Equal(testNextGameVersion))
 			expectCondition(server, "Ready", metav1.ConditionTrue, "Running")
+		})
+	})
+
+	Context("When the agent Pod runs an outdated pod template", func() {
+		const serverName = "fsrv-template"
+
+		var (
+			// agentPod returns the agent Pod of the server, or nil when the
+			// StatefulSet has to create it again.
+			agentPod func() *corev1.Pod
+
+			// agentStatefulSet returns the agent StatefulSet of the server.
+			agentStatefulSet func() *appsv1.StatefulSet
+		)
+
+		BeforeEach(func() {
+			agentPod = func() *corev1.Pod {
+				pod := &corev1.Pod{}
+
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Namespace: testNamespace, Name: serverName + "-0",
+				}, pod)
+				if errors.IsNotFound(err) {
+					return nil
+				}
+
+				Expect(err).NotTo(HaveOccurred())
+
+				return pod
+			}
+
+			agentStatefulSet = func() *appsv1.StatefulSet {
+				statefulSet := &appsv1.StatefulSet{}
+
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Namespace: testNamespace, Name: serverName,
+				}, statefulSet)
+				Expect(err).NotTo(HaveOccurred())
+
+				return statefulSet
+			}
+
+			createTestPVC(ctx, serverName+"-saves")
+			createMinimalServer(ctx, serverName, serverName+"-saves")
+			createReadyAgentPod(ctx, serverName)
+		})
+
+		AfterEach(func() {
+			deleteTestObjects(ctx, serverName)
+		})
+
+		It("should recreate the Pod when the save PersistentVolumeClaim changes", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(agentPod()).NotTo(BeNil())
+
+			// The StatefulSet update strategy is OnDelete, so the template
+			// change alone reaches no Pod: the controller has to delete it.
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.SavePersistentVolumeClaimName = serverName + "-saves-next"
+			})
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testRetryInterval))
+
+			Expect(agentPod()).To(BeNil())
+			Expect(eventReasons(reconciler)).To(ContainElement("AgentPodRecreated"))
+
+			Expect(volumeByName(agentStatefulSet().Spec.Template.Spec.Volumes, resources.SavesVolumeName).
+				PersistentVolumeClaim.ClaimName).To(Equal(serverName + "-saves-next"))
+
+			server := fetchServer(ctx, serverName)
+			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhasePending))
+			expectCondition(server, "Progressing", metav1.ConditionTrue, "AgentUnavailable")
+		})
+
+		It("should recreate the Pod when the agent resources change", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.Agent = &koujouoanqounetv1.AgentSpec{
+					Resources: &corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("512Mi"),
+						},
+					},
+				}
+			})
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testRetryInterval))
+
+			Expect(agentPod()).To(BeNil())
+			Expect(eventReasons(reconciler)).To(ContainElement("AgentPodRecreated"))
+
+			Expect(agentStatefulSet().Spec.Template.Spec.Containers[0].Resources.Requests.Memory().String()).
+				To(Equal("512Mi"))
+		})
+
+		It("should keep the Pod when only the controller image changes", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			hash := agentStatefulSet().Spec.Template.Annotations[resources.TemplateHashAnnotation]
+			Expect(hash).NotTo(BeEmpty())
+
+			// The agent replaces its own binary in place, so an image
+			// change must not recreate the Pod; the fake agent reports the
+			// version of this build, so no upgrade runs either.
+			reconciler.ControllerImage = testNextControllerImage
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testPollInterval))
+
+			pod := agentPod()
+			Expect(pod).NotTo(BeNil())
+			Expect(pod.DeletionTimestamp).To(BeNil())
+			Expect(eventReasons(reconciler)).NotTo(ContainElement("AgentPodRecreated"))
+			Expect(fakeAgent.agentUpgrades()).To(BeEmpty())
+
+			statefulSet := agentStatefulSet()
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].Image).To(Equal(testNextControllerImage))
+			Expect(statefulSet.Spec.Template.Annotations[resources.TemplateHashAnnotation]).To(Equal(hash))
+			Expect(hash).To(Equal(podTemplateHashOf(ctx, serverName, testNextControllerImage)))
+		})
+
+		It("should not delete the Pod again while it is being deleted", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			markPodTerminating(ctx, serverName)
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.SavePersistentVolumeClaimName = serverName + "-saves-next"
+			})
+
+			result, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(testPollInterval))
+
+			pod := agentPod()
+			Expect(pod).NotTo(BeNil())
+			Expect(pod.DeletionTimestamp).NotTo(BeNil())
+			Expect(eventReasons(reconciler)).NotTo(ContainElement("AgentPodRecreated"))
+		})
+
+		It("should keep the annotations of the pod template it does not own", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			statefulSet := agentStatefulSet()
+			statefulSet.Spec.Template.Annotations["example.com/note"] = "owned by the user"
+			Expect(k8sClient.Update(ctx, statefulSet)).To(Succeed())
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			statefulSet = agentStatefulSet()
+			Expect(statefulSet.Spec.Template.Annotations).To(HaveKeyWithValue("example.com/note", "owned by the user"))
+			Expect(statefulSet.Spec.Template.Annotations).To(
+				HaveKeyWithValue(resources.TemplateHashAnnotation, podTemplateHashOf(ctx, serverName, testControllerImage)))
+
+			Expect(agentPod()).NotTo(BeNil())
+			Expect(eventReasons(reconciler)).NotTo(ContainElement("AgentPodRecreated"))
 		})
 	})
 
@@ -949,13 +1122,18 @@ func fullServerSpec(name string) koujouoanqounetv1.FactorioServerSpec {
 }
 
 // createReadyAgentPod creates the agent Pod of server with a ready
-// status, standing in for the StatefulSet controller.
+// status, standing in for the StatefulSet controller. It carries the
+// template hash of the desired StatefulSet, as the StatefulSet controller
+// copies the annotations of the pod template into the Pod.
 func createReadyAgentPod(ctx context.Context, serverName string) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: testNamespace,
 			Name:      serverName + "-0",
 			Labels:    map[string]string{resources.FactorioServerLabelKey: serverName},
+			Annotations: map[string]string{
+				resources.TemplateHashAnnotation: podTemplateHashOf(ctx, serverName, testControllerImage),
+			},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "agent", Image: testControllerImage}},
@@ -969,6 +1147,26 @@ func createReadyAgentPod(ctx context.Context, serverName string) {
 		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 	}
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// podTemplateHashOf returns the template hash of the StatefulSet the
+// controller builds for the named server.
+func podTemplateHashOf(ctx context.Context, serverName, controllerImage string) string {
+	statefulSet, err := resources.BuildStatefulSet(fetchServer(ctx, serverName), controllerImage, k8sClient.Scheme())
+	Expect(err).NotTo(HaveOccurred())
+
+	hash, ok := statefulSet.Spec.Template.Annotations[resources.TemplateHashAnnotation]
+	Expect(ok).To(BeTrue())
+
+	return hash
+}
+
+// eventReasons returns the reasons the test recorder collected.
+func eventReasons(reconciler *controller.FactorioServerReconciler) []string {
+	recorder, ok := reconciler.Recorder.(*fakeEventRecorder)
+	Expect(ok).To(BeTrue())
+
+	return recorder.reasons
 }
 
 // deleteTestObjects removes the objects of one test server. envtest has
@@ -1034,6 +1232,11 @@ func expectAgentStatefulSet(ctx context.Context, serverName, pvcName string) *ap
 	Expect(statefulSet.Spec.ServiceName).To(Equal(serverName))
 	Expect(statefulSet.Spec.Selector.MatchLabels).To(HaveKeyWithValue(resources.FactorioServerLabelKey, serverName))
 	Expect(statefulSet.Spec.Template.Labels).To(HaveKeyWithValue(resources.FactorioServerLabelKey, serverName))
+
+	// The Pod has to carry the hash of this template, or the controller
+	// would delete it on every reconcile.
+	Expect(statefulSet.Spec.Template.Annotations).To(
+		HaveKeyWithValue(resources.TemplateHashAnnotation, podTemplateHashOf(ctx, serverName, testControllerImage)))
 
 	podSpec := statefulSet.Spec.Template.Spec
 	Expect(*podSpec.TerminationGracePeriodSeconds).To(Equal(int64(expectedGracePeriodSeconds)))
