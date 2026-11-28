@@ -31,7 +31,7 @@ internal/version/version.go       Build version shared by the manager and the ag
 rpc/koujouo.capnp                 Controller <-> agent protocol (edit this)
 rpc/koujouo.capnp.go              Auto-generated (DO NOT EDIT; from `make generate-capnp`)
 rpc/generate.go                   `go:generate` directive of the schema
-charts/koujouo/Chart.yaml          Helm chart metadata (version, appVersion)
+charts/koujouo/Chart.yaml          Helm chart metadata (version, appVersion, icon)
 charts/koujouo/values.yaml         Helm values: image, configuration, security contexts, ServiceMonitor
 charts/koujouo/templates/          Helm templates; the CRD and manager-role.yaml are generated
 examples/manager.yaml             Manager configuration (every key with its default)
@@ -680,7 +680,7 @@ holds placeholders: substitute real values in what you apply, never in the track
 - **Owner references**: Enable automatic garbage collection (`SetControllerReference`)
 - **Watch secondary resources**: Use `.Owns()` or `.Watches()`, not just `RequeueAfter`
 - **Finalizers**: Clean up external resources (buckets, VMs, DNS entries)
-- **Linting**: `.golangci.yml` enables every golangci-lint linter except `depguard`, `exhaustruct` (replaced by `exhaustruct_v5`) and `wsl`; `exhaustruct_v5` ignores `k8s.io/*` and controller-runtime types
+- **Linting**: `.golangci.yml` enables every golangci-lint linter except `depguard`, `exhaustruct` (replaced by `exhaustruct_v5`), `gomodguard` (replaced by `gomodguard_v2`) and `wsl`; `exhaustruct_v5` ignores `k8s.io/*` and controller-runtime types
 - **Linter exceptions**: Idiomatic scheme/test globals and other exceptions that cannot be removed carry `//nolint:<linter> // reason` directives — keep that style when adding new exceptions
 
 **koujouo specifics:**
@@ -755,6 +755,8 @@ helm upgrade --install koujouo charts/koujouo -n koujouo-system --create-namespa
 
 **Key points:**
 - `charts/koujouo/` holds the CRD, the RBAC, the configuration ConfigMap and the manager Deployment
+- `icon` of `Chart.yaml` points at the raw URL of `charts/koujouo/icon.svg` on `master`: the icon is
+  an asset of this repository and is not hosted anywhere else
 - The CRD carries `helm.sh/resource-policy: keep`, so `helm uninstall` keeps it and the
   `FactorioServer`s it holds; delete the CRD yourself once none is left
 - `helm package charts/koujouo` produces an archive for users without a checkout

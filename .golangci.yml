@@ -1,9 +1,14 @@
 version: "2"
 linters:
   default: all
+  enable:
+    # The successor of gomodguard, which golangci-lint deprecates since v2.12.0.
+    # It needs no settings: neither an allow nor a block list is configured.
+    - gomodguard_v2
   disable:
     - depguard
     - exhaustruct
+    - gomodguard
     - wsl
   exclusions:
     rules:

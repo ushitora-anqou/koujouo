@@ -1,6 +1,9 @@
 apiVersion: v2
 name: koujouo
 description: A Kubernetes operator that hosts headless Factorio servers.
+# The icon lives in this directory and is served from the repository itself, so
+# the URL points at the master branch rather than at a separately hosted asset.
+icon: https://raw.githubusercontent.com/ushitora-anqou/koujouo/master/charts/koujouo/icon.svg
 
 # A chart can be either an 'application' or a 'library' chart.
 #
