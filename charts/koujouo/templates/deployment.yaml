@@ -36,6 +36,13 @@ spec:
           args:
             - --config
             - /etc/koujouo/manager.yaml
+          env:
+            # The agent NetworkPolicies admit the agent RPC port from this
+            # namespace only.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: health
               containerPort: 8081

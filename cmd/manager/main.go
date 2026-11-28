@@ -20,6 +20,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -49,6 +50,15 @@ import (
 // --config is not given. The deployment of the Helm chart mounts the
 // configuration there as a ConfigMap.
 const defaultConfigPath = "/etc/koujouo/manager.yaml"
+
+// The manager learns its namespace from the downward API, then from the
+// file the API server mounts into every Pod. A manager run outside a
+// cluster has neither, which leaves the namespace empty and the agent RPC
+// restricted by no NetworkPolicy.
+const (
+	podNamespaceEnv         = "POD_NAMESPACE"
+	serviceAccountNamespace = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+)
 
 // Defaults of the configuration. examples/manager.yaml lists the same keys
 // with the same values.
@@ -248,11 +258,15 @@ func run(cfg managerConfig, setupLog logr.Logger) error {
 		setupLog.Info("controllerImage is not set; agent StatefulSets cannot be created")
 	}
 
+	managerNamespace := resolveManagerNamespace(setupLog)
+
 	// The poll, retry and progress intervals fall back to the reconciler
 	// defaults.
 	err = (&controller.FactorioServerReconciler{
 		Client:                    mgr.GetClient(),
+		APIReader:                 mgr.GetAPIReader(),
 		Scheme:                    mgr.GetScheme(),
+		ManagerNamespace:          managerNamespace,
 		ControllerImage:           cfg.ControllerImage,
 		AgentBinaryPath:           "", // The agent binary of the controller image.
 		Dialer:                    &controller.TCPAgentDialer{},
@@ -284,6 +298,34 @@ func run(cfg managerConfig, setupLog logr.Logger) error {
 	}
 
 	return nil
+}
+
+// resolveManagerNamespace returns the namespace the manager runs in, which
+// the agent NetworkPolicies admit the agent RPC port from. The downward API
+// passes it as POD_NAMESPACE; the namespace file of the mounted
+// ServiceAccount is the fallback. Both are empty only when the manager runs
+// outside a cluster, and the reconcile then warns once and creates no
+// NetworkPolicy.
+func resolveManagerNamespace(setupLog logr.Logger) string {
+	namespace := os.Getenv(podNamespaceEnv)
+	if namespace != "" {
+		return namespace
+	}
+
+	content, err := os.ReadFile(serviceAccountNamespace)
+	if err != nil {
+		setupLog.Info("Could not read the namespace of the ServiceAccount",
+			"path", serviceAccountNamespace, "error", err.Error())
+
+		return ""
+	}
+
+	namespace = strings.TrimSpace(string(content))
+	if namespace == "" {
+		setupLog.Info("The namespace of the ServiceAccount is empty", "path", serviceAccountNamespace)
+	}
+
+	return namespace
 }
 
 // newWebhookServer builds the webhook server, optionally watching the

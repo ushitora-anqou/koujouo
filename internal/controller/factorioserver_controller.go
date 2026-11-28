@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -64,7 +66,19 @@ const (
 type FactorioServerReconciler struct {
 	client.Client
 
+	// APIReader reads with the API server directly instead of through the
+	// cache. It reads the Secrets and ConfigMaps the spec refers to, which
+	// are few and need no cluster-wide watch. A nil APIReader falls back to
+	// Client.
+	APIReader client.Reader
+
 	Scheme *runtime.Scheme
+
+	// ManagerNamespace is the namespace the manager runs in. It is the only
+	// source the NetworkPolicy of an agent Pod admits the agent RPC port
+	// from. Empty skips the NetworkPolicy, which leaves the RPC reachable
+	// from the whole Pod network.
+	ManagerNamespace string
 
 	// ControllerImage is the container image deployed for the agent
 	// containers. It is the controllerImage key of the manager
@@ -93,12 +107,18 @@ type FactorioServerReconciler struct {
 	// ConfigureProgressInterval is how often the agent phase is polled
 	// while a configure call is in flight. Defaults to 2s.
 	ConfigureProgressInterval time.Duration
+
+	// managerNamespaceWarned records that the missing ManagerNamespace was
+	// already reported, so the warning is logged once instead of once per
+	// reconcile.
+	managerNamespaceWarned atomic.Bool
 }
 
 // +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=koujouo.anqou.net,resources=factorioservers/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -198,7 +218,7 @@ func (r *FactorioServerReconciler) reconcileActive(
 	log logr.Logger,
 	server *koujouoanqounetv1.FactorioServer,
 ) (ctrl.Result, error) {
-	err := r.ensureStatefulSet(ctx, log, server)
+	err := r.ensureAgentObjects(ctx, log, server)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -428,6 +448,21 @@ func agentPodUnavailable(pod *corev1.Pod, found bool) bool {
 	return !found || pod.Status.PodIP == "" || !podIsReady(pod)
 }
 
+// ensureAgentObjects creates the StatefulSet and the NetworkPolicy of
+// server and synchronizes both.
+func (r *FactorioServerReconciler) ensureAgentObjects(
+	ctx context.Context,
+	log logr.Logger,
+	server *koujouoanqounetv1.FactorioServer,
+) error {
+	err := r.ensureStatefulSet(ctx, log, server)
+	if err != nil {
+		return err
+	}
+
+	return r.ensureNetworkPolicy(ctx, log, server)
+}
+
 // ensureStatefulSet creates the StatefulSet of server when it is missing
 // and synchronizes the fields the controller owns on an existing one.
 func (r *FactorioServerReconciler) ensureStatefulSet(
@@ -475,6 +510,65 @@ func (r *FactorioServerReconciler) ensureStatefulSet(
 	}
 
 	return nil
+}
+
+// ensureNetworkPolicy creates the NetworkPolicy of the agent Pod of server
+// and synchronizes it. The agent RPC is unauthenticated and plain text, so
+// the policy admits it from the manager namespace only. Without a manager
+// namespace the policy would admit no source at all, which would cut the
+// manager off from the agent; the controller then leaves the policy out and
+// warns once.
+func (r *FactorioServerReconciler) ensureNetworkPolicy(
+	ctx context.Context,
+	log logr.Logger,
+	server *koujouoanqounetv1.FactorioServer,
+) error {
+	if r.ManagerNamespace == "" {
+		r.warnManagerNamespaceUnset(log)
+
+		return nil
+	}
+
+	desired := resources.BuildNetworkPolicy(server, r.ManagerNamespace)
+
+	networkPolicy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace},
+	}
+
+	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, networkPolicy, func() error {
+		// CreateOrUpdate hands over the empty shell above when the policy is
+		// missing and the object it fetched when it exists. Both get the
+		// owner reference of the desired policy, so the garbage collector
+		// removes it together with the FactorioServer.
+		networkPolicy.Labels = desired.Labels
+		networkPolicy.OwnerReferences = desired.OwnerReferences
+		networkPolicy.Spec = desired.Spec
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("could not ensure the NetworkPolicy: %w", err)
+	}
+
+	if result == controllerutil.OperationResultCreated {
+		log.Info("Created NetworkPolicy", "name", desired.Name)
+	}
+
+	if result == controllerutil.OperationResultUpdated {
+		log.Info("Updated NetworkPolicy", "name", desired.Name)
+	}
+
+	return nil
+}
+
+// warnManagerNamespaceUnset reports the missing manager namespace once: the
+// reconcile repeats every poll interval and the message is the same each time.
+func (r *FactorioServerReconciler) warnManagerNamespaceUnset(log logr.Logger) {
+	if !r.managerNamespaceWarned.CompareAndSwap(false, true) {
+		return
+	}
+
+	log.Info("ManagerNamespace is not set; the agent RPC stays reachable from the whole Pod network")
 }
 
 // applyStatefulSet copies the desired state into the StatefulSet given to
@@ -526,6 +620,12 @@ func syncStatefulSet(existing, desired *appsv1.StatefulSet) {
 		podSpec.TerminationGracePeriodSeconds, desiredPodSpec.TerminationGracePeriodSeconds,
 	) {
 		podSpec.TerminationGracePeriodSeconds = desiredPodSpec.TerminationGracePeriodSeconds
+	}
+
+	if !equality.Semantic.DeepEqual(
+		podSpec.AutomountServiceAccountToken, desiredPodSpec.AutomountServiceAccountToken,
+	) {
+		podSpec.AutomountServiceAccountToken = desiredPodSpec.AutomountServiceAccountToken
 	}
 
 	if volumesDrifted(podSpec.Volumes, desiredPodSpec.Volumes) {
@@ -701,6 +801,19 @@ func (r *FactorioServerReconciler) patchStatus(
 	}
 
 	return nil
+}
+
+// reader returns the reader of the referenced ConfigMaps and Secrets: the
+// API server directly, so the manager caches no Secret. The tests and an
+// incomplete wiring fall back to Client.
+//
+//nolint:ireturn // The fallback picks one of the two client.Reader fields.
+func (r *FactorioServerReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+
+	return r.Client
 }
 
 // recordEvent emits an event unless the recorder is unset.

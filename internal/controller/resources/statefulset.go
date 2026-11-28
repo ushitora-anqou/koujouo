@@ -127,6 +127,9 @@ func BuildStatefulSet(
 // agentPodSpec returns the pod spec of the agent pod.
 func agentPodSpec(server *koujouoanqounetv1.FactorioServer, controllerImage string) corev1.PodSpec {
 	return corev1.PodSpec{
+		// The agent never talks to the API server, so it carries no
+		// ServiceAccount token.
+		AutomountServiceAccountToken:  new(false),
 		TerminationGracePeriodSeconds: new(terminationGracePeriod),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot: new(true),

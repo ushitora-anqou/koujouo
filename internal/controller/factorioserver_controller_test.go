@@ -28,6 +28,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -50,12 +51,17 @@ const (
 	testPollInterval    = 30 * time.Second
 	testRetryInterval   = 5 * time.Second
 
+	// testManagerNamespace is the namespace the test reconciler runs in, as
+	// POD_NAMESPACE of the manager Deployment names it in a cluster.
+	testManagerNamespace = "koujouo-system"
+
 	// testProgressInterval is short so a test observes a configure in
 	// flight without waiting for the production poll interval.
 	testProgressInterval = 10 * time.Millisecond
 
 	expectedGracePeriodSeconds = 900
 	expectedGameUDPPort        = 34197
+	expectedAgentRPCPort       = 9550
 	expectedEphemeralStorage   = "2Gi"
 
 	testGameVersion     = "2.0.0"
@@ -192,6 +198,7 @@ var _ = Describe("FactorioServer Controller", func() {
 				Type: appsv1.RollingUpdateStatefulSetStrategyType,
 			}
 			existing.Spec.Template.Spec.SecurityContext = nil
+			existing.Spec.Template.Spec.AutomountServiceAccountToken = nil
 			existing.Spec.Template.Spec.Containers[0].SecurityContext = nil
 
 			err = k8sClient.Update(ctx, existing)
@@ -212,6 +219,10 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(containerSecurityContext).NotTo(BeNil())
 			Expect(containerSecurityContext.ReadOnlyRootFilesystem).NotTo(BeNil())
 			Expect(*containerSecurityContext.ReadOnlyRootFilesystem).To(BeTrue())
+
+			// The agent never talks to the API server, so the ServiceAccount
+			// token must not come back either.
+			Expect(*statefulSet.Spec.Template.Spec.AutomountServiceAccountToken).To(BeFalse())
 		})
 
 		It("should configure the agent and report its status", func() {
@@ -369,6 +380,76 @@ var _ = Describe("FactorioServer Controller", func() {
 			Expect(server.Status.Phase).To(Equal(koujouoanqounetv1.PhaseRunning))
 			Expect(server.Status.CurrentGameVersion).To(Equal(testNextGameVersion))
 			expectCondition(server, "Ready", metav1.ConditionTrue, "Running")
+		})
+	})
+
+	Context("When reconciling the agent NetworkPolicy", func() {
+		const serverName = "fsrv-netpol"
+
+		BeforeEach(func() {
+			createTestPVC(ctx, serverName+"-saves")
+			createMinimalServer(ctx, serverName, serverName+"-saves")
+		})
+
+		AfterEach(func() {
+			deleteTestObjects(ctx, serverName)
+		})
+
+		It("should admit the game port from anywhere and the RPC port from the manager only", func() {
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			networkPolicy := expectAgentNetworkPolicy(ctx, serverName)
+
+			Expect(networkPolicy.Spec.PodSelector.MatchLabels).To(
+				HaveKeyWithValue(resources.FactorioServerLabelKey, serverName))
+			// Egress stays open: the agent downloads the game, uploads the
+			// saves and posts to Discord.
+			Expect(networkPolicy.Spec.PolicyTypes).To(ConsistOf(networkingv1.PolicyTypeIngress))
+
+			ingress := networkPolicy.Spec.Ingress
+			Expect(ingress).To(HaveLen(2))
+
+			Expect(ingress[0].From).To(BeEmpty(), "the game port must stay open to every source")
+			Expect(ingress[0].Ports).To(HaveLen(1))
+			Expect(*ingress[0].Ports[0].Protocol).To(Equal(corev1.ProtocolUDP))
+			Expect(ingress[0].Ports[0].Port.IntVal).To(Equal(int32(expectedGameUDPPort)))
+
+			Expect(ingress[1].Ports).To(HaveLen(1))
+			Expect(*ingress[1].Ports[0].Protocol).To(Equal(corev1.ProtocolTCP))
+			Expect(ingress[1].Ports[0].Port.IntVal).To(Equal(int32(expectedAgentRPCPort)))
+
+			Expect(ingress[1].From).To(HaveLen(1))
+			namespaceSelector := ingress[1].From[0].NamespaceSelector
+			Expect(namespaceSelector).NotTo(BeNil())
+			Expect(namespaceSelector.MatchLabels).To(
+				HaveKeyWithValue("kubernetes.io/metadata.name", testManagerNamespace))
+			Expect(ingress[1].From[0].PodSelector).To(BeNil(), "the RPC port is open to the manager namespace only")
+
+			By("keeping the NetworkPolicy when the server is suspended")
+
+			updateServerSpec(ctx, serverName, func(spec *koujouoanqounetv1.FactorioServerSpec) {
+				spec.Suspend = true
+			})
+
+			_, err = reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The owner reference removes the policy together with the
+			// FactorioServer, so the suspension leaves it in place.
+			expectAgentNetworkPolicy(ctx, serverName)
+		})
+
+		It("should not create a NetworkPolicy without the manager namespace", func() {
+			reconciler.ManagerNamespace = ""
+
+			_, err := reconcileOnce(ctx, reconciler, serverName)
+			Expect(err).NotTo(HaveOccurred())
+
+			key := types.NamespacedName{Namespace: testNamespace, Name: serverName + "-agent"}
+
+			lookupErr := k8sClient.Get(ctx, key, &networkingv1.NetworkPolicy{})
+			Expect(errors.IsNotFound(lookupErr)).To(BeTrue())
 		})
 	})
 
@@ -627,10 +708,14 @@ var _ = Describe("FactorioServer Controller", func() {
 // and the fake agent.
 func newTestReconciler(agent *fakeAgentServer) *controller.FactorioServerReconciler {
 	return &controller.FactorioServerReconciler{
-		Client:          k8sClient,
-		Scheme:          k8sClient.Scheme(),
-		ControllerImage: testControllerImage,
-		AgentBinaryPath: "",
+		Client:    k8sClient,
+		APIReader: k8sClient,
+		Scheme:    k8sClient.Scheme(),
+		// testManagerNamespace stands in for the namespace of the manager
+		// Deployment; envtest runs the reconciler in the test process.
+		ManagerNamespace: testManagerNamespace,
+		ControllerImage:  testControllerImage,
+		AgentBinaryPath:  "",
 		Dialer: &fakeAgentDialer{
 			agent: agent,
 		},
@@ -897,6 +982,9 @@ func deleteTestObjects(ctx context.Context, serverName string) {
 	_ = k8sClient.Delete(ctx, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: serverName + "-0"},
 	})
+	_ = k8sClient.Delete(ctx, &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: serverName + "-agent"},
+	})
 	deleteTestPVC(ctx, serverName+"-saves")
 	_ = k8sClient.Delete(ctx, &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: serverName + "-config"},
@@ -949,6 +1037,8 @@ func expectAgentStatefulSet(ctx context.Context, serverName, pvcName string) *ap
 
 	podSpec := statefulSet.Spec.Template.Spec
 	Expect(*podSpec.TerminationGracePeriodSeconds).To(Equal(int64(expectedGracePeriodSeconds)))
+	Expect(podSpec.AutomountServiceAccountToken).NotTo(BeNil())
+	Expect(*podSpec.AutomountServiceAccountToken).To(BeFalse())
 	Expect(podSpec.Containers).To(HaveLen(1))
 
 	container := podSpec.Containers[0]
@@ -983,6 +1073,22 @@ func expectAgentStatefulSet(ctx context.Context, serverName, pvcName string) *ap
 	Expect(owner.Name).To(Equal(serverName))
 
 	return statefulSet
+}
+
+// expectAgentNetworkPolicy asserts the presence and the ownership of the
+// agent NetworkPolicy of server and returns it.
+func expectAgentNetworkPolicy(ctx context.Context, serverName string) *networkingv1.NetworkPolicy {
+	networkPolicy := &networkingv1.NetworkPolicy{}
+
+	key := types.NamespacedName{Namespace: testNamespace, Name: serverName + "-agent"}
+	Expect(k8sClient.Get(ctx, key, networkPolicy)).To(Succeed())
+
+	owner := metav1.GetControllerOf(networkPolicy)
+	Expect(owner).NotTo(BeNil())
+	Expect(owner.Kind).To(Equal("FactorioServer"))
+	Expect(owner.Name).To(Equal(serverName))
+
+	return networkPolicy
 }
 
 // expectCondition asserts the state and reason of one status condition.

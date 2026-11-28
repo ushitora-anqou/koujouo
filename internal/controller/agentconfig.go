@@ -498,7 +498,7 @@ func (r *FactorioServerReconciler) readConfigMapKey(
 ) (string, error) {
 	configMap := &corev1.ConfigMap{}
 
-	err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: selector.Name}, configMap)
+	err := r.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: selector.Name}, configMap)
 	if err != nil {
 		return "", fmt.Errorf("could not get ConfigMap %s: %w", selector.Name, err)
 	}
@@ -519,7 +519,7 @@ func (r *FactorioServerReconciler) readSecretKey(
 ) (string, error) {
 	secret := &corev1.Secret{}
 
-	err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: selector.Name}, secret)
+	err := r.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: selector.Name}, secret)
 	if err != nil {
 		return "", fmt.Errorf("could not get Secret %s: %w", selector.Name, err)
 	}
