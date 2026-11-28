@@ -268,18 +268,18 @@ nix build .#dockerImage   # Verify it still builds (load the go2nix plugin as de
 
 ## CI
 
-GitHub Actions workflows install Nix via `DeterminateSystems/nix-installer-action`
+GitHub Actions workflows install Nix via `cachix/install-nix-action`
 and work inside the dev shell using
 [`nicknovitski/nix-develop`](https://github.com/nicknovitski/nix-develop), which
 exports the dev shell environment to subsequent steps. All actions are pinned by
 commit SHA. Dependabot (`.github/dependabot.yml`) updates Go modules and the
 pinned actions weekly.
 
-The action installs upstream Nix 2.34.9 (`determinate: false` and a
-`nix-package-url` pinned per architecture), because the go2nix Nix plugin is
-built against nixpkgs' Nix 2.34.9 and Determinate Nix is a different build
-whose ABI the plugin cannot load (`undefined symbol: nix::eBlackHole`). Keep
-the pinned version in step with `nixVersions.nix_2_34` in `flake.lock`.
+The action pins upstream Nix 2.34.9 with `install_url` (the installer of that
+release) and `install_sha256` (the published hash of the installer), because the
+go2nix Nix plugin is built against nixpkgs' Nix 2.34.9 and needs that exact
+ABI. Keep the pinned version in step with `nixVersions.nix_2_34` in
+`flake.lock`.
 
 `ci.yml` runs on every push and pull request: one job on `ubuntu-latest` that does
 `go mod tidy`, then `make all`, then `make check-uncomitted` — the same two commands a

@@ -26,14 +26,15 @@ jobs:
           persist-credentials: false
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
         with:
           # go2nix builds its Nix plugin against the upstream Nix of nixpkgs
-          # (2.34.9). Determinate Nix is a different build whose ABI the plugin
-          # cannot load ("undefined symbol: nix::eBlackHole"), so install the
-          # upstream release the plugin is built against and pin its version.
-          determinate: false
-          nix-package-url: https://releases.nixos.org/nix/nix-2.34.9/nix-2.34.9-${{ runner.arch == 'ARM64' && 'aarch64-linux' || 'x86_64-linux' }}.tar.xz
+          # (2.34.9). Install that exact release so the plugin's ABI matches;
+          # the hash is the published sha256 of the installer script.
+          install_url: https://releases.nixos.org/nix/nix-2.34.9/install
+          install_sha256: a03ce2e9eaf4ea1560260b9a93e311dbaf589d28fb5c9318f8d9e768ee6339d8
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       - name: Enter the Nix dev shell
         uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1.2.1
