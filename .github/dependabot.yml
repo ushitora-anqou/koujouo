@@ -1,6 +1,7 @@
 # Dependabot creates one pull request per multi-ecosystem group. A push that
 # touches this file is the only way to run the group on demand: "Check for
 # updates" runs an update job but does not create the grouped pull request.
+# Use it again after a manual dependency update that unblocks the group.
 version: 2
 multi-ecosystem-groups:
   dependencies:
