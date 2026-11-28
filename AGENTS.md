@@ -107,6 +107,13 @@ restart it by design (see the known limitations in README.md).
 - **The controller reads the referenced Secrets and ConfigMaps through `APIReader`**, not
   through the cache: they are few and need no cluster-wide watch, and this keeps the
   Secrets out of the manager's memory cache.
+- **Creating a `FactorioServer` grants reading the Secrets it names.** The spec selectors
+  (`notification.discordWebhookURL`, `backup.credentials`, `downloadCredentials`) name any
+  Secret of the namespace; the controller delivers the values to the agent, which writes
+  them into `agent-state.json` on the save volume. Whoever may mount that volume, or reach
+  the agent RPC, can read them. This is the intended model — the user of a server owns its
+  credentials — so do not add a cross-namespace reference or a webhook that reads Secrets
+  on behalf of a user without an authorization check.
 - **The pod template hash decides when a Pod is replaced.** The StatefulSet keeps
   `updateStrategy: OnDelete`, so a template change alone reaches no running Pod. The
   controller therefore stamps the hash of the owned pod template fields (labels and spec,

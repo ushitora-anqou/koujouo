@@ -26,6 +26,14 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // FactorioServerSpec defines the desired state of FactorioServer.
+//
+// The Secret selectors below (notification, backup, downloadCredentials)
+// name Secrets in the namespace of the FactorioServer, and the controller
+// reads their values and delivers them to the agent. A user who may create
+// a FactorioServer can therefore read those Secrets through the agent: the
+// values are written to the state file of the save volume, which the
+// FactorioServer owner can mount. Grant the create permission only to
+// users who may read the Secrets they name.
 type FactorioServerSpec struct {
 	// gameVersion pins the Factorio release to run, for example "2.1.24".
 	// The agent downloads the headless build of this version.
